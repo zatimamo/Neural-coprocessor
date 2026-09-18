@@ -1,0 +1,424 @@
+# ============================================================================
+# CREATECONTRACT - the creation-time parameter contract A/B
+# ============================================================================
+# ONE revision, TWO binaries. The only difference between them is one compile
+# definition, MGPU_CONTRACT_EXPANDED.
+#
+#   contract_control  : MGPU's existing CreateFeature parameters, unchanged.
+#   contract_expanded : the same, PLUS the additional creation-time keys, each
+#                       one logged immediately before CreateFeature.
+#
+# ARCHTEST IS HELD CONSTANT. BOTH variants are built with MGPU_ARCH_COMPAT=ON,
+# because that architecture hook is what makes the private runtime's Init return
+# Success - it was the measured result of the ARCHTEST experiment. Removing it
+# here would change two variables and invalidate the comparison, so it stays on
+# in both binaries and is not a variable in this experiment.
+#
+# The architecture hook itself is NOT modified by this workflow. ARCHTEST is
+# closed; this builds on top of it.
+#
+# The two binaries MUST differ. The compare job fails the run if their hashes
+# match, because identical binaries would mean the contract never changed.
+#
+# RIG INSTRUCTIONS (not a CI step - CI cannot run this):
+#   1. Download both artifacts. Each contains the seven-file deploy set plus
+#      CREATECONTRACT_VARIANT.txt and SHA256SUMS.txt, which are diagnostics and
+#      are NOT part of the deploy set.
+#   2. Deploy the CONTROL set into <game>\bin\x64, launch, let the neural stage
+#      arm, and read the [CREATECONTRACT] and [ARCHTEST] lines. Expect
+#      variant=contract_control and CreateFeature result=0xBAD00002.
+#   3. Deploy the EXPANDED set over it (same seven deploy files, same add-on
+#      name), launch again under the same conditions, read the same lines.
+#   4. The comparison is the two CreateFeature result= lines. Everything else -
+#      architecture spoof, DLL, driver, GPU, caller, dimensions, command list -
+#      is identical by construction, because both binaries are this revision.
+#
+# INTERPRETATION (fixed before the run):
+#   expanded still 0xBAD00002 in BOTH the startup probe and the real stream
+#       -> reject the missing-creation-parameters theory; move next to
+#          caller/application identity.
+#   expanded returns anything else
+#       -> record the exact new NGX result and stop.
+# ============================================================================
+
+name: createcontract-ab
+
+on:
+  workflow_dispatch:
+  push:
+    # This experiment lives on the same dedicated branch as ARCHTEST. It is not
+    # main, it is not merged into main, and nothing here is intended to ship.
+    branches: [archtest-ab]
+    paths:
+      - 'src/create_contract.cpp'
+      - 'src/create_contract.hpp'
+      - 'src/gpu1_context.cpp'
+      - 'CMakeLists.txt'
+      - '.github/workflows/createcontract-ab.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Same pins as build.yml and archtest-ab.yml. Source of truth: VENDOR_LOCK.md.
+  RESHADE_SHA: 18deaa52de0c425a78b329e9cb3c497281cd00ec
+  NGX_SHA: a291cc7d2cc642a51566f3dfd5376f635cd1b284
+  # MinHook v1.3.4, BSD-2-Clause. Unchanged from ARCHTEST - the hook is held
+  # constant across this experiment, not re-pinned.
+  MINHOOK_SHA: c3fcafdc10146beb5919319d0683e44e3c30d537
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # BOTH keep the architecture COMPAT hook ON. That is deliberate and is
+          # the whole point: only the contract varies.
+          - variant: contract_control
+            compat: "ON"
+            expanded: "OFF"
+          - variant: contract_expanded
+            compat: "ON"
+            expanded: "ON"
+
+    name: mgpu_${{ matrix.variant }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Containment check
+        shell: bash
+        run: |
+          PATTERN='GetClockCalibration'
+          FOUND=0
+          for DIR in src assets; do
+            [ -d "$DIR" ] || continue
+            if grep -rnE "$PATTERN" "$DIR"; then FOUND=1; fi
+          done
+          if [ "$FOUND" -ne 0 ]; then
+            echo "::error::Out-of-scope symbol: GetClockCalibration is still guarded (P2.2)"
+            exit 1
+          fi
+
+      # The contract module must exist and must not touch anything it should not.
+      - name: Verify the CREATECONTRACT contract is present
+        shell: bash
+        run: |
+          test -f src/create_contract.cpp
+          test -f src/create_contract.hpp
+          grep -q 'CREATECONTRACT' src/create_contract.cpp
+          # the experiment must never build NGX objects of its own
+          if grep -nE 'D3D12CreateDevice|CreateCommandAllocator|CreateCommandList|LoadLibrary|MH_CreateHook' src/create_contract.cpp; then
+            echo "::error::create_contract.cpp is creating objects it must not create"
+            exit 1
+          fi
+          echo "CREATECONTRACT contract present."
+
+      - name: Fetch ReShade headers at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/reshade.tar.gz \
+            "https://codeload.github.com/crosire/reshade/tar.gz/${RESHADE_SHA}"
+          tar -xzf _dl/reshade.tar.gz -C _dl "reshade-${RESHADE_SHA}/include"
+          rm -rf ext/reshade
+          mv "_dl/reshade-${RESHADE_SHA}/include" ext/reshade
+          test -f ext/reshade/reshade.hpp
+
+      - name: Verify pin (RESHADE_API_VERSION 20)
+        shell: bash
+        run: |
+          grep -q 'define RESHADE_API_VERSION 20' ext/reshade/reshade.hpp || {
+            echo "::error::Pin drift - fetched tree does not define RESHADE_API_VERSION 20"
+            exit 1
+          }
+
+      - name: Fetch NVIDIA NGX headers at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/ngx.tar.gz \
+            "https://codeload.github.com/NVIDIA/DLSS/tar.gz/${NGX_SHA}"
+          tar -xzf _dl/ngx.tar.gz -C _dl --wildcards "*/include"
+          rm -rf ext/ngx
+          mv _dl/*/include ext/ngx
+          test -f ext/ngx/nvsdk_ngx.h
+          test -f ext/ngx/nvsdk_ngx_defs.h
+          test -f ext/ngx/nvsdk_ngx_params.h
+
+      - name: Verify NGX pin (NVSDK_NGX_Feature_Reserved18)
+        shell: bash
+        run: |
+          grep -rq 'NVSDK_NGX_Feature_Reserved18' ext/ngx || {
+            echo "::error::Pin drift - fetched tree does not declare NVSDK_NGX_Feature_Reserved18"
+            exit 1
+          }
+
+      # The interface keys this experiment sets are quoted from this header, not
+      # invented. If the pin moves and a key disappears, fail here rather than
+      # silently setting a name nothing reads.
+      - name: Verify the NGX parameter keys exist in the pinned header
+        shell: bash
+        run: |
+          FAIL=0
+          for K in \
+            'NVSDK_NGX_Parameter_Width' \
+            'NVSDK_NGX_Parameter_Height' \
+            'NVSDK_NGX_Parameter_CreationNodeMask' \
+            'NVSDK_NGX_Parameter_VisibilityNodeMask' \
+            'NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags'
+          do
+            grep -rq "$K" ext/ngx || { echo "::error::pinned NGX headers do not declare $K"; FAIL=1; }
+          done
+          [ "$FAIL" -eq 0 ] || exit 1
+          echo "all CREATECONTRACT generic NGX keys are declared by the pinned headers."
+
+      - name: Fetch and build MinHook at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/minhook.tar.gz \
+            "https://codeload.github.com/TsudaKageyu/minhook/tar.gz/${MINHOOK_SHA}"
+          tar -xzf _dl/minhook.tar.gz -C _dl
+          rm -rf ext/minhook
+          mv _dl/minhook-* ext/minhook
+          test -f ext/minhook/include/MinHook.h
+          test -f ext/minhook/LICENSE.txt
+
+          echo "--- MinHook licence (BSD-2-Clause) ---"
+          head -n 5 ext/minhook/LICENSE.txt
+
+          cmake -S ext/minhook -B ext/minhook/build -A x64 \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+          cmake --build ext/minhook/build --config Release
+
+          echo "--- every library MinHook's build produced ---"
+          find ext/minhook/build -type f -iname '*.lib' | sort || true
+
+          LIB=$(find ext/minhook/build -type f \( -iname 'minhook.x64.lib' -o -iname '*minhook*.lib' \) | head -n1)
+          if [ -z "$LIB" ]; then
+            echo "::error::no MinHook static library found under ext/minhook/build"
+            echo "searched for: minhook.x64.lib, *minhook*.lib"
+            find ext/minhook/build -type f | sort | head -50 || true
+            exit 1
+          fi
+          echo "discovered MinHook library: $LIB"
+          mkdir -p ext/minhook/lib
+          cp "$LIB" ext/minhook/lib/MinHook.lib
+          echo "staged at ext/minhook/lib/MinHook.lib (deterministic path for MGPU_MINHOOK_DIR)"
+          ls -l ext/minhook/lib/
+
+          grep -q 'MH_CreateHook' ext/minhook/include/MinHook.h || {
+            echo "::error::MinHook.h does not declare MH_CreateHook"; exit 1; }
+
+      - name: Configure (${{ matrix.variant }})
+        shell: bash
+        run: |
+          cmake -B build -A x64 \
+            -DMGPU_ARCH_COMPAT=${{ matrix.compat }} \
+            -DMGPU_CONTRACT_EXPANDED=${{ matrix.expanded }} \
+            -DMGPU_MINHOOK_DIR="${{ github.workspace }}/ext/minhook" 2>&1 | tee _cfg.txt
+
+          # -i on purpose: CMake prints the variant uppercase, the matrix is
+          # lowercase.
+          grep -qi "ARCHTEST variant = COMPAT" _cfg.txt || {
+            echo "::error::both CREATECONTRACT variants must build with the architecture hook ON"
+            grep -ni 'ARCHTEST variant' _cfg.txt || true
+            exit 1; }
+
+          # -i on purpose: CMake prints the variant uppercase (CONTRACT_CONTROL /
+          # CONTRACT_EXPANDED) while the matrix values are lowercase.
+          grep -qi "CREATECONTRACT variant = ${{ matrix.variant }}" _cfg.txt || {
+            echo "::error::configure did not report the expected CREATECONTRACT variant"
+            echo "expected (case-insensitive): CREATECONTRACT variant = ${{ matrix.variant }}"
+            grep -ni 'CREATECONTRACT variant' _cfg.txt || echo "(no CREATECONTRACT variant line)"
+            exit 1; }
+
+          grep -q "MinHook library linked from" _cfg.txt || {
+            echo "::error::configured WITHOUT MinHook - the architecture hook would fail closed"
+            grep -n 'MinHook' _cfg.txt || true
+            exit 1; }
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Verify artifact name
+        shell: bash
+        run: |
+          if find build -name 'mgpu_bridge.addon64.dll' -type f | grep -q .; then
+            echo "::error::Built mgpu_bridge.addon64.dll - SUFFIX appended to .dll instead of replacing it"
+            exit 1
+          fi
+          ADDON=$(find build -name 'mgpu_bridge.addon64' -type f | head -n1)
+          if [ -z "$ADDON" ]; then
+            echo "::error::mgpu_bridge.addon64 not produced"
+            find build -maxdepth 3 -type f || true
+            exit 1
+          fi
+          echo "ADDON_PATH=$ADDON" >> "$GITHUB_ENV"
+          echo "Output verified: $ADDON"
+
+      - name: Verify shipped presets are empty
+        shell: bash
+        run: |
+          FAIL=0
+          if grep -nE '^\s*Techniques\s*=\s*\S' assets/gpu1.ini; then
+            echo "::error::assets/gpu1.ini enables techniques - a shipped preset must be empty"
+            FAIL=1
+          fi
+          if grep -n 'DEBUG' assets/gpu1.ini; then
+            echo "::error::assets/gpu1.ini carries a debug preprocessor definition"
+            FAIL=1
+          fi
+          [ "$FAIL" -eq 0 ] || exit 1
+
+      - name: Verify the shipped run is unbounded
+        shell: bash
+        run: |
+          if ! grep -qE '^\s*Frames\s*=\s*0\s*$' assets/mgpu.ini; then
+            echo "::error::assets/mgpu.ini does not set Frames=0 - the shipped build must be unbounded"
+            exit 1
+          fi
+
+      - name: Verify the shipped transport is on
+        shell: bash
+        run: |
+          FAIL=0
+          grep -qE '^\s*Depth\s*=\s*1\s*$' assets/mgpu.ini || {
+            echo "::error::assets/mgpu.ini does not set Depth=1"; FAIL=1; }
+          grep -qE '^\s*MVec\s*=\s*3\s*$' assets/mgpu.ini || {
+            echo "::error::assets/mgpu.ini does not set MVec=3"; FAIL=1; }
+          [ "$FAIL" -eq 0 ] || exit 1
+
+      # The rename lives here and ONLY here, exactly as build.yml does it.
+      - name: Stage deploy set (${{ matrix.variant }})
+        shell: bash
+        run: |
+          mkdir -p _deploy
+          cp "$ADDON_PATH" _deploy/nvngx.dll_mgpu_bridge.addon64
+          cp assets/gpu1.ini      _deploy/
+          cp assets/mgpu.ini      _deploy/
+          cp assets/ReShade2.ini  _deploy/
+          cp assets/README.txt    _deploy/
+          cp LICENSE              _deploy/
+          mkdir -p _deploy/reshade-shaders/Shaders
+          cp assets/reshade-shaders/Shaders/mgpu_depth_tap.fx _deploy/reshade-shaders/Shaders/
+
+          find _deploy -type f | sort
+          test -f _deploy/nvngx.dll_mgpu_bridge.addon64
+          test -f _deploy/mgpu.ini
+          test -f _deploy/reshade-shaders/Shaders/mgpu_depth_tap.fx
+          case "$(ls _deploy)" in
+            *nvngx.dll_*) ;;
+            *) echo "::error::Deploy set does not carry the nvngx.dll_ caller-gate prefix"; exit 1 ;;
+          esac
+
+      - name: Verify the artifact is exactly the seven-file deploy set
+        shell: bash
+        run: |
+          COUNT=$(find _deploy -type f | wc -l)
+          if [ "$COUNT" -ne 7 ]; then
+            echo "::error::_deploy holds $COUNT files, expected 7"
+            find _deploy -type f | sort
+            exit 1
+          fi
+          echo "deploy set is exactly 7 files."
+
+      - name: Record the variant marker and hashes
+        shell: bash
+        run: |
+          {
+            echo "variant    = ${{ matrix.variant }}"
+            echo "arch_compat= ${{ matrix.compat }}   (held constant across both variants)"
+            echo "expanded   = ${{ matrix.expanded }}"
+            echo "commit     = ${GITHUB_SHA}"
+            echo "run        = ${GITHUB_RUN_ID}"
+            echo "built      = $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > CREATECONTRACT_VARIANT.txt
+          cat CREATECONTRACT_VARIANT.txt
+
+          {
+            echo "CREATECONTRACT artifact hashes - ${{ matrix.variant }}"
+            echo
+            echo "Deploy set (7 files, the drop-in package):"
+            ( cd _deploy && find . -type f | sort | while read f; do
+                printf '%s  %s\n' "$(sha256sum "$f" | awk '{print $1}')" "$f"
+              done )
+            echo
+            echo "Add-on alone (the file the compare job keys on):"
+            printf '%s  %s\n' \
+              "$(sha256sum _deploy/nvngx.dll_mgpu_bridge.addon64 | awk '{print $1}')" \
+              "nvngx.dll_mgpu_bridge.addon64"
+          } > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Move diagnostics into the artifact directory
+        shell: bash
+        run: |
+          cp CREATECONTRACT_VARIANT.txt SHA256SUMS.txt _deploy/
+          echo "--- final artifact contents ---"
+          find _deploy -type f | sort
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mgpu_${{ matrix.variant }}
+          path: |
+            _deploy/
+            SHA256SUMS.txt
+            CREATECONTRACT_VARIANT.txt
+          if-no-files-found: error
+
+  compare:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: arts
+
+      - name: Compare the two variants
+        shell: bash
+        run: |
+          set -e
+          find arts -type f | sort
+
+          # upload-artifact uploads the CONTENTS of the path, so each artifact
+          # directory contains _deploy/ with the staged deploy set inside it.
+          CTRL_ADDON=arts/mgpu_contract_control/_deploy/nvngx.dll_mgpu_bridge.addon64
+          EXP_ADDON=arts/mgpu_contract_expanded/_deploy/nvngx.dll_mgpu_bridge.addon64
+
+          for f in "$CTRL_ADDON" "$EXP_ADDON"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::expected artefact missing: $f"
+              echo "--- what was actually downloaded ---"
+              find arts -type f | sort
+              exit 1
+            fi
+          done
+
+          HC=$(sha256sum "$CTRL_ADDON" | awk '{print $1}')
+          HE=$(sha256sum "$EXP_ADDON" | awk '{print $1}')
+          echo "contract_control  = $HC"
+          echo "contract_expanded = $HE"
+          if [ "$HC" = "$HE" ]; then
+            echo "::error::the two binaries are IDENTICAL - the contract never changed"
+            exit 1
+          fi
+          {
+            echo "CREATECONTRACT artifact hashes"
+            echo "contract_control  nvngx.dll_mgpu_bridge.addon64 = $HC"
+            echo "contract_expanded nvngx.dll_mgpu_bridge.addon64 = $HE"
+            echo "distinct = yes"
+          } > HASHES.txt
+          cat HASHES.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mgpu_contract_hashes
+          path: HASHES.txt
+          if-no-files-found: error

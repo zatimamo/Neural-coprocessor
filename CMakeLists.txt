@@ -58,6 +58,11 @@ add_library(mgpu_bridge SHARED
     # No new link library: nvapi64.dll is reached with LoadLibraryW and
     # GetProcAddress, the way the Reflex block in gpu1_context already does.
     src/arch_test.cpp
+    # CREATECONTRACT: the creation-time parameter A/B. Compiled into BOTH
+    # variants of that experiment; MGPU_CONTRACT_EXPANDED decides whether it
+    # adds the extra keys or is a log line only. It writes interface values
+    # into MGPU's existing parameter block and builds nothing.
+    src/create_contract.cpp
 )
 
 target_include_directories(mgpu_bridge PRIVATE
@@ -188,6 +193,32 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# CREATECONTRACT. The creation-time parameter contract A/B.
+#
+#   MGPU_CONTRACT_EXPANDED absent  ->  contract_control.
+#                                      MGPU's existing CreateFeature
+#                                      parameters, unchanged. create_contract.cpp
+#                                      compiles to a single log line.
+#   MGPU_CONTRACT_EXPANDED defined ->  contract_expanded.
+#                                      the same parameters PLUS the additional
+#                                      creation-time keys, logged one by one
+#                                      immediately before CreateFeature.
+#
+# BOTH variants of THIS experiment keep the architecture COMPAT hook ON, because
+# that hook is what makes Init return Success; removing it would change two
+# variables instead of one. The CI job builds it that way.
+# ---------------------------------------------------------------------------
+option(MGPU_CONTRACT_EXPANDED
+       "CREATECONTRACT expanded creation parameter variant"
+       OFF)
+if(MGPU_CONTRACT_EXPANDED)
+    target_compile_definitions(mgpu_bridge PRIVATE MGPU_CONTRACT_EXPANDED=1)
+    message(STATUS "MGPU: CREATECONTRACT variant = CONTRACT_EXPANDED")
+else()
+    message(STATUS "MGPU: CREATECONTRACT variant = CONTRACT_CONTROL")
+endif()
+
+# ---------------------------------------------------------------------------
 # ARCHTEST: MinHook, the x64 trampoline provider.
 #
 # The detour needs a callable ORIGINAL: the overwritten prologue copied
@@ -225,8 +256,7 @@ else()
     message(STATUS "MGPU: MGPU_MINHOOK_DIR not set - ARCHTEST COMPAT will fail closed (no interception)")
 endif()
 
-option(MGPU_BUILD_TESTS "Build CPU-only adapter policy tests" OFF)
-if(MGPU_BUILD_TESTS)
+option(MGPU_BUILD_TESTS "Build CPU-only adapter policy tests" OFF)if(MGPU_BUILD_TESTS)
     enable_testing()
     add_executable(mgpu_adapter_selection_test
         tests/adapter_selection_test.cpp

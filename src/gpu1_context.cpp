@@ -41,6 +41,7 @@
 #include "screen.hpp"   // R108: the idle screen. Compiled since R108, called since V26.
 #include "sl_probe.hpp"   // SL1: is our own device an SL proxy
 #include "arch_test.hpp"  // ARCHTEST: the architecture A/B experiment (CONTROL/COMPAT)
+#include "create_contract.hpp"  // CREATECONTRACT: the creation-time parameter A/B
 
 // R111. DXGI_STATUS_OCCLUDED comes from dxgi.h by way of <dxgi1_4.h> above.
 // Guarded because it is a SUCCESS code and a build where it went missing
@@ -2701,6 +2702,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
     // no object, no parameter and no duration.
     {
         mgpu::archtest::log_mode();
+        mgpu::contract::log_variant();
         mgpu::adapter::selection_result asel;
         mgpu::adapter::get_selection(asel);
         if (asel.valid)
@@ -3517,6 +3519,16 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
     //                  rejected us, so the module rename did not satisfy it.
     //   0xBAD0000C     FAIL_OutOfDate: a version gate - which also proves
     //                  the feature id is right.
+    //
+    // ---- CREATECONTRACT: the creation-time parameter contract ----
+    //
+    // ARCHTEST measured that the architecture spoof clears Init but not
+    // CreateFeature. This experiment asks whether the CREATE-TIME PARAMETER
+    // CONTRACT is what CreateFeature is rejecting. It sets the additional keys
+    // on this same block, immediately before the same call, and logs every one.
+    // See src/create_contract.hpp. In contract_control this is a log line only.
+    mgpu::contract::apply_expanded_create_contract(params, (unsigned)width, (unsigned)height,
+                                                   "startup probe");
     {
         LARGE_INTEGER f{}, t0{}, t1{};
         QueryPerformanceFrequency(&f);
@@ -11648,6 +11660,12 @@ namespace
                 // were already inside the scope; this bracket exists so the
                 // experiment's log names the exact operation under test.
                 mgpu::archtest::log_entering_create_feature();
+                // CREATECONTRACT: the creation-time parameter contract, applied
+                // to the same block immediately before the same call, so this
+                // site stays comparable with the startup probe. Logged once per
+                // attempt. In contract_control this is a log line only.
+                mgpu::contract::apply_expanded_create_contract(s.nr_params, (unsigned)s.width,
+                                                               (unsigned)s.height, "real stream");
                 // V44. Guarded. See ngx_create_guarded for why it is its own
                 // function and why we do not re-enter NGX after a catch.
                 unsigned long seh_code = 0ul;
