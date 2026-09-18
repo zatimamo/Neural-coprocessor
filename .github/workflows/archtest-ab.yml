@@ -148,7 +148,7 @@ jobs:
         shell: bash
         run: |
           cmake -B build -A x64 -DMGPU_ARCH_COMPAT=${{ matrix.compat }} 2>&1 | tee _cfg.txt
-          grep -q "ARCHTEST variant = ${{ matrix.variant }}" _cfg.txt || {
+          grep -qi "ARCHTEST variant = ${{ matrix.variant }}" _cfg.txt || {
             echo "::error::configure did not report the expected ARCHTEST variant"
             echo "expected: ARCHTEST variant = ${{ matrix.variant }}"
             grep -n 'ARCHTEST variant' _cfg.txt || echo "(no ARCHTEST variant line in configure output)"
