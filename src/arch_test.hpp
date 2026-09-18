@@ -57,17 +57,38 @@ namespace mgpu::archtest
     // Install the NVAPI detour. Returns false if it could not be installed or
     // if this is the CONTROL build (which never intercepts anything), in which
     // case NOTHING is intercepted and the log says why.
+    //
+    // On success this ALSO resolves NvAPI_GPU_GetArchInfo proactively - by
+    // calling the real trampoline for its interface id directly - and installs
+    // the direct hook on the returned entry. It does not wait for the runtime
+    // to ask for that id, because the first private NR load happens in the
+    // P1.0c startup probe long before stream_nr_create() runs.
     bool hook_install();
+
+    // True when the proactive direct GetArchInfo hook is in place. The caller
+    // uses this to decide whether the experiment can run at all; when it is
+    // false the rewrite can never happen and the log says so.
+    bool direct_arch_hook_installed();
 
     // Remove the detour. Safe to call when no hook is installed.
     void hook_remove();
 
     // Arm / disarm the rewrite. Between these two calls the architecture
     // rewrite is live; outside them the hook passes everything through.
-    void scope_begin();
+    //
+    // TWO SCOPES USE THESE. The first covers the P1.0c startup probe - the
+    // private runtime's FIRST load, Init, Init_Ext, PopulateParameters and its
+    // first CreateFeature(Reserved18). The second covers the same sequence in
+    // stream_nr_create() for the real stream. The hooks stay installed across
+    // both and are only removed after the real stream attempt.
+    void scope_begin(const char *why);
     void scope_end();
 
     // Diagnostics for the surrounding MGPU code to bracket the call under test.
+    void log_scope_marker(const char *why);
     void log_entering_create_feature();
     void log_create_feature_result(long result, void *handle);
+
+    // Which GPU was matched, so callers can report it without re-deriving it.
+    unsigned matched_gpu_pci();
 }
