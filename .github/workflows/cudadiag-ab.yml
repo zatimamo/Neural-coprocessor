@@ -1,0 +1,721 @@
+# ============================================================================
+# CUDADIAG - pass-through instrumentation of the two NVAPI CUDA-interop calls
+#            the private DLSS-NR runtime makes inside CreateFeature
+# ============================================================================
+# THIS IS NOT AN A/B. There is exactly ONE build and ONE artifact, and there is
+# no compare job.
+#
+# THIS DIAGNOSTIC PRESERVES THE EXPERIMENT SETTINGS OF THE CLEAN NVAPI-CONTROL
+# BASELINE:
+#     MGPU_ARCH_COMPAT=ON          architecture spoof, GPU identity, MinHook
+#     MGPU_CONTRACT_EXPANDED=ON    expanded CreateFeature parameter contract
+#     MGPU_NVAPI_EXPLICIT_INIT=OFF the rejected experiment's control arm
+# and ADDS MGPU_CUDA_DIAG instrumentation.
+#
+# The historical clean CONTROL result is the BEHAVIOURAL REFERENCE, not a
+# byte-for-byte A/B artifact. The source revision itself now carries the
+# CUDA-DIAG integration - one composition point inside the existing detour, the
+# scope labels, the identity publication - so this binary is not the old one plus
+# one definition. The reference is used for what it recorded under those
+# settings (P1.0c Init=Success, P4.1 Init=Success, CreateFeature=0xBAD00002 at
+# both 1280x720 and 3840x2160) and for nothing byte-level.
+#
+# WHY MGPU_ARCH_COMPAT IS FROZEN ON
+#   Two reasons, neither of which is a claim that the flag causes Init success:
+#     a) COMPAT=ON is the configuration of the current known-clean baseline, so
+#        the diagnostic runs in the state that baseline was recorded in;
+#     b) that definition owns the existing nvapi_QueryInterface detour, which is
+#        the mechanism this diagnostic uses to substitute a returned pointer.
+#        With it OFF there is no detour, nothing is intercepted, and
+#        cuda_diag::log_variant() reports the run as VOID for this diagnostic.
+#
+#   ARCH_COMPAT is neither universally necessary nor sufficient for Init success.
+#
+# THE QUESTION, FIXED IN ADVANCE
+#   In a run where BOTH P1.0c Init and P4.1 Init return Success, do
+#       NvAPI_D3D12_GetCudaIndependentDescriptorObject  ->  -1 (NVAPI_ERROR)
+#       NvAPI_D3D12_CreateCuModule                      ->  -1 (NVAPI_ERROR)
+#   still occur, and are they called with the WRONG D3D12 device?
+#
+# RUN-TIME VALIDITY GATE (applies to EVERY case below)
+#   A run is a valid basis for this diagnostic only if BOTH of these hold:
+#       P1.0c Init = Success
+#       P4.1  Init = Success
+#   If either is FAIL_OutOfDate, the NGX portion of that run is VOID: record it
+#   separately, and do NOT read that run's CreateFeature result as a clean
+#   comparison. The gate is evaluated per run, from the log - not inferred from
+#   the configure flags.
+#
+# INTERPRETATION, FIXED IN ADVANCE
+#   Both still -1 with match=no on a non-neural adapter
+#       -> the CUDA-interop layer is bound to the wrong device; that is the
+#          boundary, and CreateFeature's 0xBAD00002 is downstream of it.
+#   Both still -1 with match=yes (the selected neural adapter)
+#       -> the calls reach the right device and still fail; the fault is above
+#          the device selection and this diagnostic has excluded it.
+#   Both Success
+#       -> the historical -1 pair is stale; the current blocker is elsewhere and
+#          this arm answers nothing about it. Report and stop.
+#   ONE Success and ONE -1 (mixed)
+#       -> report BOTH raw results and stop. The function that still returns -1
+#          is the current observed CUDA/NVAPI failure boundary. The historical
+#          -1 recorded for the function that now succeeds is STALE. Do not patch
+#          either function in this run: a single run with one success does not
+#          establish why the other fails, and there is no A/B arm to attribute a
+#          change to.
+#   Either function is NEVER called, i.e. an armed line is ABSENT
+#       -> this diagnostic did not intercept that interface, so its NvAPI_Status
+#          and its device argument are UNOBSERVED in this run. Possible reasons
+#          include earlier caching, or the execution path not resolving or not
+#          reaching that interface. An absent armed line is NOT a result: do not
+#          read it as a pass, and do not read it as a failure.
+#   No wrapper may retry, replace a status, replace an output, force a handle,
+#   read the blob, modify a descriptor, read a FAILED __out value, or invoke
+#   either function proactively. If any of that appears, the run is void
+#   regardless of its result.
+#
+# WHAT THIS JOB REFUSES TO BUILD
+#   The scope-verification step fails the build if cuda_diag.cpp writes to any
+#   caller-owned output, copies memory, installs a hook, contains a loop around
+#   either call, publishes a real pointer with a plain store instead of a CAS,
+#   reaches into the adapter module or takes a lock, reads a caller-owned __out
+#   value on a path where the status was not NVAPI_OK, reintroduces the
+#   superseded absent-armed-line wording, or asserts a device mismatch it never
+#   compared. A pass-through that is not provably a pass-through is worse than
+#   no diagnostic at all.
+#
+#   It also fails if the superseded causal wording ("... makes Init return
+#   Success") or the superseded counterfactual wording ("... by exactly one
+#   compile definition") reappears anywhere in the tree it builds.
+# ============================================================================
+
+name: cudadiag-ab
+
+on:
+  workflow_dispatch:
+  push:
+    # Same dedicated branch as ARCHTEST, CREATECONTRACT and NVAPIINIT. Not main.
+    branches: [archtest-ab]
+    paths:
+      - 'src/cuda_diag.cpp'
+      - 'src/cuda_diag.hpp'
+      - 'src/arch_test.cpp'
+      - 'src/gpu1_context.cpp'
+      - 'CMakeLists.txt'
+      - '.github/workflows/cudadiag-ab.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RESHADE_SHA: 18deaa52de0c425a78b329e9cb3c497281cd00ec
+  NGX_SHA: a291cc7d2cc642a51566f3dfd5376f635cd1b284
+  MINHOOK_SHA: c3fcafdc10146beb5919319d0683e44e3c30d537
+
+jobs:
+  build:
+    runs-on: windows-latest
+    name: mgpu_cudadiag
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Containment check
+        shell: bash
+        run: |
+          PATTERN='GetClockCalibration'
+          FOUND=0
+          for DIR in src assets; do
+            [ -d "$DIR" ] || continue
+            if grep -rnE "$PATTERN" "$DIR"; then FOUND=1; fi
+          done
+          if [ "$FOUND" -ne 0 ]; then
+            echo "::error::Out-of-scope symbol: GetClockCalibration is still guarded (P2.2)"
+            exit 1
+          fi
+
+      # The pass-through contract, enforced on the SOURCE rather than trusted.
+      # Every pattern below is something a wrapper must never do to a call it
+      # claims only to observe.
+      - name: Verify CUDADIAG is a pass-through
+        shell: bash
+        run: |
+          test -f src/cuda_diag.cpp
+          test -f src/cuda_diag.hpp
+          grep -q 'CUDADIAG' src/cuda_diag.cpp
+          grep -q '0x0DDAC234u' src/cuda_diag.hpp
+          grep -q '0xAD1A677Du' src/cuda_diag.hpp
+
+          # There is no compiler on the machine these files are written on, so a
+          # structural check runs here as the substitute. It walks the
+          # preprocessor nesting: an unmatched #endif in this file is a build
+          # error that no compiler was available to catch locally.
+          awk '
+            /^[ \t]*#[ \t]*(ifdef|ifndef|if)\b/ { depth++ }
+            /^[ \t]*#[ \t]*endif\b/            { depth--; if (depth < 0) neg = 1 }
+            END {
+              if (depth != 0 || neg) {
+                printf "::error::cuda_diag.cpp preprocessor nesting does not close (depth=%d, underflow=%d)\n", depth, neg
+                exit 1
+              }
+              print "preprocessor nesting: cuda_diag.cpp closes cleanly"
+            }
+          ' src/cuda_diag.cpp
+          awk '
+            /^[ \t]*#[ \t]*(ifdef|ifndef|if)\b/ { depth++ }
+            /^[ \t]*#[ \t]*endif\b/            { depth--; if (depth < 0) neg = 1 }
+            END {
+              if (depth != 0 || neg) {
+                printf "::error::cuda_diag.hpp preprocessor nesting does not close (depth=%d, underflow=%d)\n", depth, neg
+                exit 1
+              }
+            }
+          ' src/cuda_diag.hpp
+
+          FAIL=0
+          note() { echo "::error::$1"; FAIL=1; }
+          # Every check below is written as "does the CODE contain a STORE or a
+          # loop", never as "does the file contain a word" - a comment that
+          # mentions adapter.hpp or `return` must not fail the build, and a real
+          # assignment must not pass it. So hits() drops comment-only lines.
+          #
+          # hits() ALSO fails the build if grep itself errors (exit > 1). Without
+          # that, a malformed pattern would silently pass every check that uses
+          # it: grep exits 2, the caller sees "no output", and the gate reports
+          # success having verified nothing.
+          hits() {
+            local raw rc out
+            raw=$(grep -nE "$1" src/cuda_diag.cpp); rc=$?
+            if [ "$rc" -gt 1 ]; then
+              echo "::error::the scope gate's own grep failed (exit $rc) on pattern: $1"
+              exit 1
+            fi
+            if [ "$rc" -eq 1 ]; then printf ''; return 0; fi
+            out=$(printf '%s\n' "$raw" | grep -vE '^[0-9]+:[ \t]*(//|\*|/\*)' || true)
+            printf '%s' "$out"
+          }
+          # Line numbers of a LITERAL in the code, comments excluded.
+          code_line_numbers() {
+            grep -nF "$1" src/cuda_diag.cpp \
+              | grep -vE '^[0-9]+:[ \t]*(//|\*|/\*)' \
+              | cut -d: -f1 || true
+          }
+          first_line() {   # $1 = ERE, $2 = lo, $3 = hi
+            awk -v lo="$2" -v hi="$3" -v pat="$1" \
+                'NR > lo && NR < hi && $0 ~ pat { print NR; exit }' src/cuda_diag.cpp
+          }
+          fn_bounds() {    # $1 = name -> FN_START / FN_END
+            FN_START=$(grep -nE "^    void $1\(" src/cuda_diag.cpp | head -n1 | cut -d: -f1)
+            [ -n "$FN_START" ] || return 1
+            FN_END=$(awk -v s="$FN_START" 'NR > s && /^    }$/ { print NR; exit }' src/cuda_diag.cpp)
+            [ -n "$FN_END" ]
+          }
+          # The guard's OWN block, from the `if` line to its closing brace. A
+          # `return;` anywhere else in the function does not make the read
+          # unreachable - the check has to be that THIS branch returns.
+          guard_block() {   # $1 = guard line number
+            awk -v g="$1" '
+              NR < g { next }
+              NR == g { print; next }
+              { print; if ($0 ~ /^        \}$/) exit }
+            ' src/cuda_diag.cpp
+          }
+          # Proves: every occurrence of the __out form in the file is inside the
+          # one guarded reader, the status guard precedes the read, and the
+          # guard's own block returns - so the read is unreachable unless the
+          # status was NVAPI_OK. The literal is matched with index(), not as a
+          # regex, so no escaping is involved and an invalid-regexp awk fatal
+          # cannot silently turn this into a check that verifies nothing.
+          out_read_proof() {   # $1 = reader fn, $2 = literal read form, $3 = label
+            local fn="$1" lit="$2" what="$3" total inside rd gd nret
+            fn_bounds "$fn" || { echo "::error::$what: reader $fn not found"; return 1; }
+            total=$(code_line_numbers "$lit" | grep -c . || true)
+            inside=$(code_line_numbers "$lit" \
+                     | awk -v lo="$FN_START" -v hi="$FN_END" '$1 > lo && $1 < hi' | grep -c . || true)
+            [ "$total" -ge 1 ] || {
+              echo "::error::$what: the read form '$lit' does not appear in the code at all"; return 1; }
+            [ "$total" -eq "$inside" ] || {
+              echo "::error::$what: '$lit' occurs $total time(s) in code but only $inside inside $fn - a read exists outside the guarded reader"
+              return 1; }
+            rd=$(code_line_numbers "$lit" | tail -n1)
+            gd=$(first_line 'status != NVAPI_OK' "$FN_START" "$FN_END")
+            [ -n "$gd" ] || {
+              echo "::error::$what: no 'status != NVAPI_OK' guard in $fn"; return 1; }
+            [ "$gd" -lt "$rd" ] || {
+              echo "::error::$what: guard line $gd does not precede the read line $rd"; return 1; }
+            nret=$(guard_block "$gd" | grep -cE '^[ \t]*return[ \t]*;' || true)
+            [ "$nret" -ge 1 ] || {
+              echo "::error::$what: the 'status != NVAPI_OK' guard at line $gd does not return, so the read at line $rd is reachable when NvApi_Status != NVAPI_OK"
+              return 1; }
+            echo "$what: guard line $gd returns ($nret return; in its own block) -> read line $rd ($total code occurrence(s), all inside $fn)"
+          }
+
+          # No second detour, and no hook on either CUDA entry point.
+          H=$(hits 'MH_CreateHook|MH_EnableHook|MinHook|VirtualProtect|WriteProcessMemory')
+          [ -z "$H" ] || { echo "$H"; note "cuda_diag.cpp installs a hook; it must not"; }
+
+          # ---- REAL POINTER PUBLICATION ----------------------------------
+          # First publication must be a compare_exchange_strong from nullptr. A
+          # plain store would overwrite an already-published pointer, and the
+          # wrapper the runtime was handed calls the pointer in that slot - so
+          # overwriting it makes the log describe a call that did not happen.
+          H=$(hits 'slot\s*\.\s*store\s*\(')
+          [ -z "$H" ] || { echo "$H"; note "publishes the real pointer with a plain store(); first publication must be compare_exchange_strong"; }
+          H=$(hits '(g_real_desc|g_real_module)\s*\.\s*store\s*\(')
+          [ -z "$H" ] || { echo "$H"; note "stores directly to a real-pointer slot"; }
+          CAS=$(grep -cE 'slot\.compare_exchange_strong\(' src/cuda_diag.cpp || true)
+          [ "$CAS" -eq 1 ] || {
+            echo "::error::expected exactly 1 'slot.compare_exchange_strong(' in cuda_diag.cpp, found $CAS"; FAIL=1; }
+          grep -qE 'slot\.compare_exchange_strong\(expected, real,' src/cuda_diag.cpp || {
+            echo "::error::the CAS does not publish (expected, real)"; FAIL=1; }
+          grep -qE 'void \*expected = nullptr;' src/cuda_diag.cpp || {
+            echo "::error::the CAS expected value is not initialised to nullptr, so it is not a first-publication CAS"; FAIL=1; }
+          grep -qE 'std::memory_order_release,' src/cuda_diag.cpp || {
+            echo "::error::the CAS success ordering is not release - a wrapper could observe nullptr"; FAIL=1; }
+          grep -qE 'std::memory_order_acquire\)\)' src/cuda_diag.cpp || {
+            echo "::error::the CAS failure ordering is not acquire"; FAIL=1; }
+          grep -qE 'else if \(expected != real\)' src/cuda_diag.cpp || {
+            echo "::error::the different-pointer case does not compare expected against real"; FAIL=1; }
+          grep -qE 'the published pointer is kept' src/cuda_diag.cpp || {
+            echo "::error::the mismatch path does not say the published pointer is kept"; FAIL=1; }
+
+          # ---- NO MUTEX, AND NO CALL INTO THE ADAPTER MODULE --------------
+          # adapter::get_selection() takes a mutex; a diagnostic of an NVIDIA
+          # CUDA/NVAPI call may not acquire an unrelated lock on that path.
+          H=$(hits 'adapter::get_selection|selection_result|adapter\.hpp|"adapter\.hpp"')
+          [ -z "$H" ] || { echo "$H"; note "cuda_diag.cpp reaches into the adapter module; the identity must be pushed in via set_expected_adapter"; }
+          H=$(hits 'std::mutex|lock_guard|unique_lock|scoped_lock|\.lock\s*\(|pthread_|EnterCriticalSection|WaitForSingleObject')
+          [ -z "$H" ] || { echo "$H"; note "cuda_diag.cpp acquires a lock on the CUDA call path"; }
+          grep -qE 'void set_expected_adapter\(const LUID &luid, unsigned vendor_id, unsigned device_id\)' src/cuda_diag.cpp || {
+            echo "::error::set_expected_adapter is missing or has a different signature"; FAIL=1; }
+          grep -qE 'g_expected_known\.store\(true, std::memory_order_release\)' src/cuda_diag.cpp || {
+            echo "::error::the expected-adapter flag is not published with release after its payload"; FAIL=1; }
+          grep -qE 'g_expected_known\.load\(std::memory_order_acquire\)' src/cuda_diag.cpp || {
+            echo "::error::the expected-adapter flag is not read with acquire"; FAIL=1; }
+          # And the wrappers must read the atomics, not the adapter module.
+          grep -qE 'expected_adapter\(want, want_pci, want_known\)' src/cuda_diag.cpp || {
+            echo "::error::log_device does not read the pushed-in identity atomics"; FAIL=1; }
+
+          # ---- NEVER ASSERT A COMPARISON THAT DID NOT HAPPEN ---------------
+          # A null device is only a negative MATCH when there is something to
+          # match against. With no published identity no comparison occurred, so
+          # match=no would assert a result this run never had.
+          H=$(hits 'expected=unknown.*match=no|match=no.*expected=unknown')
+          [ -z "$H" ] || { echo "$H"; note "an unknown expected identity is reported as match=no"; }
+          # Counted in CODE only: the comment explaining why the unknown path does
+          # not say match=no necessarily contains the words "match=no".
+          NULLNO=$(code_line_numbers 'match=no' | grep -c . || true)
+          [ "$NULLNO" -eq 1 ] || {
+            echo "::error::expected exactly 1 code 'match=no' in cuda_diag.cpp, found $NULLNO"
+            code_line_numbers 'match=no'; FAIL=1; }
+          NOTCMP=$(code_line_numbers 'match=NOT_COMPARED' | grep -c . || true)
+          [ "$NOTCMP" -ge 2 ] || {
+            echo "::error::expected the NOT_COMPARED wording on both unknown-identity paths, found $NOTCMP"; FAIL=1; }
+          # The one code match=no must sit inside the `if (want_known)` branch, so
+          # it cannot be reached when no identity was published. Bracket
+          # expressions are used instead of backslash escapes, which awk treats as
+          # plain characters and which therefore silently match nothing.
+          fn_bounds log_device || { echo "::error::log_device not found"; exit 1; }
+          WK=$(first_line 'if [(]want_known[)]' "$FN_START" "$FN_END")
+          # Comment-aware: the comment explaining why the unknown path does NOT
+          # say match=no necessarily contains the words, and it sits above the
+          # guard.
+          NO=$(code_line_numbers 'match=no' \
+               | awk -v lo="$FN_START" -v hi="$FN_END" '$1 > lo && $1 < hi' | head -n1)
+          [ -n "$WK" ] && [ -n "$NO" ] && [ "$WK" -lt "$NO" ] || {
+            echo "::error::the null-device match=no is not gated on want_known (want_known at ${WK:-none}, match=no at ${NO:-none})"; FAIL=1; }
+          echo "unknown-identity paths: want_known guard line ${WK:-none} precedes the single match=no at ${NO:-none}; NOT_COMPARED in $NOTCMP place(s)"
+
+          # ---- SUPERSEDED WORDING MUST NOT REAPPEAR ------------------------
+          # Assembled from fragments so this check's own text does not contain
+          # the phrases it forbids.
+          P_CAUSE="makes Init"" return Success"
+          P_ONEDEF="exactly one compile"" definition"
+          P_ALREADY="differs from the ALREADY""-RUN"
+          P_DXHDR="internal DX"" header"
+          FORBID=$(grep -rnE "$P_CAUSE|$P_ONEDEF|$P_ALREADY|$P_DXHDR" \
+                   src CMakeLists.txt .github/workflows/cudadiag-ab.yml 2>/dev/null || true)
+          [ -z "$FORBID" ] || {
+            echo "$FORBID"
+            echo "::error::superseded wording is still present in the tree"
+            FAIL=1; }
+          echo "superseded causal/counterfactual/provenance wording: absent"
+
+          # ---- A FAILED __out VALUE IS NEVER READ -------------------------
+          out_read_proof read_descriptor_handle 'pParams->handle' \
+            'GetCudaIndependentDescriptorObject __out' || FAIL=1
+          out_read_proof read_module_handle '(*phModule)' \
+            'CreateCuModule __out' || FAIL=1
+
+          # The failure wording must exist verbatim, because it is the line a
+          # reader of the log will look for.
+          grep -qF 'returned handle NOT READ because NvApi_Status != NVAPI_OK' src/cuda_diag.cpp || {
+            echo "::error::the 'handle NOT READ on failure' line is missing"; FAIL=1; }
+          grep -qF 'module handle NOT READ because NvApi_Status != NVAPI_OK' src/cuda_diag.cpp || {
+            echo "::error::the 'module handle NOT READ on failure' line is missing"; FAIL=1; }
+          grep -qE 'const int NVAPI_OK = 0;' src/cuda_diag.cpp || {
+            echo "::error::NVAPI_OK is not defined as 0"; FAIL=1; }
+
+          # ---- ABSENT-OBSERVATION WORDING --------------------------------
+          # A missing armed line is NOT a result, and must not be described as
+          # one. Both of the claims the audit rejected are forbidden outright:
+          # that the genuine functions returned -1, and that absence necessarily
+          # means the pointers were cached earlier.
+          H=$(hits 'a missing call is NOT a success|returned by the genuine functions|necessarily means|must have been cached|did not apply - a missing')
+          [ -z "$H" ] || { echo "$H"; note "the wording overclaims what an absent armed line means"; }
+          grep -qF 'armed line is absent, this diagnostic did not intercept that interface' src/cuda_diag.cpp || {
+            echo "::error::the corrected absent-armed-line wording is missing"; FAIL=1; }
+          grep -qF 'UNOBSERVED in this run' src/cuda_diag.cpp || {
+            echo "::error::the corrected wording does not say the observation is UNOBSERVED"; FAIL=1; }
+          grep -qF 'Possible reasons include earlier caching' src/cuda_diag.cpp || {
+            echo "::error::the corrected wording does not list possible reasons"; FAIL=1; }
+          grep -qF 'An absent armed line is not a result' src/cuda_diag.cpp || {
+            echo "::error::the corrected wording does not state that absence is not a result"; FAIL=1; }
+
+          # No output replacement. A store is `field =` where the next character
+          # is not `=` (so `==` comparisons do not count).
+          H=$(hits '\*\s*phModule\s*=[^=]')
+          [ -z "$H" ] || { echo "$H"; note "writes *phModule"; }
+          H=$(hits 'pParams\s*->\s*(structSizeIn|structSizeOut|pDevice|type|handle|desc(\.ptr)?)\s*=[^=]')
+          [ -z "$H" ] || { echo "$H"; note "writes a caller-owned field of pParams"; }
+
+          # No blob inspection and no memory copying at all.
+          H=$(hits 'memcpy|memmove|memset|memcmp|pBlob\s*\[|pBlob\s*\+')
+          [ -z "$H" ] || { echo "$H"; note "reads or copies the blob"; }
+
+          # No retry: neither call may sit inside a loop. Matched as syntax, so
+          # the word "does" in a comment cannot trip it.
+          H=$(hits '\b(for|while)\s*\(|\bdo\s*\{')
+          [ -z "$H" ] || { echo "$H"; note "contains a loop around a call"; }
+
+          # No proactive invocation: the wrappers may only be entered by the
+          # runtime, so neither real pointer may be called outside its wrapper.
+          CALLS=$(grep -cE '= real\(' src/cuda_diag.cpp || true)
+          [ "$CALLS" -eq 2 ] || {
+            echo "::error::expected exactly 2 genuine calls in cuda_diag.cpp, found $CALLS"; FAIL=1; }
+
+          # The observed status must be returned verbatim, and the ONLY other
+          # return a wrapper may have is the unreachable null-guard constant.
+          # Returns are counted inside the two wrappers only, so the returns in
+          # select() - which is not a call path for a real invocation - cannot
+          # mask a rewritten status.
+          W=$(sed -n '/^    int __cdecl diag_/,/^    }$/p' src/cuda_diag.cpp)
+          [ -n "$W" ] || { echo "::error::could not isolate the two wrappers"; exit 1; }
+          # Comment-only lines are dropped before counting, so the word "return"
+          # in prose is not a return statement - but a return ANYWHERE on a code
+          # line is, including one hidden after a condition.
+          WCODE=$(printf '%s\n' "$W" | grep -vE '^[ \t]*(//|\*|/\*)' || true)
+          VERBATIM=$(printf '%s\n' "$WCODE" | grep -cE '^[ \t]*return status;' || true)
+          GUARD=$(printf '%s\n' "$WCODE" | grep -cE '^[ \t]*return NVAPI_ERROR_UNREACHABLE;' || true)
+          RETURNS=$(printf '%s\n' "$WCODE" | grep -cE '\breturn\b' || true)
+          [ "$VERBATIM" -eq 2 ] || {
+            echo "::error::expected 2 verbatim status returns in the wrappers, found $VERBATIM"; FAIL=1; }
+          [ "$GUARD" -eq 2 ] || {
+            echo "::error::expected 2 unreachable null-guard returns, found $GUARD"; FAIL=1; }
+          [ "$RETURNS" -eq 4 ] || {
+            echo "::error::the wrappers hold $RETURNS return statements; exactly 4 are permitted (2 verbatim + 2 unreachable guards)"
+            printf '%s\n' "$WCODE" | grep -nE '\breturn\b'; FAIL=1; }
+          # No arithmetic, negation or numeric literal may appear in a return:
+          # the two guards must use the NAMED constant, so that a numeric literal
+          # appearing in a wrapper return is always a rewritten status.
+          H=$(hits 'return\s+(status\s*[-+*/%]|!status|-[0-9]|[0-9]|0x)')
+          [ -z "$H" ] || { echo "$H"; note "the status is not returned verbatim"; }
+
+          [ "$FAIL" -eq 0 ] || exit 1
+          echo "CUDADIAG pass-through verified: no hook, no retry, no output write, no blob read."
+
+      # The detour that makes the two ids reachable lives in arch_test.cpp, so
+      # the composition point is asserted too.
+      - name: Verify the composition point
+        shell: bash
+        run: |
+          grep -q '#include "cuda_diag.hpp"' src/arch_test.cpp || {
+            echo "::error::arch_test.cpp does not include cuda_diag.hpp"; exit 1; }
+          grep -q 'mgpu::cudadiag::select(id, answer)' src/arch_test.cpp || {
+            echo "::error::the composition point is missing from query_detour"; exit 1; }
+          # Exactly one composition point, and it is in the EXISTING detour.
+          N=$(grep -c 'cudadiag::select' src/arch_test.cpp)
+          [ "$N" -eq 1 ] || { echo "::error::expected 1 composition point, found $N"; exit 1; }
+          # The scope labels must be paired: one begin per scope, one clear per end.
+          B=$(grep -c 'mgpu::archtest::scope_begin' src/gpu1_context.cpp)
+          E=$(grep -c 'mgpu::cudadiag::scope_outside' src/gpu1_context.cpp)
+          S=$(grep -c 'mgpu::cudadiag::scope_startup_probe' src/gpu1_context.cpp)
+          R=$(grep -c 'mgpu::cudadiag::scope_real_stream' src/gpu1_context.cpp)
+          echo "scope_begin=$B scope_startup_probe=$S scope_real_stream=$R scope_outside=$E"
+          [ "$B" -eq 2 ] || { echo "::error::expected 2 scope_begin sites, found $B"; exit 1; }
+          [ "$S" -eq 1 ] || { echo "::error::expected 1 startup-probe label, found $S"; exit 1; }
+          [ "$R" -eq 1 ] || { echo "::error::expected 1 real-stream label, found $R"; exit 1; }
+          # scope_end is called from every exit path; every one must clear the label,
+          # or a stale label would mislabel a real-stream call as a startup one.
+          END=$(grep -c 'mgpu::archtest::scope_end' src/gpu1_context.cpp)
+          [ "$E" -eq "$END" ] || {
+            echo "::error::scope_outside=$E but scope_end=$END - a scope exit would leave a stale label"
+            exit 1; }
+
+          # ---- the GetArchInfo behaviour must be untouched ----------------
+          # The ARCHTEST rewrite path is the reason this build gets Init=Success,
+          # so the composition point must sit AFTER it, on the fall-through, and
+          # the branch itself must still be exactly what it was.
+          ARCH=$(grep -n 'id == NVAPI_ID_GET_ARCH_INFO' src/arch_test.cpp | head -n1 | cut -d: -f1)
+          SEL=$(grep -n 'mgpu::cudadiag::select(id, answer)' src/arch_test.cpp | head -n1 | cut -d: -f1)
+          [ -n "$ARCH" ] && [ -n "$SEL" ] || {
+            echo "::error::could not locate the GetArchInfo branch and the composition point"; exit 1; }
+          [ "$ARCH" -lt "$SEL" ] || {
+            echo "::error::the composition point precedes the GetArchInfo branch"; exit 1; }
+          grep -qF 'reinterpret_cast<void *>(&get_arch_info_shim)' src/arch_test.cpp || {
+            echo "::error::the GetArchInfo shim return is gone"; exit 1; }
+          grep -qF 'if (!g_direct_arch_hooked && answer != nullptr)' src/arch_test.cpp || {
+            echo "::error::the GetArchInfo secondary-install condition changed"; exit 1; }
+          # Three code references: the id's definition and its two uses. Counted
+          # with comments excluded, so the prose above the branch cannot mask a
+          # change to the branch itself.
+          ARCHREFS=$(grep -n 'NVAPI_ID_GET_ARCH_INFO' src/arch_test.cpp \
+                     | grep -vE '^[0-9]+:[ \t]*(//|\*|/\*)' | grep -c . || true)
+          [ "$ARCHREFS" -eq 3 ] || {
+            echo "::error::expected 3 code references to NVAPI_ID_GET_ARCH_INFO, found $ARCHREFS"; exit 1; }
+          # Still exactly one MinHook on nvapi_QueryInterface, and no new one.
+          [ "$(grep -cE 'MH_CreateHook\([^;]*&query_detour' src/arch_test.cpp)" -eq 1 ] || {
+            echo "::error::expected exactly 1 MH_CreateHook(&query_detour)"; exit 1; }
+
+          # ---- the identity is pushed in BEFORE hook_install() ------------
+          grep -qF 'mgpu::cudadiag::set_expected_adapter(asel.selected_luid,' src/gpu1_context.cpp || {
+            echo "::error::set_expected_adapter is not called with the existing asel"; exit 1; }
+          IDN=$(grep -n 'mgpu::cudadiag::set_expected_adapter' src/gpu1_context.cpp | head -n1 | cut -d: -f1)
+          HOOK=$(grep -n 'mgpu::archtest::hook_install();' src/gpu1_context.cpp | head -n1 | cut -d: -f1)
+          # The startup CALL SITE, not the function definition at the top of the
+          # file: match the assignment form.
+          LOAD=$(grep -n 'mods.snippet = nr_load_private_snippet(snip_where,' src/gpu1_context.cpp | head -n1 | cut -d: -f1)
+          SCOPE=$(grep -n 'mgpu::archtest::scope_begin("startup private NR load")' src/gpu1_context.cpp | head -n1 | cut -d: -f1)
+          [ -n "$IDN" ] && [ -n "$HOOK" ] && [ -n "$LOAD" ] && [ -n "$SCOPE" ] || {
+            echo "::error::could not locate the publish / hook_install / snippet-load / scope sites"; exit 1; }
+          [ "$IDN" -lt "$HOOK" ] || {
+            echo "::error::the identity is published AFTER hook_install() (line $IDN vs $HOOK)"; exit 1; }
+          [ "$IDN" -lt "$SCOPE" ] || {
+            echo "::error::the identity is published AFTER the scope is armed (line $IDN vs $SCOPE)"; exit 1; }
+          [ "$IDN" -lt "$LOAD" ] || {
+            echo "::error::the identity is published AFTER the private NR DLL is loaded (line $IDN vs $LOAD)"; exit 1; }
+          echo "identity published at line $IDN, before hook_install at $HOOK, the armed scope at $SCOPE, and the snippet load at $LOAD"
+          echo "composition, scope labels, GetArchInfo path and identity publication verified."
+
+      - name: Fetch ReShade headers at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/reshade.tar.gz \
+            "https://codeload.github.com/crosire/reshade/tar.gz/${RESHADE_SHA}"
+          tar -xzf _dl/reshade.tar.gz -C _dl "reshade-${RESHADE_SHA}/include"
+          rm -rf ext/reshade
+          mv "_dl/reshade-${RESHADE_SHA}/include" ext/reshade
+          test -f ext/reshade/reshade.hpp
+          grep -q 'define RESHADE_API_VERSION 20' ext/reshade/reshade.hpp
+
+      - name: Fetch NVIDIA NGX headers at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/ngx.tar.gz \
+            "https://codeload.github.com/NVIDIA/DLSS/tar.gz/${NGX_SHA}"
+          tar -xzf _dl/ngx.tar.gz -C _dl --wildcards "*/include"
+          rm -rf ext/ngx
+          mv _dl/*/include ext/ngx
+          test -f ext/ngx/nvsdk_ngx.h
+          grep -rq 'NVSDK_NGX_Feature_Reserved18' ext/ngx || {
+            echo "::error::Pin drift - no NVSDK_NGX_Feature_Reserved18"; exit 1; }
+
+      - name: Fetch and build MinHook at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/minhook.tar.gz \
+            "https://codeload.github.com/TsudaKageyu/minhook/tar.gz/${MINHOOK_SHA}"
+          tar -xzf _dl/minhook.tar.gz -C _dl
+          rm -rf ext/minhook
+          mv _dl/minhook-* ext/minhook
+          test -f ext/minhook/include/MinHook.h
+          cmake -S ext/minhook -B ext/minhook/build -A x64 \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+          cmake --build ext/minhook/build --config Release
+          LIB=$(find ext/minhook/build -type f \( -iname 'minhook.x64.lib' -o -iname '*minhook*.lib' \) | head -n1)
+          if [ -z "$LIB" ]; then
+            echo "::error::no MinHook static library found"
+            find ext/minhook/build -type f | sort | head -50 || true
+            exit 1
+          fi
+          echo "discovered MinHook library: $LIB"
+          mkdir -p ext/minhook/lib
+          cp "$LIB" ext/minhook/lib/MinHook.lib
+
+      # All four flags are asserted. This artifact is the recorded
+      # mgpu_nvapi_control build plus MGPU_CUDA_DIAG, and nothing else.
+      - name: Configure (cudadiag)
+        shell: bash
+        run: |
+          cmake -B build -A x64 \
+            -DMGPU_ARCH_COMPAT=ON \
+            -DMGPU_CONTRACT_EXPANDED=ON \
+            -DMGPU_NVAPI_EXPLICIT_INIT=OFF \
+            -DMGPU_CUDA_DIAG=ON \
+            -DMGPU_MINHOOK_DIR="${{ github.workspace }}/ext/minhook" 2>&1 | tee _cfg.txt
+
+          grep -qi "ARCHTEST variant = COMPAT" _cfg.txt || {
+            echo "::error::frozen variable drifted: MGPU_ARCH_COMPAT must be ON"
+            grep -ni 'ARCHTEST variant' _cfg.txt || true; exit 1; }
+
+          grep -qi "CREATECONTRACT variant = CONTRACT_EXPANDED" _cfg.txt || {
+            echo "::error::frozen variable drifted: MGPU_CONTRACT_EXPANDED must be ON"
+            grep -ni 'CREATECONTRACT variant' _cfg.txt || true; exit 1; }
+
+          grep -qi "NVAPIINIT variant = NVAPI_CONTROL" _cfg.txt || {
+            echo "::error::frozen variable drifted: MGPU_NVAPI_EXPLICIT_INIT must be OFF"
+            grep -ni 'NVAPIINIT variant' _cfg.txt || true; exit 1; }
+
+          grep -qi "CUDADIAG = ON" _cfg.txt || {
+            echo "::error::MGPU_CUDA_DIAG did not take - this build would be inert"
+            grep -ni 'CUDADIAG' _cfg.txt || true; exit 1; }
+
+          grep -q "MinHook library linked from" _cfg.txt || {
+            echo "::error::configured WITHOUT MinHook - the arch hook would fail closed"; exit 1; }
+
+          echo "--- all variant lines ---"
+          grep -niE 'variant = |CUDADIAG' _cfg.txt || true
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Verify artifact name
+        shell: bash
+        run: |
+          if find build -name 'mgpu_bridge.addon64.dll' -type f | grep -q .; then
+            echo "::error::SUFFIX appended to .dll instead of replacing it"; exit 1
+          fi
+          ADDON=$(find build -name 'mgpu_bridge.addon64' -type f | head -n1)
+          if [ -z "$ADDON" ]; then
+            echo "::error::mgpu_bridge.addon64 not produced"
+            find build -maxdepth 3 -type f || true; exit 1
+          fi
+          echo "ADDON_PATH=$ADDON" >> "$GITHUB_ENV"
+          echo "Output verified: $ADDON"
+
+      # The instrumentation must be IN the binary that ships, not merely in the
+      # source tree. The id constants and the two log tags are string literals,
+      # so they are findable in the artifact.
+      - name: Verify the instrumentation is in the binary
+        shell: bash
+        run: |
+          for S in CUDADIAG reachable= GetCudaIndependentDescriptorObject CreateCuModule; do
+            if ! grep -qa "$S" "$ADDON_PATH"; then
+              echo "::error::'$S' is not present in $ADDON_PATH - the diagnostic was compiled out"
+              exit 1
+            fi
+          done
+          echo "instrumentation strings present in the artifact."
+
+      - name: Verify shipped presets are empty
+        shell: bash
+        run: |
+          FAIL=0
+          grep -nE '^\s*Techniques\s*=\s*\S' assets/gpu1.ini && FAIL=1
+          grep -n 'DEBUG' assets/gpu1.ini && FAIL=1
+          [ "$FAIL" -eq 0 ] || { echo "::error::shipped preset is not clean"; exit 1; }
+
+      - name: Verify shipped config
+        shell: bash
+        run: |
+          grep -qE '^\s*Frames\s*=\s*0\s*$' assets/mgpu.ini || {
+            echo "::error::assets/mgpu.ini does not set Frames=0"; exit 1; }
+          grep -qE '^\s*Depth\s*=\s*1\s*$' assets/mgpu.ini || {
+            echo "::error::assets/mgpu.ini does not set Depth=1"; exit 1; }
+          grep -qE '^\s*MVec\s*=\s*3\s*$' assets/mgpu.ini || {
+            echo "::error::assets/mgpu.ini does not set MVec=3"; exit 1; }
+
+      # The rename lives here and ONLY here, exactly as build.yml does it.
+      - name: Stage deploy set (cudadiag)
+        shell: bash
+        run: |
+          mkdir -p _deploy
+          cp "$ADDON_PATH" _deploy/nvngx.dll_mgpu_bridge.addon64
+          cp assets/gpu1.ini      _deploy/
+          cp assets/mgpu.ini      _deploy/
+          cp assets/ReShade2.ini  _deploy/
+          cp assets/README.txt    _deploy/
+          cp LICENSE              _deploy/
+          mkdir -p _deploy/reshade-shaders/Shaders
+          cp assets/reshade-shaders/Shaders/mgpu_depth_tap.fx _deploy/reshade-shaders/Shaders/
+          find _deploy -type f | sort
+          test -f _deploy/nvngx.dll_mgpu_bridge.addon64
+          case "$(ls _deploy)" in
+            *nvngx.dll_*) ;;
+            *) echo "::error::lost the nvngx.dll_ caller-gate prefix"; exit 1 ;;
+          esac
+
+      - name: Verify the artifact is exactly the seven-file deploy set
+        shell: bash
+        run: |
+          COUNT=$(find _deploy -type f | wc -l)
+          if [ "$COUNT" -ne 7 ]; then
+            echo "::error::_deploy holds $COUNT files, expected 7"
+            find _deploy -type f | sort; exit 1
+          fi
+
+      - name: Record the variant marker and hashes
+        shell: bash
+        run: |
+          {
+            echo "variant            = cudadiag"
+            echo "MGPU_CUDA_DIAG     = ON            (the only difference from mgpu_nvapi_control)"
+            echo "MGPU_ARCH_COMPAT   = ON            (frozen; also what makes the ids reachable)"
+            echo "MGPU_CONTRACT_EXPANDED = ON        (frozen)"
+            echo "MGPU_NVAPI_EXPLICIT_INIT = OFF     (frozen; the rejected experiment's control)"
+            echo "commit             = ${GITHUB_SHA}"
+            echo "run                = ${GITHUB_RUN_ID}"
+            echo "built              = $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "NOT AN A/B. There is no second arm and no compare job: the raw"
+            echo "counterfactual (mgpu_nvapi_control) is already on the record with"
+            echo "P1.0c Init=Success, P4.1 Init=Success and CreateFeature=0xBAD00002"
+            echo "at both 1280x720 and 3840x2160."
+          } > CUDADIAG_VARIANT.txt
+          cat CUDADIAG_VARIANT.txt
+
+          {
+            echo "CUDADIAG artifact hashes - cudadiag"
+            echo
+            echo "Deploy set (7 files):"
+            ( cd _deploy && find . -type f | sort | while read f; do
+                printf '%s  %s\n' "$(sha256sum "$f" | awk '{print $1}')" "$f"
+              done )
+            echo
+            echo "Add-on alone:"
+            printf '%s  %s\n' \
+              "$(sha256sum _deploy/nvngx.dll_mgpu_bridge.addon64 | awk '{print $1}')" \
+              "nvngx.dll_mgpu_bridge.addon64"
+          } > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # The deploy set is what the game receives, so it must stay EXACTLY the
+      # seven files staged above. The variant marker and the hash file are
+      # uploaded ALONGSIDE it, never copied into it: a ninth entry in _deploy
+      # would be shipped to the rig. Re-asserted here, immediately before upload,
+      # rather than trusting the earlier check.
+      - name: Assert the deploy set is still exactly seven files
+        shell: bash
+        run: |
+          COUNT=$(find _deploy -type f | wc -l)
+          if [ "$COUNT" -ne 7 ]; then
+            echo "::error::_deploy holds $COUNT files immediately before upload, expected 7"
+            find _deploy -type f | sort; exit 1
+          fi
+          find _deploy -type f | sort
+          echo "deploy set is exactly 7 files; metadata stays outside it."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mgpu_cudadiag
+          path: |
+            _deploy/
+            SHA256SUMS.txt
+            CUDADIAG_VARIANT.txt
+          if-no-files-found: error

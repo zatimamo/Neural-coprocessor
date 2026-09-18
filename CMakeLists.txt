@@ -69,6 +69,22 @@ add_library(mgpu_bridge SHARED
     # existing dynamic-NVAPI route (LoadLibraryW + GetProcAddress +
     # nvapi_QueryInterface), so no new link library and no NVAPI header.
     src/nvapi_init.cpp
+    # CUDADIAG: the two NVAPI CUDA-interop calls the private DLSS-NR runtime
+    # makes inside its CreateFeature. Self-contained like the five above - it
+    # reaches no NVAPI module itself: it is handed the GENUINE pointer the
+    # existing ARCHTEST nvapi_QueryInterface detour already resolved, and hands
+    # back a pass-through wrapper. No new link library, no NVAPI header, no
+    # second detour and no hook on either CUDA entry point.
+    #
+    #   MGPU_CUDA_DIAG undefined -> this file is BEHAVIOURALLY INERT: select()
+    #                               returns the real resolver result unchanged,
+    #                               so the add-on behaves as it does without the
+    #                               instrumentation. The file is still compiled
+    #                               and linked; it is NOT claimed that the binary
+    #                               is byte-identical to one built without it.
+    #   MGPU_CUDA_DIAG defined   -> the two target interface ids are substituted
+    #                               with observational pass-through wrappers.
+    src/cuda_diag.cpp
 )
 
 target_include_directories(mgpu_bridge PRIVATE
@@ -210,9 +226,13 @@ endif()
 #                                      creation-time keys, logged one by one
 #                                      immediately before CreateFeature.
 #
-# BOTH variants of THIS experiment keep the architecture COMPAT hook ON, because
-# that hook is what makes Init return Success; removing it would change two
-# variables instead of one. The CI job builds it that way.
+# BOTH variants of THIS experiment keep the architecture COMPAT hook ON, so that
+# the architecture spoof and the GPU identity are frozen exactly as they stand in
+# the current known-clean baseline; changing that would vary two variables
+# instead of one. That is a statement about the baseline, NOT a causal claim:
+# whether Init returns Success is a RUN-TIME gate on every run, and a run whose
+# P1.0c Init or P4.1 Init is FAIL_OutOfDate has a void NGX portion and is not a
+# valid comparison, whatever the flags were. The CI job builds it that way.
 # ---------------------------------------------------------------------------
 option(MGPU_CONTRACT_EXPANDED
        "CREATECONTRACT expanded creation parameter variant"
@@ -287,6 +307,47 @@ if(MGPU_MINHOOK_DIR)
     endif()
 else()
     message(STATUS "MGPU: MGPU_MINHOOK_DIR not set - ARCHTEST COMPAT will fail closed (no interception)")
+endif()
+
+# ---------------------------------------------------------------------------
+# CUDADIAG. The pass-through instrumentation for the two NVAPI CUDA-interop
+# calls DLSS-NR issues inside CreateFeature.
+#
+#   MGPU_CUDA_DIAG undefined ->  this file is BEHAVIOURALLY INERT: select()
+#                                returns the real resolver result unchanged, so
+#                                the add-on behaves as it does without the
+#                                instrumentation. The file is still compiled and
+#                                linked; it is NOT claimed that the binary is
+#                                byte-identical to one built without it.
+#   MGPU_CUDA_DIAG defined   ->  the two target interface ids are substituted
+#                                with observational pass-through wrappers. Every
+#                                wrapper calls the genuine function exactly once,
+#                                with the original arguments, and returns the
+#                                genuine NvApi_Status verbatim.
+#
+# There is NO second variant: this is instrumentation, not an experiment, so the
+# CI job produces ONE artifact and there is no compare job. It is built with
+# MGPU_ARCH_COMPAT=ON for two reasons, neither of which is a claim about Init:
+#   a) COMPAT=ON is the configuration of the current known-clean baseline, so the
+#      diagnostic runs in the state that baseline was recorded in;
+#   b) that definition owns the existing nvapi_QueryInterface detour, which is
+#      the mechanism CUDA-DIAG uses to substitute a returned pointer. With it off
+#      there is no detour, nothing is intercepted, and cuda_diag::log_variant()
+#      reports the run as VOID for this diagnostic.
+#
+# ARCH_COMPAT is neither universally necessary nor sufficient for Init success.
+# Init success is a RUN-TIME validity gate on every run: the NGX portion of a run
+# whose P1.0c Init or P4.1 Init is FAIL_OutOfDate is void.
+#
+# Nothing in the selection, transport, presentation, parameter or CreateFeature
+# code is conditional on it.
+# ---------------------------------------------------------------------------
+option(MGPU_CUDA_DIAG "CUDADIAG: instrument the two NVAPI CUDA-interop calls (observational)" OFF)
+if(MGPU_CUDA_DIAG)
+    target_compile_definitions(mgpu_bridge PRIVATE MGPU_CUDA_DIAG=1)
+    message(STATUS "MGPU: CUDADIAG = ON (pass-through instrumentation of the two CUDA-interop ids)")
+else()
+    message(STATUS "MGPU: CUDADIAG = OFF (cuda_diag.cpp compiles to no-ops)")
 endif()
 
 option(MGPU_BUILD_TESTS "Build CPU-only adapter policy tests" OFF)

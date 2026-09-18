@@ -43,6 +43,7 @@
 #include "arch_test.hpp"  // ARCHTEST: the architecture A/B experiment (CONTROL/COMPAT)
 #include "create_contract.hpp"  // CREATECONTRACT: the creation-time parameter A/B
 #include "nvapi_init.hpp"       // NVAPIINIT: the explicit-NVAPI-initialization A/B
+#include "cuda_diag.hpp"        // CUDADIAG: the two NVAPI CUDA-interop calls DLSS-NR makes
 
 // R111. DXGI_STATUS_OCCLUDED comes from dxgi.h by way of <dxgi1_4.h> above.
 // Guarded because it is a SUCCESS code and a build where it went missing
@@ -2762,10 +2763,22 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
 
         mgpu::archtest::log_mode();
         mgpu::contract::log_variant();
+        mgpu::cudadiag::log_variant();
         mgpu::adapter::selection_result asel;
         mgpu::adapter::get_selection(asel);
         if (asel.valid)
+        {
             mgpu::archtest::set_neural_gpu(asel.selected_vendor_id, asel.selected_device_id);
+            // CUDADIAG: publish the neural adapter identity into cuda_diag's OWN
+            // atomics, once, here - before hook_install(), before the scope is
+            // armed, and before the private NR runtime is loaded. The CUDA-interop
+            // wrappers then read only those atomics and never call
+            // adapter::get_selection(), so the diagnostic adds no mutex
+            // acquisition to the NVIDIA CUDA/NVAPI call path.
+            mgpu::cudadiag::set_expected_adapter(asel.selected_luid,
+                                                 asel.selected_vendor_id,
+                                                 asel.selected_device_id);
+        }
         else
             mgpu::diag::warn("[ARCHTEST] T2 selection is not valid - neural GPU identity "
                              "unknown, so nothing will be rewritten");
@@ -2776,6 +2789,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
                              "cannot test the architecture theory; in CONTROL it is expected.");
         mgpu::archtest::log_scope_marker("startup private NR load + first probe");
         mgpu::archtest::scope_begin("startup private NR load");
+        mgpu::cudadiag::scope_startup_probe();   // CUDADIAG: label only, P1.0c
     }
 
     char snip_where[MAX_PATH * 2] = {};
@@ -2829,7 +2843,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
         // scope was armed for it. Disarm on every path, or a failed probe leaves
         // the rewrite armed into the real stream arm.
-        mgpu::archtest::scope_end();
+        mgpu::archtest::scope_end(); mgpu::cudadiag::scope_outside();
         return false;
     }
 
@@ -2850,7 +2864,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
         // scope was armed for it. Disarm on every path, or a failed probe leaves
         // the rewrite armed into the real stream arm.
-        mgpu::archtest::scope_end();
+        mgpu::archtest::scope_end(); mgpu::cudadiag::scope_outside();
         return false;
     }
 
@@ -2924,7 +2938,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
         // scope was armed for it. Disarm on every path, or a failed probe leaves
         // the rewrite armed into the real stream arm.
-        mgpu::archtest::scope_end();
+        mgpu::archtest::scope_end(); mgpu::cudadiag::scope_outside();
         return false;
     }
 
@@ -2937,7 +2951,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
         // scope was armed for it. Disarm on every path, or a failed probe leaves
         // the rewrite armed into the real stream arm.
-        mgpu::archtest::scope_end();
+        mgpu::archtest::scope_end(); mgpu::cudadiag::scope_outside();
         return false;
     }
 
@@ -3348,7 +3362,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
             // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
             // scope was armed for it. Disarm on every path, or a failed probe leaves
             // the rewrite armed into the real stream arm.
-            mgpu::archtest::scope_end();
+            mgpu::archtest::scope_end(); mgpu::cudadiag::scope_outside();
             return false;
         }
         init_ok = true;
@@ -3368,7 +3382,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
             // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
             // scope was armed for it. Disarm on every path, or a failed probe leaves
             // the rewrite armed into the real stream arm.
-            mgpu::archtest::scope_end();
+            mgpu::archtest::scope_end(); mgpu::cudadiag::scope_outside();
             return false;
         }
     }
@@ -3507,7 +3521,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
             // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
             // scope was armed for it. Disarm on every path, or a failed probe leaves
             // the rewrite armed into the real stream arm.
-            mgpu::archtest::scope_end();
+            mgpu::archtest::scope_end(); mgpu::cudadiag::scope_outside();
             return false;
         }
 
@@ -3524,7 +3538,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
             // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
             // scope was armed for it. Disarm on every path, or a failed probe leaves
             // the rewrite armed into the real stream arm.
-            mgpu::archtest::scope_end();
+            mgpu::archtest::scope_end(); mgpu::cudadiag::scope_outside();
             return false;
         }
         // From here on the list exists and is recording, so every exit runs
@@ -3542,7 +3556,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
             // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
             // scope was armed for it. Disarm on every path, or a failed probe leaves
             // the rewrite armed into the real stream arm.
-            mgpu::archtest::scope_end();
+            mgpu::archtest::scope_end(); mgpu::cudadiag::scope_outside();
             return false;
         }
 
@@ -3557,7 +3571,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
             // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
             // scope was armed for it. Disarm on every path, or a failed probe leaves
             // the rewrite armed into the real stream arm.
-            mgpu::archtest::scope_end();
+            mgpu::archtest::scope_end(); mgpu::cudadiag::scope_outside();
             return false;
         }
     }
@@ -3612,7 +3626,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         // installed. The runtime stays hooked, passing every call through
         // unchanged, until the real stream arm has had its own attempt.
         mgpu::archtest::log_create_feature_result((long)(unsigned)r, (void *)handle);
-        mgpu::archtest::scope_end();
+        mgpu::archtest::scope_end(); mgpu::cudadiag::scope_outside();
 
         if (r != NVSDK_NGX_Result_Success)
         {
@@ -11365,6 +11379,7 @@ namespace
         // intercepted and no decision, object, parameter or duration changes.
         mgpu::archtest::log_scope_marker("real stream arm");
         mgpu::archtest::scope_begin("real stream arm");
+        mgpu::cudadiag::scope_real_stream();   // CUDADIAG: label only, P4.1
 
         NVSDK_NGX_Result r = p_init(0ULL, data_path, ndev, &common, NVSDK_NGX_Version_API);
         snprintf(line, sizeof line, "[MGPU][P4.1] Init: result=0x%08X (%s)",
@@ -11398,7 +11413,7 @@ namespace
             // ARCHTEST: scope 2 exit. Disarm and drop the hooks on this path
             // too, or a failed capability query leaves the rewrite armed and
             // the detour live for the rest of the process.
-            mgpu::archtest::scope_end();
+            mgpu::archtest::scope_end(); mgpu::cudadiag::scope_outside();
             mgpu::archtest::hook_remove();
             return false;
         }
@@ -11635,7 +11650,7 @@ namespace
             mgpu::diag::error(line);
             // ARCHTEST: scope 2 exit. Same reason as the capability failure
             // above - disarm and drop the hooks on this path too.
-            mgpu::archtest::scope_end();
+            mgpu::archtest::scope_end(); mgpu::cudadiag::scope_outside();
             mgpu::archtest::hook_remove();
             return false;
         }
@@ -11741,7 +11756,7 @@ namespace
                     // what happened.
                     arm_fault_recover(s, seh_code);
                     // ARCHTEST: leave no detour behind on any exit path.
-                    mgpu::archtest::scope_end();
+                    mgpu::archtest::scope_end(); mgpu::cudadiag::scope_outside();
                     mgpu::archtest::hook_remove();
                     return false;
                 }
@@ -11789,7 +11804,7 @@ namespace
                               "summary says so. Handles already created are released with "
                               "the stream.");
             // ARCHTEST: the operation under test is over - disarm and remove.
-            mgpu::archtest::scope_end();
+            mgpu::archtest::scope_end(); mgpu::cudadiag::scope_outside();
             mgpu::archtest::hook_remove();
             return false;
         }
@@ -11810,7 +11825,7 @@ namespace
         // ARCHTEST: the feature-creation scope is complete. Disarm the rewrite
         // and remove the detour - from here on this process runs with the
         // original NVAPI entry point restored.
-        mgpu::archtest::scope_end();
+        mgpu::archtest::scope_end(); mgpu::cudadiag::scope_outside();
         mgpu::archtest::hook_remove();
         return true;
     }

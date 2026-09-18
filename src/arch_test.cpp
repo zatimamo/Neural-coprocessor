@@ -56,6 +56,7 @@
 
 #include "diag.hpp"
 #include "adapter.hpp"
+#include "cuda_diag.hpp"
 
 #if defined(__has_include)
 #  if __has_include(<MinHook.h>)
@@ -351,7 +352,20 @@ namespace
                        ? reinterpret_cast<void *>(&get_arch_info_shim)
                        : answer;
         }
-        return answer;
+
+        // ---- CUDADIAG composition point (Phase 2) -----------------------
+        // Observational only. select() answers `answer` itself for every id it
+        // does not instrument, and for the two CUDA-interop ids it answers a
+        // pass-through wrapper whose SOLE behaviour is to call the genuine
+        // function once with the original arguments and return its status
+        // verbatim. It can never alter an answer: with MGPU_CUDA_DIAG undefined
+        // it is an inline `return real`.
+        //
+        // This is deliberately on the EXISTING detour, not a second
+        // QueryInterface hook and not a hook on either CUDA entry point. The
+        // resolver investigation proved both ids reach the driver through the
+        // same cached nvapi_QueryInterface pointer this detour already owns.
+        return mgpu::cudadiag::select(id, answer);
     }
 
     // ---- identity: which physical GPU is MGPU's neural adapter? ---------
