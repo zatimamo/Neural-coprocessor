@@ -454,6 +454,11 @@ namespace
             S.result.selected_desc[sizeof S.result.selected_desc - 1] = '\0';
             S.result.rule = rule;
             S.result.selected_adapter = e.adapter;
+            // ARCHTEST: carry the identity out with the choice. Diagnostic for
+            // the architecture experiment only - nothing in the selection
+            // logic reads these back.
+            S.result.selected_vendor_id = e.vendor_id;
+            S.result.selected_device_id = e.device_id;
 
             snprintf(line, sizeof line,
                      "[MGPU][T2] SELECTED adapter[%u] luid=0x%08X-0x%08X desc=\"%s\" outputs=%u "

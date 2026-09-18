@@ -51,6 +51,13 @@ add_library(mgpu_bridge SHARED
     # SLTags= is set in mgpu.ini, so this source compiles into every build
     # and touches nothing in any of them until it is asked for.
     src/sl_tags.cpp
+    # ARCHTEST: the architecture A/B experiment. Self-contained like the five
+    # above - it holds its own NVAPI interception and no ReShade or
+    # gpu1_context types, so neither gains a dependency. It is compiled into
+    # BOTH variants; MGPU_ARCH_COMPAT decides whether it intercepts anything.
+    # No new link library: nvapi64.dll is reached with LoadLibraryW and
+    # GetProcAddress, the way the Reflex block in gpu1_context already does.
+    src/arch_test.cpp
 )
 
 target_include_directories(mgpu_bridge PRIVATE
@@ -148,6 +155,37 @@ target_link_libraries(mgpu_bridge PRIVATE
 # P0: warnings visible, not fatal. A compile error costs the same round
 # trip as a logic error and teaches less - keep the first-try bar low.
 target_compile_options(mgpu_bridge PRIVATE /W3)
+
+# ---------------------------------------------------------------------------
+# ARCHTEST. The architecture A/B experiment.
+#
+# BOTH variants are built from THIS revision. The ONLY thing that differs is
+# one compile definition:
+#
+#   MGPU_ARCH_COMPAT absent  ->  CONTROL. arch_test.cpp compiles to logging
+#                                and identity reporting only; no detour is
+#                                ever installed and no value is ever rewritten.
+#   MGPU_ARCH_COMPAT defined ->  COMPAT.  the same file additionally detours
+#                                nvapi_QueryInterface for the feature-creation
+#                                scope and rewrites NvAPI_GPU_GetArchInfo for
+#                                the selected neural GPU.
+#
+# The definition is passed in from the build system rather than written here,
+# so one source revision yields both binaries with a single configure flag:
+#
+#   cmake -B build-control -A x64
+#   cmake -B build-compat  -A x64 -DMGPU_ARCH_COMPAT=ON
+#
+# Nothing in the selection, transport, presentation, parameter or CreateFeature
+# code is conditional on it.
+# ---------------------------------------------------------------------------
+option(MGPU_ARCH_COMPAT "ARCHTEST COMPAT variant: enable the NVAPI architecture hook" OFF)
+if(MGPU_ARCH_COMPAT)
+    target_compile_definitions(mgpu_bridge PRIVATE MGPU_ARCH_COMPAT=1)
+    message(STATUS "MGPU: ARCHTEST variant = COMPAT (architecture hook enabled)")
+else()
+    message(STATUS "MGPU: ARCHTEST variant = CONTROL (no architecture modification)")
+endif()
 
 option(MGPU_BUILD_TESTS "Build CPU-only adapter policy tests" OFF)
 if(MGPU_BUILD_TESTS)

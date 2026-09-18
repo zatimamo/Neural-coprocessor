@@ -40,6 +40,7 @@
 #include "mgpu_ini_parser.hpp"
 #include "screen.hpp"   // R108: the idle screen. Compiled since R108, called since V26.
 #include "sl_probe.hpp"   // SL1: is our own device an SL proxy
+#include "arch_test.hpp"  // ARCHTEST: the architecture A/B experiment (CONTROL/COMPAT)
 
 // R111. DXGI_STATUS_OCCLUDED comes from dxgi.h by way of <dxgi1_4.h> above.
 // Guarded because it is a SUCCESS code and a build where it went missing
@@ -11187,6 +11188,41 @@ namespace
         common.LoggingInfo.LoggingCallback = ngx_log_callback;
         common.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
         common.LoggingInfo.DisableOtherLoggingSinks = false;
+
+        // ---- ARCHTEST: the A/B experiment, and it is the ONLY difference ----
+        //
+        // One question: does presenting Blackwell architecture information to
+        // the private DLSS-NR runtime, for the RTX 4070 it runs on, change
+        // CreateFeature(Reserved18) from 0xBAD00002 into Success or another
+        // result? See src/arch_test.hpp.
+        //
+        // The neural GPU is named by PCI identity taken from the T2 selection,
+        // never by enumeration order. The hook is installed before the private
+        // session opens so the runtime's own interface resolution is seen; it
+        // is removed after CreateFeature. The rewrite itself is armed only for
+        // the feature-creation scope below.
+        //
+        // WHY THIS BLOCK IS HARMLESS IN THE CONTROL BUILD, which is what makes
+        // the two variants comparable: every call here is read-only logging
+        // plus one read of the T2 selection. In CONTROL, arch_test.cpp compiles
+        // hook_install() to a log line and a `return false` - it never touches
+        // nvapi64, never writes a byte of any code page, and set_neural_gpu
+        // only records a number nothing acts on. No MGPU decision, object,
+        // parameter or duration changes. get_selection() is already called from
+        // this file for the same diagnostic purpose elsewhere.
+        {
+            mgpu::archtest::log_mode();
+            mgpu::adapter::selection_result asel;
+            mgpu::adapter::get_selection(asel);
+            if (asel.valid)
+                mgpu::archtest::set_neural_gpu(asel.selected_vendor_id, asel.selected_device_id);
+            else
+                mgpu::diag::warn("[ARCHTEST] T2 selection is not valid - neural GPU identity "
+                                 "unknown, so nothing will be rewritten");
+            mgpu::archtest::hook_install();
+            mgpu::archtest::scope_begin();
+        }
+
         NVSDK_NGX_Result r = p_init(0ULL, data_path, ndev, &common, NVSDK_NGX_Version_API);
         snprintf(line, sizeof line, "[MGPU][P4.1] Init: result=0x%08X (%s)",
                  (unsigned)r, ngx_result_name(r));
@@ -11525,12 +11561,19 @@ namespace
                              i + 1, s.width, s.height);
                     mgpu::diag::info(am);
                 }
+                // ARCHTEST. The rewrite is live for THIS call and nothing else.
+                // scope_begin() was called before the private session opened, so
+                // the runtime's own architecture queries during session setup
+                // were already inside the scope; this bracket exists so the
+                // experiment's log names the exact operation under test.
+                mgpu::archtest::log_entering_create_feature();
                 // V44. Guarded. See ngx_create_guarded for why it is its own
                 // function and why we do not re-enter NGX after a catch.
                 unsigned long seh_code = 0ul;
                 r = ngx_create_guarded((ngx_pf_create_seh_fn)p_cre, s.nl,
                                        (NVSDK_NGX_Feature)NVSDK_NGX_Feature_Reserved18,
                                        s.nr_params, &s.nr_handle[i], &seh_code);
+                mgpu::archtest::log_create_feature_result((long)(unsigned)r, (void *)s.nr_handle[i]);
                 if ((unsigned)r == NGX_RESULT_MGPU_SEH_FAULT)
                 {
                     // DO NOT close or execute the init list. NGX faulted with
@@ -11539,6 +11582,9 @@ namespace
                     // the stream continues transport-only and the window says
                     // what happened.
                     arm_fault_recover(s, seh_code);
+                    // ARCHTEST: leave no detour behind on any exit path.
+                    mgpu::archtest::scope_end();
+                    mgpu::archtest::hook_remove();
                     return false;
                 }
                 LARGE_INTEGER t1{}; QueryPerformanceCounter(&t1);
@@ -11584,6 +11630,9 @@ namespace
                               "pass did) - the stream continues TRANSPORT-ONLY and the "
                               "summary says so. Handles already created are released with "
                               "the stream.");
+            // ARCHTEST: the operation under test is over - disarm and remove.
+            mgpu::archtest::scope_end();
+            mgpu::archtest::hook_remove();
             return false;
         }
         // P8.1. LEFT NULL ON PURPOSE, and this is a fix rather than a
@@ -11600,6 +11649,11 @@ namespace
         // P5.0 line when it does start. It is advanced below, per frame, and
         // ONLY when the final pass actually wrote.
         s.nr_final = nullptr;
+        // ARCHTEST: the feature-creation scope is complete. Disarm the rewrite
+        // and remove the detour - from here on this process runs with the
+        // original NVAPI entry point restored.
+        mgpu::archtest::scope_end();
+        mgpu::archtest::hook_remove();
         return true;
     }
 }

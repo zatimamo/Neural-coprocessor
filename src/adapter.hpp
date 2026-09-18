@@ -59,6 +59,13 @@ namespace mgpu::adapter
         UINT selected_outputs = 0;
         char selected_desc[128]{};
         const char *rule = "none";
+        // ARCHTEST. The selected adapter's PCI identity, carried out of the
+        // enumeration so the architecture-compatibility experiment can name
+        // the neural GPU by identity rather than by enumeration order. DXGI's
+        // VendorId/DeviceId are the same pair NVAPI reports for a physical
+        // GPU, so the match is made on these two numbers.
+        unsigned selected_vendor_id = 0;
+        unsigned selected_device_id = 0;
         // AddRef'd IDXGIAdapter1 for T3's D3D12CreateDevice; released by
         // shutdown(). nullptr when no adapter was selected.
         void *selected_adapter = nullptr;
