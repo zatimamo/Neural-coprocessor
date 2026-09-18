@@ -187,6 +187,44 @@ else()
     message(STATUS "MGPU: ARCHTEST variant = CONTROL (no architecture modification)")
 endif()
 
+# ---------------------------------------------------------------------------
+# ARCHTEST: MinHook, the x64 trampoline provider.
+#
+# The detour needs a callable ORIGINAL: the overwritten prologue copied
+# elsewhere with every RIP-relative operand and relative branch relocated.
+# Instruction-boundary safety alone does NOT make a copied x64 instruction
+# relocatable, and that relocation is the entire problem, so it is delegated
+# to MinHook (TsudaKageyu/minhook, BSD-2-Clause).
+#
+# CI fetches a PINNED MinHook, builds it static, and points this at it:
+#     -DMGPU_MINHOOK_DIR=<tree>   (header at <tree>/include, lib at
+#                                  <tree>/lib/MinHook.lib)
+#
+# It is OPTIONAL on purpose. When it is absent, src/arch_test.cpp still
+# compiles and links: COMPAT logs "MinHook not available in this build" and
+# performs NO interception, leaving the process on the original NVAPI entry.
+# Fail closed - never patch, then call the patched entry.
+# ---------------------------------------------------------------------------
+set(MGPU_MINHOOK_DIR "" CACHE PATH "MinHook tree: <dir>/include/MinHook.h and <dir>/lib/MinHook.lib")
+if(MGPU_MINHOOK_DIR)
+    if(EXISTS "${MGPU_MINHOOK_DIR}/include/MinHook.h")
+        target_include_directories(mgpu_bridge PRIVATE "${MGPU_MINHOOK_DIR}/include")
+        message(STATUS "MGPU: MinHook headers found at ${MGPU_MINHOOK_DIR}/include")
+    else()
+        message(WARNING "MGPU: MGPU_MINHOOK_DIR set but ${MGPU_MINHOOK_DIR}/include/MinHook.h is missing - "
+                        "ARCHTEST will fail closed and not intercept")
+    endif()
+    if(EXISTS "${MGPU_MINHOOK_DIR}/lib/MinHook.lib")
+        target_link_libraries(mgpu_bridge PRIVATE "${MGPU_MINHOOK_DIR}/lib/MinHook.lib")
+        message(STATUS "MGPU: MinHook library linked from ${MGPU_MINHOOK_DIR}/lib/MinHook.lib")
+    else()
+        message(WARNING "MGPU: ${MGPU_MINHOOK_DIR}/lib/MinHook.lib is missing - "
+                        "ARCHTEST will fail to link or fail closed")
+    endif()
+else()
+    message(STATUS "MGPU: MGPU_MINHOOK_DIR not set - ARCHTEST COMPAT will fail closed (no interception)")
+endif()
+
 option(MGPU_BUILD_TESTS "Build CPU-only adapter policy tests" OFF)
 if(MGPU_BUILD_TESTS)
     enable_testing()

@@ -23,12 +23,12 @@
 //   adds one hook around one call.
 //
 // SCOPE - TWO AXES, BOTH ENFORCED
-//   Identity : the rewrite applies only to the physical GPU whose PCI
-//              identity (vendor << 16 | device) equals the SELECTED neural
-//              adapter's. The RTX 4070 is 0x10DE2786 and the RTX 4070 Ti
-//              SUPER is 0x10DE2705, so a mismatch is a refusal, never a
-//              spoof. If identity cannot be established, NOTHING is
-//              rewritten and the log says so.
+//   Identity : the rewrite applies only to the physical GPU whose raw NVAPI
+//              pDeviceId equals the SELECTED neural adapter's. NVAPI packs that
+//              word as (device << 16) | vendor, so the RTX 4070 is 0x278610DE
+//              and the RTX 4070 Ti SUPER is 0x270510DE - different words, so a
+//              mismatch is a refusal, never a spoof. If identity cannot be
+//              established, NOTHING is rewritten and the log says so.
 //   Time     : the rewrite is armed only between arch_test_scope_begin()
 //              and arch_test_scope_end(), which MGPU calls immediately
 //              around the private DLSS-NR feature-creation scope. Outside
@@ -48,9 +48,10 @@ namespace mgpu::archtest
     // The one line that identifies which build a log came from.
     void log_mode();
 
-    // Say which GPU the rewrite is allowed to affect. Normalised the same way
-    // NVAPI reports it: (vendor_id << 16) | device_id. Called with the T2
-    // selection once it exists.
+    // Say which GPU the rewrite is allowed to affect. The two halves arrive
+    // separately from DXGI and are packed the way NVAPI packs them:
+    // (device_id << 16) | vendor_id. Called with the T2 selection once it
+    // exists.
     void set_neural_gpu(unsigned vendor_id, unsigned device_id);
 
     // Install the NVAPI detour. Returns false if it could not be installed or

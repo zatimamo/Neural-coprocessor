@@ -36,6 +36,10 @@ name: archtest-ab
 on:
   workflow_dispatch:
   push:
+    # THIS EXPERIMENT LIVES ON ITS OWN BRANCH. It is not main, it is not merged
+    # into main, and nothing here is intended to ship. Keeping the filter on the
+    # experiment branch means a push of the ARCHTEST revision starts the run
+    # without any part of it reaching main.
     branches: [archtest-ab]
     paths:
       - 'src/arch_test.cpp'
@@ -53,6 +57,10 @@ env:
   # Same pins as build.yml. Source of truth: VENDOR_LOCK.md.
   RESHADE_SHA: 18deaa52de0c425a78b329e9cb3c497281cd00ec
   NGX_SHA: a291cc7d2cc642a51566f3dfd5376f635cd1b284
+  # ARCHTEST only. MinHook v1.3.4, BSD-2-Clause. Pinned by commit so the
+  # trampoline provider cannot drift under the experiment. The licence is
+  # recorded in the build log by the fetch step below.
+  MINHOOK_SHA: c3fcafdc10146beb5919319d0683e44e3c30d537
 
 jobs:
   build:
@@ -144,15 +152,82 @@ jobs:
 
       # Configure once and read the variant back out of the configure output, so
       # a mistake in the matrix cannot ship two identical binaries.
+      # MinHook provides the x64 relocation trampoline. The detour needs a
+      # callable ORIGINAL, and copying prologue bytes is only correct once
+      # RIP-relative operands and relative branches inside them are relocated.
+      # That is the whole problem MinHook exists to solve, so it is a pinned
+      # dependency rather than another hand-written decoder.
+      #
+      # It is EXTERNAL and OPTIONAL: the source tree never vendors it, and the
+      # module compiles without it (failing closed, performing no interception).
+      - name: Fetch and build MinHook at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/minhook.tar.gz \
+            "https://codeload.github.com/TsudaKageyu/minhook/tar.gz/${MINHOOK_SHA}"
+          tar -xzf _dl/minhook.tar.gz -C _dl
+          rm -rf ext/minhook
+          mv _dl/minhook-* ext/minhook
+          test -f ext/minhook/include/MinHook.h
+          test -f ext/minhook/LICENSE.txt
+
+          echo "--- MinHook licence (BSD-2-Clause) ---"
+          head -n 5 ext/minhook/LICENSE.txt
+
+          # Build it static. The pinned MinHook CMake build applies a platform
+          # postfix to the target's output, so the artefact on disk is
+          # minhook.x64.lib rather than MinHook.lib. DISCOVER it rather than
+          # assume a name, then stage it at one deterministic path for the
+          # MGPU CMake variable.
+          cmake -S ext/minhook -B ext/minhook/build -A x64 \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+          cmake --build ext/minhook/build --config Release
+
+          echo "--- every library MinHook's build produced ---"
+          find ext/minhook/build -type f -iname '*.lib' | sort || true
+
+          LIB=$(find ext/minhook/build -type f \( -iname 'minhook.x64.lib' -o -iname '*minhook*.lib' \) | head -n1)
+          if [ -z "$LIB" ]; then
+            echo "::error::no MinHook static library found under ext/minhook/build"
+            echo "searched for: minhook.x64.lib, *minhook*.lib"
+            find ext/minhook/build -type f | sort | head -50 || true
+            exit 1
+          fi
+          echo "discovered MinHook library: $LIB"
+          mkdir -p ext/minhook/lib
+          cp "$LIB" ext/minhook/lib/MinHook.lib
+          echo "staged at ext/minhook/lib/MinHook.lib (deterministic path for MGPU_MINHOOK_DIR)"
+          ls -l ext/minhook/lib/
+
+          # Prove the trampoline API the module calls actually exists.
+          grep -q 'MH_CreateHook' ext/minhook/include/MinHook.h || {
+            echo "::error::MinHook.h does not declare MH_CreateHook"; exit 1; }
+
       - name: Configure (${{ matrix.variant }})
         shell: bash
         run: |
-          cmake -B build -A x64 -DMGPU_ARCH_COMPAT=${{ matrix.compat }} 2>&1 | tee _cfg.txt
+          cmake -B build -A x64 -DMGPU_ARCH_COMPAT=${{ matrix.compat }} \
+            -DMGPU_MINHOOK_DIR="${{ github.workspace }}/ext/minhook" 2>&1 | tee _cfg.txt
+          # -i on purpose. The matrix values are lowercase (control/compat) and
+          # CMake prints them uppercase in its STATUS line
+          # ("ARCHTEST variant = CONTROL ..."), so a case-sensitive grep fails a
+          # correct configure.
           grep -qi "ARCHTEST variant = ${{ matrix.variant }}" _cfg.txt || {
             echo "::error::configure did not report the expected ARCHTEST variant"
-            echo "expected: ARCHTEST variant = ${{ matrix.variant }}"
-            grep -n 'ARCHTEST variant' _cfg.txt || echo "(no ARCHTEST variant line in configure output)"
+            echo "expected (case-insensitive): ARCHTEST variant = ${{ matrix.variant }}"
+            grep -ni 'ARCHTEST variant' _cfg.txt || echo "(no ARCHTEST variant line in configure output)"
             exit 1; }
+
+          # COMPAT must actually get the hook library. A COMPAT build that
+          # silently fell back to "no interception" would produce a binary
+          # identical in behaviour to CONTROL and the experiment would be void.
+          if [ "${{ matrix.variant }}" = "compat" ]; then
+            grep -q "MinHook library linked from" _cfg.txt || {
+              echo "::error::COMPAT configured WITHOUT MinHook - it would fail closed and intercept nothing"
+              grep -n 'MinHook' _cfg.txt || true
+              exit 1; }
+          fi
 
       - name: Build
         run: cmake --build build --config Release
@@ -304,8 +379,24 @@ jobs:
         run: |
           set -e
           find arts -type f | sort
-          HC=$(sha256sum arts/mgpu_arch_control/nvngx.dll_mgpu_bridge.addon64 | awk '{print $1}')
-          HP=$(sha256sum arts/mgpu_arch_compat/nvngx.dll_mgpu_bridge.addon64 | awk '{print $1}')
+
+          # upload-artifact uploads the CONTENTS of the path, so each artifact
+          # directory contains _deploy/ with the staged deploy set inside it.
+          # Hash the add-on at its real path, not the artifact directory.
+          CTRL_ADDON=arts/mgpu_arch_control/_deploy/nvngx.dll_mgpu_bridge.addon64
+          COMP_ADDON=arts/mgpu_arch_compat/_deploy/nvngx.dll_mgpu_bridge.addon64
+
+          for f in "$CTRL_ADDON" "$COMP_ADDON"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::expected artefact missing: $f"
+              echo "--- what was actually downloaded ---"
+              find arts -type f | sort
+              exit 1
+            fi
+          done
+
+          HC=$(sha256sum "$CTRL_ADDON" | awk '{print $1}')
+          HP=$(sha256sum "$COMP_ADDON" | awk '{print $1}')
           echo "control = $HC"
           echo "compat  = $HP"
           if [ "$HC" = "$HP" ]; then

@@ -1,7 +1,10 @@
 // ============================================================================
 // MGPU Bridge - ARCHTEST implementation. See arch_test.hpp for the contract.
 //
-// Independently written for this experiment. No third-party source is copied.
+// Independently written for this experiment. No experiment logic is copied
+// from anywhere; the only third-party code involved is a hooking library that
+// is LINKED, not vendored into this file (see "THE HOOK" below).
+//
 // The NVAPI interface ids and the NV_GPU_ARCH_INFO layout below are public
 // vendor interface facts, taken from NVIDIA/nvapi's own headers:
 //     nvapi_interface.h : { "NvAPI_GPU_GetArchInfo", 0xd8265d24 }
@@ -11,9 +14,37 @@
 //                             NvU32 architecture; NvU32 implementation;
 //                             NvU32 revision; }
 //                         NV_GPU_ARCH_INFO_VER_2 = MAKE_NVAPI_VERSION(...,2)
-// These are the same class of constant MGPU already carries for NvAPI_Initialize
-// and NvAPI_D3D_SetSleepMode in gpu1_context.cpp, and they are cited rather
-// than guessed: a wrong id returns a pointer to a DIFFERENT function.
+// These are the same class of constant MGPU already carries for
+// NvAPI_Initialize and NvAPI_D3D_SetSleepMode in gpu1_context.cpp, and they
+// are cited rather than guessed: a wrong id returns a pointer to a DIFFERENT
+// function.
+//
+// ============================================================================
+// THE HOOK, AND WHY IT IS A LIBRARY CALL RATHER THAN HAND-WRITTEN
+// ============================================================================
+// nvapi64!nvapi_QueryInterface is detoured. The detour needs a callable
+// ORIGINAL, and that original is what this file previously got wrong: it
+// stored the function's own entry address and then overwrote that same
+// address with the jump, so the "original" became the detour and the first
+// call recursed until the stack was gone. The game died immediately after
+// "hook installed", which is exactly where map_target_gpu() first calls it.
+//
+// A correct original is a TRAMPOLINE: the overwritten prologue instructions
+// copied elsewhere, every RIP-relative operand and every relative branch/call
+// inside them relocated to the new address, ending in a jump back to
+// target + copied_length. Instruction-boundary safety alone is NOT enough - a
+// copied instruction can be boundary-aligned and still be wrong if it
+// addresses memory or jumps relative to its old position.
+//
+// That relocation is the whole problem, so it is delegated to MinHook
+// (TsudaKageyu/minhook, BSD-2-Clause), the de-facto standard x64 hooking
+// library: MH_CreateHook() performs the relocation and hands back the
+// trampoline. This file contains no instruction decoder.
+//
+// MINHOOK IS OPTIONAL AT COMPILE TIME. If its header is not on the include
+// path this module still compiles and links, hook_install() logs that it
+// cannot intercept, and the process runs with the original NVAPI entry
+// untouched. That is fail-closed: never patch, then call the patched entry.
 // ============================================================================
 
 #include "arch_test.hpp"
@@ -25,6 +56,16 @@
 
 #include "diag.hpp"
 #include "adapter.hpp"
+
+#if defined(__has_include)
+#  if __has_include(<MinHook.h>)
+#    include <MinHook.h>
+#    define ARCHTEST_HAVE_MINHOOK 1
+#  endif
+#endif
+#ifndef ARCHTEST_HAVE_MINHOOK
+#  define ARCHTEST_HAVE_MINHOOK 0
+#endif
 
 namespace mgpu::archtest
 {
@@ -62,17 +103,19 @@ namespace
         void *gpu[64];
     };
 
-    void *g_pfn_query_real = nullptr;      // the REAL nvapi_QueryInterface
-    void *g_pfn_pci_ident = nullptr;       // the REAL NvAPI_GPU_GetPCIIdentifiers
-    void *g_pfn_arch_real = nullptr;       // the REAL NvAPI_GPU_GetArchInfo
+    // THE ORIGINAL. After hook_install() this points at the relocation
+    // trampoline, NOT at the patched entry - the distinction the previous
+    // revision got wrong.
+    void *g_pfn_query_original = nullptr;
 
-    void *g_hook_page = nullptr;           // our detour stub
-    unsigned char g_saved_entry[32] = {};
-    unsigned g_saved_len = 0;
+    void *g_pfn_arch_original = nullptr;   // the REAL NvAPI_GPU_GetArchInfo (trampoline)
+    void *g_pfn_arch_entry = nullptr;      // its patched entry, for MH removal
+
+    void *g_hook_target = nullptr;         // nvapi_QueryInterface entry
     bool g_hook_live = false;
 
     void *g_target_gpu = nullptr;          // the RTX 4070's physical handle
-    unsigned g_target_pci = 0;             // (vendor << 16) | device
+    unsigned g_target_pci = 0;             // NVAPI pDeviceId packing: (device << 16) | vendor
     bool g_target_known = false;
 
     std::atomic<bool> g_active{false};     // the temporal scope
@@ -83,103 +126,39 @@ namespace
     using pfn_pci_identifiers = int (*)(void *, unsigned *, unsigned *, unsigned *, unsigned *);
     using pfn_enum_physical = int (*)(NV_PHYSICAL_GPU_HANDLE_ARRAY *, unsigned *);
 
-    // ---- minimal x64 instruction-length decoder -------------------------
-    // Writing a detour over the first bytes of a function is only sound if the
-    // copy ends on an instruction boundary. Rather than assume a prologue
-    // shape, decode it. Returns 0 for anything not decoded, and the caller
-    // REFUSES rather than guessing.
-    int insn_len(const unsigned char *p, int avail)
+#if ARCHTEST_HAVE_MINHOOK
+    const char *mh_status_string(MH_STATUS s)
     {
-        int i = 0;
-        bool rex_w = false;
-
-        // legacy prefixes
-        for (;;)
+        switch (s)
         {
-            if (!(i < avail)) return 0;
-            const unsigned char b = p[i];
-            if (b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 ||
-                b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 || b == 0x64 || b == 0x65)
-            { ++i; continue; }
-            break;
+            case MH_OK: return "MH_OK";
+            case MH_ERROR_ALREADY_INITIALIZED: return "MH_ERROR_ALREADY_INITIALIZED";
+            case MH_ERROR_NOT_INITIALIZED: return "MH_ERROR_NOT_INITIALIZED";
+            case MH_ERROR_ALREADY_CREATED: return "MH_ERROR_ALREADY_CREATED";
+            case MH_ERROR_NOT_CREATED: return "MH_ERROR_NOT_CREATED";
+            case MH_ERROR_ENABLED: return "MH_ERROR_ENABLED";
+            case MH_ERROR_DISABLED: return "MH_ERROR_DISABLED";
+            case MH_ERROR_NOT_EXECUTABLE: return "MH_ERROR_NOT_EXECUTABLE";
+            case MH_ERROR_UNSUPPORTED_FUNCTION: return "MH_ERROR_UNSUPPORTED_FUNCTION";
+            case MH_ERROR_MEMORY_ALLOC: return "MH_ERROR_MEMORY_ALLOC";
+            case MH_ERROR_MEMORY_PROTECT: return "MH_ERROR_MEMORY_PROTECT";
+            case MH_ERROR_MODULE_NOT_FOUND: return "MH_ERROR_MODULE_NOT_FOUND";
+            case MH_ERROR_FUNCTION_NOT_FOUND: return "MH_ERROR_FUNCTION_NOT_FOUND";
+            default: return "MH_ERROR_?";
         }
-        // REX
-        if (i < avail && p[i] >= 0x40 && p[i] <= 0x4F)
-        {
-            rex_w = (p[i] & 0x08) != 0;
-            ++i;
-        }
-        if (i >= avail) return 0;
-        const unsigned char op = p[i++];
-
-        if (op >= 0x50 && op <= 0x5F) return i;          // push/pop r64
-        if (op == 0x90 || op == 0xC3 || op == 0xCC) return i;
-        if (op >= 0xB8 && op <= 0xBF) return i + (rex_w ? 8 : 4);
-        if (op >= 0xB0 && op <= 0xB7) return i + 1;
-        if (op == 0x6A) return i + 1;
-        if (op == 0x68) return i + 4;
-        if (op == 0xE8 || op == 0xE9) return (i + 4 <= avail) ? i + 4 : 0;
-        if (op == 0xEB) return (i + 1 <= avail) ? i + 1 : 0;
-
-        bool modrm = false, imm8 = false, imm32 = false;
-        switch (op)
-        {
-            case 0x88: case 0x89: case 0x8A: case 0x8B:
-            case 0x00: case 0x01: case 0x02: case 0x03:
-            case 0x28: case 0x29: case 0x2A: case 0x2B:
-            case 0x30: case 0x31: case 0x32: case 0x33:
-            case 0x84: case 0x85: case 0x8D:
-            case 0xFF: case 0xFE:
-                modrm = true; break;
-            case 0x83: case 0xC1: case 0x6B: case 0x80:
-                modrm = true; imm8 = true; break;
-            case 0x81: case 0xC7: case 0x69:
-                modrm = true; imm32 = true; break;
-            default:
-                return 0;                                 // not decoded -> refuse
-        }
-        if (!modrm || i >= avail) return 0;
-
-        const unsigned char m = p[i++];
-        const int mod = m >> 6, rm = m & 7;
-        if (mod != 3)
-        {
-            if (rm == 4)
-            {
-                if (i >= avail) return 0;
-                const unsigned char sib = p[i++];
-                if ((sib & 7) == 5 && mod == 0) i += 4;
-            }
-            else if (rm == 5 && mod == 0) i += 4;
-            if (mod == 1) i += 1;
-            else if (mod == 2) i += 4;
-        }
-        if (imm8) i += 1;
-        if (imm32) i += 4;
-        return (i <= avail) ? i : 0;
     }
-
-    // Bytes consumed by whole instructions until >= need. 0 if undecodable.
-    int bytes_to_cover(const unsigned char *p, int avail, int need)
-    {
-        int total = 0;
-        while (total < need)
-        {
-            const int l = insn_len(p + total, avail - total);
-            if (l <= 0) return 0;
-            total += l;
-            if (total > 32) return 0;
-        }
-        return total;
-    }
+#else
+    const char *mh_status_string(int) { return "MinHook not compiled in"; }
+#endif
 
     // ---- the shim the runtime actually calls ----------------------------
-    // Signature is the real one. The real function is called FIRST; the
-    // rewrite is applied afterwards to its output and only under every gate.
+    // Signature is the real one. The real function is called FIRST, through
+    // its trampoline; the rewrite is applied afterwards to its output and only
+    // when every gate passes.
     int __cdecl get_arch_info_shim(void *hPhysicalGpu, NV_GPU_ARCH_INFO *pInfo)
     {
         const pfn_get_arch_info real_fn =
-            reinterpret_cast<pfn_get_arch_info>(g_pfn_arch_real);
+            reinterpret_cast<pfn_get_arch_info>(g_pfn_arch_original);
         if (real_fn == nullptr)
             return -1;
 
@@ -191,12 +170,10 @@ namespace
 
         char l[288];
         std::snprintf(l, sizeof l,
-                      "[ARCHTEST] GetArchInfo handle=%p status=%d",
-                      hPhysicalGpu, status);
+                      "[ARCHTEST] GetArchInfo handle=%p status=%d", hPhysicalGpu, status);
         mgpu::diag::info(l);
         std::snprintf(l, sizeof l,
-                      "[ARCHTEST] original arch=0x%X impl=0x%X rev=0x%X",
-                      arch0, impl0, rev0);
+                      "[ARCHTEST] original arch=0x%X impl=0x%X rev=0x%X", arch0, impl0, rev0);
         mgpu::diag::info(l);
 
         // ---- the gates, in order. Any one of them can refuse. ----
@@ -224,8 +201,8 @@ namespace
             mgpu::diag::info(l);
             mgpu::diag::info("[ARCHTEST] rewrite=yes");
             std::snprintf(l, sizeof l,
-                          "[ARCHTEST] target identity pci=0x%08X handle=%p (selected neural adapter)",
-                          g_target_pci, g_target_gpu);
+                          "[ARCHTEST] target identity expected pDeviceId=0x%08X handle=%p "
+                          "(selected neural adapter)", g_target_pci, g_target_gpu);
             mgpu::diag::info(l);
         }
         else
@@ -236,72 +213,88 @@ namespace
         return status;
     }
 
+    // Hook NvAPI_GPU_GetArchInfo itself, so the runtime's key dispatch of the
+    // architecture query lands in get_arch_info_shim and the real function
+    // stays reachable through its own trampoline.
+    bool create_arch_hook(void *target)
+    {
+#if ARCHTEST_HAVE_MINHOOK
+        void *original = nullptr;
+        MH_STATUS st = MH_CreateHook(target, reinterpret_cast<LPVOID>(&get_arch_info_shim), &original);
+        if (st != MH_OK || original == nullptr)
+        {
+            char l[192];
+            std::snprintf(l, sizeof l, "[ARCHTEST] MH_CreateHook(GetArchInfo) failed: %s",
+                          mh_status_string(st));
+            mgpu::diag::warn(l);
+            return false;
+        }
+        // PUBLISH THE TRAMPOLINE BEFORE THE HOOK BECOMES CALLABLE.
+        //
+        // get_arch_info_shim dereferences g_pfn_arch_original on every entry. If
+        // the hook were enabled first, this thread - or any other the runtime
+        // calls from - could enter the shim in the window between MH_EnableHook
+        // returning and the pointer being stored, and the shim would run with a
+        // null original. Publishing first closes that window completely: the
+        // pointer is non-null from the moment the detour can be reached.
+        g_pfn_arch_original = original;    // THE TRAMPOLINE
+
+        st = MH_EnableHook(target);
+        if (st != MH_OK)
+        {
+            char l[192];
+            std::snprintf(l, sizeof l, "[ARCHTEST] MH_EnableHook(GetArchInfo) failed: %s",
+                          mh_status_string(st));
+            mgpu::diag::warn(l);
+            // Take the publication back with the hook, so a failed enable cannot
+            // leave a trampoline pointing at something that is no longer
+            // installed.
+            MH_RemoveHook(target);
+            g_pfn_arch_original = nullptr;
+            return false;
+        }
+        return true;
+#else
+        (void)target;
+        return false;
+#endif
+    }
+
     // ---- the detour on nvapi_QueryInterface -----------------------------
-    // It hands the runtime OUR shim for exactly one id per build mode. Every
-    // other id is returned untouched. The real function is called first, so
-    // its answer is never invented.
+    // It hands the runtime OUR shim for exactly one id. Every other id is
+    // returned untouched. The REAL function is called through the trampoline
+    // first, so its answer is never invented and never re-enters this detour.
     void *__cdecl query_detour(unsigned int id)
     {
-        const pfn_query real_fn = reinterpret_cast<pfn_query>(g_pfn_query_real);
-        void *answer = (real_fn != nullptr) ? real_fn(id) : nullptr;
+        if (g_pfn_query_original == nullptr)
+        {
+            // No trampoline: refuse to guess. Answering null makes the runtime
+            // treat the interface as absent - a clean no-op rather than the
+            // re-entrant crash this replaces.
+            mgpu::diag::error("[ARCHTEST] detour entered with no original trampoline - "
+                              "returning null rather than recursing");
+            return nullptr;
+        }
+
+        const pfn_query real_fn = reinterpret_cast<pfn_query>(g_pfn_query_original);
+        void *answer = real_fn(id);            // ORIGINAL, via the trampoline
 
         if (id == NVAPI_ID_GET_ARCH_INFO)
         {
-            // Remember the REAL address before substituting our shim, so the
-            // shim can call the real function through it.
-            if (answer != nullptr)
-                g_pfn_arch_real = answer;
-            return reinterpret_cast<void *>(&get_arch_info_shim);
+            if (answer != nullptr && g_pfn_arch_original == nullptr)
+            {
+                g_pfn_arch_entry = answer;
+                if (create_arch_hook(answer))
+                    mgpu::diag::info("[ARCHTEST] GetArchInfo detour installed");
+                else
+                    mgpu::diag::warn("[ARCHTEST] GetArchInfo detour could NOT be installed - "
+                                     "passing the real function through unchanged");
+            }
+            return (g_pfn_arch_original != nullptr)
+                       ? reinterpret_cast<void *>(&get_arch_info_shim)
+                       : answer;
         }
         return answer;
-    }
-
-    // ---- detour installation -------------------------------------------
-    bool install_detour(void *target, void *replacement)
-    {
-        unsigned char probe[32] = {};
-        std::memcpy(probe, target, sizeof probe);
-
-        int need = bytes_to_cover(probe, sizeof probe, 12);
-        if (need < 12)
-        {
-            // Either undecodable (0) or too short for the 12-byte jmp. Both are
-            // refusals: a split instruction would fault inside nvapi64.
-            mgpu::diag::warn("[ARCHTEST] hook refused: nvapi_QueryInterface prologue does not "
-                             "reach an instruction boundary at 12 bytes");
-            return false;
-        }
-
-        DWORD old = 0;
-        if (!VirtualProtect(target, static_cast<SIZE_T>(need), PAGE_EXECUTE_READWRITE, &old))
-        {
-            mgpu::diag::error("[ARCHTEST] hook refused: VirtualProtect failed");
-            return false;
-        }
-        std::memcpy(g_saved_entry, target, static_cast<size_t>(need));
-        g_saved_len = static_cast<unsigned>(need);
-
-        unsigned char patch[16] = {};
-        patch[0] = 0x48; patch[1] = 0xB8;                       // mov rax, imm64
-        std::memcpy(patch + 2, &replacement, sizeof replacement);
-        patch[10] = 0xFF; patch[11] = 0xE0;                     // jmp rax
-        for (int i = 12; i < need; ++i) patch[i] = 0x90;        // nop pad
-
-        std::memcpy(target, patch, static_cast<size_t>(need));
-        VirtualProtect(target, static_cast<SIZE_T>(need), old, &old);
-        FlushInstructionCache(GetCurrentProcess(), target, static_cast<SIZE_T>(need));
-        return true;
-    }
-
-    void remove_detour(void *target)
-    {
-        if (g_saved_len == 0) return;
-        DWORD old = 0;
-        if (!VirtualProtect(target, g_saved_len, PAGE_EXECUTE_READWRITE, &old)) return;
-        std::memcpy(target, g_saved_entry, g_saved_len);
-        VirtualProtect(target, g_saved_len, old, &old);
-        FlushInstructionCache(GetCurrentProcess(), target, g_saved_len);
-        g_saved_len = 0;
     }
 
     // ---- identity: which physical GPU is MGPU's neural adapter? ---------
@@ -317,10 +310,13 @@ namespace
                              "NOT spoofing any adapter");
             return;
         }
-        if (g_pfn_query_real == nullptr)
+        if (g_pfn_query_original == nullptr)
+        {
+            mgpu::diag::warn("[ARCHTEST] no QueryInterface trampoline - cannot enumerate GPUs");
             return;
+        }
 
-        const pfn_query q = reinterpret_cast<pfn_query>(g_pfn_query_real);
+        const pfn_query q = reinterpret_cast<pfn_query>(g_pfn_query_original);
         const pfn_enum_physical enum_phys =
             reinterpret_cast<pfn_enum_physical>(q(NVAPI_ID_ENUM_PHYSICAL_GPUS));
         const pfn_pci_identifiers pci_ids =
@@ -351,12 +347,15 @@ namespace
             unsigned dev = 0, sub = 0, rev = 0, ext = 0;
             if (pci_ids(gpus.gpu[i], &dev, &sub, &rev, &ext) != NVAPI_OK) continue;
 
-            // NVAPI returns the PCI device id in the low 16 bits with the
-            // vendor in the high 16: 0x10DE2786 for the RTX 4070.
-            char l[224];
+            // `dev` is the RAW NVAPI pDeviceId: vendor in the low 16 bits,
+            // device in the high 16. Both it and the packed target are logged so
+            // the match is provable from the log alone.
+            char l[320];
             std::snprintf(l, sizeof l,
-                          "[ARCHTEST] nvapi physical[%u] handle=%p pci=0x%08X subsystem=0x%08X",
-                          i, gpus.gpu[i], dev, sub);
+                          "[ARCHTEST] nvapi physical[%u] handle=%p raw pDeviceId=0x%08X "
+                          "(vendor=0x%04X device=0x%04X) subsystem=0x%08X expected=0x%08X",
+                          i, gpus.gpu[i], dev,
+                          dev & 0xFFFFu, (dev >> 16) & 0xFFFFu, sub, g_target_pci);
             mgpu::diag::info(l);
 
             if (dev == g_target_pci)
@@ -364,8 +363,9 @@ namespace
                 g_target_gpu = gpus.gpu[i];
                 g_target_known = true;
                 std::snprintf(l, sizeof l,
-                              "[ARCHTEST] selected neural GPU identity MATCHED: pci=0x%08X handle=%p "
-                              "(matched by PCI identity, not enumeration order)", dev, gpus.gpu[i]);
+                              "[ARCHTEST] selected neural GPU identity MATCHED: raw pDeviceId=0x%08X "
+                              "== expected 0x%08X handle=%p (matched on the raw NVAPI word, "
+                              "not enumeration order)", dev, g_target_pci, gpus.gpu[i]);
                 mgpu::diag::info(l);
                 return;
             }
@@ -373,10 +373,11 @@ namespace
 
         // No match: refuse. Spoofing some other Ada adapter is the exact
         // failure mode this scope rule exists to prevent.
-        char l[256];
+        char l[320];
         std::snprintf(l, sizeof l,
                       "[ARCHTEST] selected neural GPU identity NOT FOUND among %u physical GPUs "
-                      "(looking for pci=0x%08X) - NOT spoofing any adapter", count, g_target_pci);
+                      "(expected NVAPI pDeviceId=0x%08X) - NOT spoofing any adapter",
+                      count, g_target_pci);
         mgpu::diag::warn(l);
     }
 }
@@ -396,10 +397,19 @@ void log_mode()
 
 void set_neural_gpu(unsigned vendor_id, unsigned device_id)
 {
-    g_target_pci = ((vendor_id & 0xFFFFu) << 16) | (device_id & 0xFFFFu);
-    char l[160];
+    // NVAPI's pDeviceId is packed with the VENDOR in the low 16 bits and the
+    // DEVICE in the high 16: NvAPI_GPU_GetPCIIdentifiers returns 0x278610DE for
+    // the RTX 4070 (vendor 0x10DE, device 0x2786). DXGI hands us the two halves
+    // separately, so the target is packed the SAME WAY NVAPI packs it, and the
+    // comparison in map_target_gpu() is then a straight equality on the raw
+    // NVAPI word. Packing it the other way round (vendor << 16 | device) would
+    // never match and the identity gate would silently refuse every adapter.
+    g_target_pci = ((device_id & 0xFFFFu) << 16) | (vendor_id & 0xFFFFu);
+
+    char l[224];
     std::snprintf(l, sizeof l,
-                  "[ARCHTEST] selected neural GPU identity vendor=0x%04X device=0x%04X pci=0x%08X",
+                  "[ARCHTEST] selected neural GPU identity vendor=0x%04X device=0x%04X "
+                  "expected NVAPI pDeviceId=0x%08X",
                   vendor_id & 0xFFFFu, device_id & 0xFFFFu, g_target_pci);
     mgpu::diag::info(l);
 }
@@ -409,6 +419,13 @@ bool hook_install()
 #ifdef MGPU_ARCH_COMPAT
     if (g_hook_live) return true;
 
+#if !ARCHTEST_HAVE_MINHOOK
+    // Fail closed. MinHook's header was not on the include path, so no
+    // relocation trampoline can be produced. Patch nothing; run normally.
+    mgpu::diag::warn("[ARCHTEST] hook not installed: MinHook not available in this build - "
+                     "NO interception, the game runs with the original NVAPI entry untouched");
+    return false;
+#else
     HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
     if (nvapi == nullptr) nvapi = LoadLibraryW(L"nvapi64.dll");
     if (nvapi == nullptr)
@@ -423,19 +440,60 @@ bool hook_install()
         mgpu::diag::warn("[ARCHTEST] hook not installed: nvapi_QueryInterface not exported");
         return false;
     }
-    g_pfn_query_real = target;   // the real address, used directly - no trampoline
+    g_hook_target = target;
 
-    if (!install_detour(target, reinterpret_cast<void *>(&query_detour)))
+    MH_STATUS st = MH_Initialize();
+    if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED)
+    {
+        char l[192];
+        std::snprintf(l, sizeof l, "[ARCHTEST] hook not installed: MH_Initialize -> %s",
+                      mh_status_string(st));
+        mgpu::diag::warn(l);
         return false;
+    }
+
+    // MH_CreateHook relocates the prologue and RETURNS THE TRAMPOLINE. That
+    // trampoline - never `target` - is the callable original.
+    void *original = nullptr;
+    st = MH_CreateHook(target, reinterpret_cast<LPVOID>(&query_detour), &original);
+    if (st != MH_OK || original == nullptr)
+    {
+        char l[224];
+        std::snprintf(l, sizeof l, "[ARCHTEST] hook not installed: MH_CreateHook -> %s",
+                      mh_status_string(st));
+        mgpu::diag::warn(l);
+        return false;
+    }
+    g_pfn_query_original = original;
+
+    st = MH_EnableHook(target);
+    if (st != MH_OK)
+    {
+        char l[224];
+        std::snprintf(l, sizeof l, "[ARCHTEST] hook not installed: MH_EnableHook -> %s",
+                      mh_status_string(st));
+        mgpu::diag::warn(l);
+        MH_RemoveHook(target);
+        g_pfn_query_original = nullptr;
+        return false;
+    }
 
     g_hook_live = true;
     mgpu::diag::info("[ARCHTEST] hook installed");
+    {
+        char l[256];
+        std::snprintf(l, sizeof l,
+                      "[ARCHTEST] original QueryInterface trampoline=%p (entry=%p, relocated by MinHook)",
+                      g_pfn_query_original, target);
+        mgpu::diag::info(l);
+    }
 
     map_target_gpu();
     if (!g_target_known)
         mgpu::diag::warn("[ARCHTEST] neural GPU identity not established - the hook will "
                          "pass every call through and rewrite nothing");
     return true;
+#endif
 #else
     // CONTROL: no interception of any kind, ever. The identity gate is still
     // logged so both logs carry the same facts about which GPU MGPU bound -
@@ -451,15 +509,20 @@ bool hook_install()
 void hook_remove()
 {
 #ifdef MGPU_ARCH_COMPAT
-    if (!g_hook_live) return;
-    HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
-    if (nvapi != nullptr)
+#if ARCHTEST_HAVE_MINHOOK
+    // Disable rather than remove: the runtime may still hold pointers to the
+    // shim, and disabling restores the original bytes at each entry without
+    // freeing anything a live pointer could still reach. The rewrite is off
+    // already (scope_end), so every remaining call is a pass-through.
+    if (g_hook_live && g_pfn_arch_entry != nullptr)
+        MH_DisableHook(g_pfn_arch_entry);
+    if (g_hook_live && g_hook_target != nullptr)
     {
-        void *target = reinterpret_cast<void *>(GetProcAddress(nvapi, "nvapi_QueryInterface"));
-        if (target != nullptr) remove_detour(target);
+        MH_DisableHook(g_hook_target);
+        mgpu::diag::info("[ARCHTEST] hook disabled (original NVAPI entry restored)");
     }
     g_hook_live = false;
-    mgpu::diag::info("[ARCHTEST] hook removed");
+#endif
 #endif
 }
 
