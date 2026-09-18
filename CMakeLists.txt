@@ -256,7 +256,8 @@ else()
     message(STATUS "MGPU: MGPU_MINHOOK_DIR not set - ARCHTEST COMPAT will fail closed (no interception)")
 endif()
 
-option(MGPU_BUILD_TESTS "Build CPU-only adapter policy tests" OFF)if(MGPU_BUILD_TESTS)
+option(MGPU_BUILD_TESTS "Build CPU-only adapter policy tests" OFF)
+if(MGPU_BUILD_TESTS)
     enable_testing()
     add_executable(mgpu_adapter_selection_test
         tests/adapter_selection_test.cpp
