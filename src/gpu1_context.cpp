@@ -2675,6 +2675,48 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
     }
 
     // ---- V45: THE PRIVATE COPY FIRST. SEE nr_load_private_snippet. ----
+    //
+    // ---- ARCHTEST: INSTALL BEFORE THE FIRST PRIVATE NR LOAD ----
+    //
+    // THIS IS THE TIMING FIX. This probe is the private runtime's FIRST load:
+    // it is loaded, initialised, and given its first CreateFeature(Reserved18)
+    // right here, ~12 s before stream_nr_create() ever runs. Installing the
+    // experiment inside stream_nr_create() therefore installed it far too late,
+    // and the first game test found the hook present but never entered - zero
+    // GetArchInfo entries, so the run could not distinguish a passing
+    // architecture check from a check that never happened.
+    //
+    // So the experiment goes in HERE, before nr_load_private_snippet(): T2's
+    // selection names the neural GPU by its raw NVAPI pDeviceId, hook_install()
+    // detours nvapi_QueryInterface AND proactively resolves and hooks
+    // NvAPI_GPU_GetArchInfo, and the scope stays armed across the load, Init,
+    // Init_Ext, PopulateParameters and the probe's own CreateFeature below.
+    //
+    // The hooks are NOT removed after the probe: they stay installed with the
+    // scope disarmed until the real stream arm in stream_nr_create() has had its
+    // own CreateFeature attempt.
+    //
+    // In the CONTROL build every one of these calls is a log line: hook_install()
+    // returns false without touching nvapi64, so this block changes no decision,
+    // no object, no parameter and no duration.
+    {
+        mgpu::archtest::log_mode();
+        mgpu::adapter::selection_result asel;
+        mgpu::adapter::get_selection(asel);
+        if (asel.valid)
+            mgpu::archtest::set_neural_gpu(asel.selected_vendor_id, asel.selected_device_id);
+        else
+            mgpu::diag::warn("[ARCHTEST] T2 selection is not valid - neural GPU identity "
+                             "unknown, so nothing will be rewritten");
+        mgpu::archtest::hook_install();
+        if (!mgpu::archtest::direct_arch_hook_installed())
+            mgpu::diag::warn("[ARCHTEST] the direct GetArchInfo hook is not installed before the "
+                             "first private NR load. In the COMPAT build that means this run "
+                             "cannot test the architecture theory; in CONTROL it is expected.");
+        mgpu::archtest::log_scope_marker("startup private NR load + first probe");
+        mgpu::archtest::scope_begin("startup private NR load");
+    }
+
     char snip_where[MAX_PATH * 2] = {};
     const bool beside_exe = nr_snippet_is_beside_exe();
     mods.snippet = nr_load_private_snippet(snip_where, sizeof snip_where);
@@ -2723,6 +2765,10 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
                          "nvngx_dlssnr.dll is reachable. On this rig _nvngx.dll has always been "
                          "resident already, so this line means something changed in the driver or "
                          "the process, not that a DLSS add-on is missing. Bridge continues.");
+        // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
+        // scope was armed for it. Disarm on every path, or a failed probe leaves
+        // the rewrite armed into the real stream arm.
+        mgpu::archtest::scope_end();
         return false;
     }
 
@@ -2740,6 +2786,10 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
                          "executable. Next to the exe the title's own Streamline loads it first "
                          "and binds NGX to the game's GPU, which is what makes the neural stage "
                          "fault on the second card. Bridge continues.");
+        // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
+        // scope was armed for it. Disarm on every path, or a failed probe leaves
+        // the rewrite armed into the real stream arm.
+        mgpu::archtest::scope_end();
         return false;
     }
 
@@ -2810,6 +2860,10 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
                          "above says whether a third spelling exists; if it does, that is the next "
                          "thing to call and its signature has to come from the header, not from "
                          "this one. Bridge continues.");
+        // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
+        // scope was armed for it. Disarm on every path, or a failed probe leaves
+        // the rewrite armed into the real stream arm.
+        mgpu::archtest::scope_end();
         return false;
     }
 
@@ -2819,6 +2873,10 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
     {
         mgpu::diag::warn("[MGPU][P1.0c] PROBE FAILED at exports - see the line above for which "
                          "names were missing. Bridge continues.");
+        // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
+        // scope was armed for it. Disarm on every path, or a failed probe leaves
+        // the rewrite armed into the real stream arm.
+        mgpu::archtest::scope_end();
         return false;
     }
 
@@ -3226,6 +3284,10 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
                     "its own devices and produced a valid cross-adapter transit result on a "
                     "launch that failed here. Void the NGX portion, not the launch.");
             teardown(which);
+            // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
+            // scope was armed for it. Disarm on every path, or a failed probe leaves
+            // the rewrite armed into the real stream arm.
+            mgpu::archtest::scope_end();
             return false;
         }
         init_ok = true;
@@ -3242,6 +3304,10 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         {
             params = nullptr;
             teardown("GetCapabilityParameters");
+            // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
+            // scope was armed for it. Disarm on every path, or a failed probe leaves
+            // the rewrite armed into the real stream arm.
+            mgpu::archtest::scope_end();
             return false;
         }
     }
@@ -3377,6 +3443,10 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         {
             palloc = nullptr;
             teardown("CreateCommandAllocator");
+            // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
+            // scope was armed for it. Disarm on every path, or a failed probe leaves
+            // the rewrite armed into the real stream arm.
+            mgpu::archtest::scope_end();
             return false;
         }
 
@@ -3390,6 +3460,10 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         {
             pcmd = nullptr;
             teardown("CreateCommandList");
+            // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
+            // scope was armed for it. Disarm on every path, or a failed probe leaves
+            // the rewrite armed into the real stream arm.
+            mgpu::archtest::scope_end();
             return false;
         }
         // From here on the list exists and is recording, so every exit runs
@@ -3404,6 +3478,10 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         {
             pfence = nullptr;
             teardown("CreateFence");
+            // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
+            // scope was armed for it. Disarm on every path, or a failed probe leaves
+            // the rewrite armed into the real stream arm.
+            mgpu::archtest::scope_end();
             return false;
         }
 
@@ -3415,6 +3493,10 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
                      (unsigned long)GetLastError());
             mgpu::diag::error(line);
             teardown("CreateEventW");
+            // ARCHTEST-SCOPE-END-GUARD - the probe is the private runtime's FIRST load and this
+            // scope was armed for it. Disarm on every path, or a failed probe leaves
+            // the rewrite armed into the real stream arm.
+            mgpu::archtest::scope_end();
             return false;
         }
     }
@@ -3453,6 +3535,13 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
                  w_create, (unsigned)r, ngx_result_name(r), (void *)handle,
                  (unsigned)width, (unsigned)height, ms);
         mgpu::diag::info(line);
+
+        // ARCHTEST: the startup probe's CreateFeature is the operation under
+        // test for the first scope. Report it, then DISARM - but leave the hooks
+        // installed. The runtime stays hooked, passing every call through
+        // unchanged, until the real stream arm has had its own attempt.
+        mgpu::archtest::log_create_feature_result((long)(unsigned)r, (void *)handle);
+        mgpu::archtest::scope_end();
 
         if (r != NVSDK_NGX_Result_Success)
         {
@@ -11189,39 +11278,22 @@ namespace
         common.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
         common.LoggingInfo.DisableOtherLoggingSinks = false;
 
-        // ---- ARCHTEST: the A/B experiment, and it is the ONLY difference ----
+        // ---- ARCHTEST: SECOND SCOPE - the real stream arm ----
         //
-        // One question: does presenting Blackwell architecture information to
-        // the private DLSS-NR runtime, for the RTX 4070 it runs on, change
-        // CreateFeature(Reserved18) from 0xBAD00002 into Success or another
-        // result? See src/arch_test.hpp.
+        // The experiment was INSTALLED in the P1.0c startup probe, before the
+        // private runtime's first load, together with its first scope. This is
+        // the second scope: the same Init / capability / Init_Ext / Populate /
+        // CreateFeature(Reserved18) sequence, for the real stream.
         //
-        // The neural GPU is named by PCI identity taken from the T2 selection,
-        // never by enumeration order. The hook is installed before the private
-        // session opens so the runtime's own interface resolution is seen; it
-        // is removed after CreateFeature. The rewrite itself is armed only for
-        // the feature-creation scope below.
+        // NOTHING IS INSTALLED HERE. The MinHook hooks are deliberately reused -
+        // the direct GetArchInfo hook has been alive, idle, since the startup
+        // probe, passing every call through while the scope was disarmed.
         //
-        // WHY THIS BLOCK IS HARMLESS IN THE CONTROL BUILD, which is what makes
-        // the two variants comparable: every call here is read-only logging
-        // plus one read of the T2 selection. In CONTROL, arch_test.cpp compiles
-        // hook_install() to a log line and a `return false` - it never touches
-        // nvapi64, never writes a byte of any code page, and set_neural_gpu
-        // only records a number nothing acts on. No MGPU decision, object,
-        // parameter or duration changes. get_selection() is already called from
-        // this file for the same diagnostic purpose elsewhere.
-        {
-            mgpu::archtest::log_mode();
-            mgpu::adapter::selection_result asel;
-            mgpu::adapter::get_selection(asel);
-            if (asel.valid)
-                mgpu::archtest::set_neural_gpu(asel.selected_vendor_id, asel.selected_device_id);
-            else
-                mgpu::diag::warn("[ARCHTEST] T2 selection is not valid - neural GPU identity "
-                                 "unknown, so nothing will be rewritten");
-            mgpu::archtest::hook_install();
-            mgpu::archtest::scope_begin();
-        }
+        // In CONTROL every call below is a log line: hook_install() ran during
+        // the probe and returned false without touching nvapi64, so nothing is
+        // intercepted and no decision, object, parameter or duration changes.
+        mgpu::archtest::log_scope_marker("real stream arm");
+        mgpu::archtest::scope_begin("real stream arm");
 
         NVSDK_NGX_Result r = p_init(0ULL, data_path, ndev, &common, NVSDK_NGX_Version_API);
         snprintf(line, sizeof line, "[MGPU][P4.1] Init: result=0x%08X (%s)",
@@ -11252,6 +11324,11 @@ namespace
             snprintf(line, sizeof line, "[MGPU][P4.1] GetCapabilityParameters failed 0x%08X (%s)",
                      (unsigned)r, ngx_result_name(r));
             mgpu::diag::error(line);
+            // ARCHTEST: scope 2 exit. Disarm and drop the hooks on this path
+            // too, or a failed capability query leaves the rewrite armed and
+            // the detour live for the rest of the process.
+            mgpu::archtest::scope_end();
+            mgpu::archtest::hook_remove();
             return false;
         }
         (void)p_iext(0ULL, data_path, ndev, NVSDK_NGX_Version_API, s.nr_params);
@@ -11485,6 +11562,10 @@ namespace
         {
             snprintf(line, sizeof line, "[MGPU][P4.1] resource creation failed hr=0x%08X", (unsigned)h);
             mgpu::diag::error(line);
+            // ARCHTEST: scope 2 exit. Same reason as the capability failure
+            // above - disarm and drop the hooks on this path too.
+            mgpu::archtest::scope_end();
+            mgpu::archtest::hook_remove();
             return false;
         }
 

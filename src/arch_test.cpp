@@ -104,12 +104,13 @@ namespace
     };
 
     // THE ORIGINAL. After hook_install() this points at the relocation
-    // trampoline, NOT at the patched entry - the distinction the previous
+    // trampoline, NOT at the patched entry - the distinction an earlier
     // revision got wrong.
     void *g_pfn_query_original = nullptr;
 
     void *g_pfn_arch_original = nullptr;   // the REAL NvAPI_GPU_GetArchInfo (trampoline)
     void *g_pfn_arch_entry = nullptr;      // its patched entry, for MH removal
+    bool g_direct_arch_hooked = false;     // the proactive direct hook is live
 
     void *g_hook_target = nullptr;         // nvapi_QueryInterface entry
     bool g_hook_live = false;
@@ -119,7 +120,10 @@ namespace
     bool g_target_known = false;
 
     std::atomic<bool> g_active{false};     // the temporal scope
-    std::atomic<bool> g_rewrote{false};    // did we actually rewrite once?
+    // PER-SCOPE, not cumulative: reset by every scope_begin() so scope_end()
+    // reports whether a rewrite happened in THAT scope. There are two scopes -
+    // the startup private NR load and the real stream arm.
+    std::atomic<bool> g_rewrote{false};
 
     using pfn_query = void *(*)(unsigned int);
     using pfn_get_arch_info = int (*)(void *, NV_GPU_ARCH_INFO *);
@@ -260,10 +264,67 @@ namespace
 #endif
     }
 
+    // ---- proactive GetArchInfo resolution --------------------------------
+    // PROACTIVE, NOT REACTIVE. The first private nvngx_dlssnr.dll load happens
+    // in the P1.0c startup probe, which runs long before stream_nr_create().
+    // Waiting for the runtime to ask nvapi_QueryInterface for
+    // NVAPI_ID_GET_ARCH_INFO would therefore install the direct hook after the
+    // machinery that needs it has already run - which is exactly what the first
+    // game test showed: the hook was installed, the scope was armed, and the
+    // runtime never asked, so no GetArchInfo call was ever intercepted.
+    //
+    // So the entry is resolved NOW, by calling the real QueryInterface
+    // trampoline ourselves for that one id, and the direct hook goes on
+    // immediately.
+    bool resolve_and_hook_arch_proactively()
+    {
+        if (g_direct_arch_hooked)
+            return true;
+        if (g_pfn_query_original == nullptr)
+        {
+            mgpu::diag::warn("[ARCHTEST] proactive GetArchInfo resolve skipped: no QueryInterface "
+                             "trampoline");
+            return false;
+        }
+
+        const pfn_query original_query = reinterpret_cast<pfn_query>(g_pfn_query_original);
+        void *entry = original_query(NVAPI_ID_GET_ARCH_INFO);   // the REAL entry
+
+        char l[224];
+        std::snprintf(l, sizeof l,
+                      "[ARCHTEST] proactive GetArchInfo resolve entry=%p", entry);
+        mgpu::diag::info(l);
+
+        if (entry == nullptr)
+        {
+            mgpu::diag::warn("[ARCHTEST] proactive GetArchInfo resolve returned null - the driver "
+                             "does not expose that interface id. No architecture rewrite is "
+                             "possible and the run cannot test the theory.");
+            return false;
+        }
+
+        g_pfn_arch_entry = entry;
+        if (!create_arch_hook(entry))
+        {
+            mgpu::diag::warn("[ARCHTEST] proactive GetArchInfo detour could NOT be installed - "
+                             "no architecture rewrite is possible");
+            return false;
+        }
+
+        g_direct_arch_hooked = true;
+        mgpu::diag::info("[ARCHTEST] proactive GetArchInfo detour installed");
+        return true;
+    }
+
     // ---- the detour on nvapi_QueryInterface -----------------------------
     // It hands the runtime OUR shim for exactly one id. Every other id is
     // returned untouched. The REAL function is called through the trampoline
     // first, so its answer is never invented and never re-enters this detour.
+    //
+    // The experiment does NOT depend on this path any more: the direct hook is
+    // installed proactively. This remains as a secondary/future-resolution path
+    // in case a runtime resolves the id later than the startup probe, and it
+    // simply reconfirms the same entry.
     void *__cdecl query_detour(unsigned int id)
     {
         if (g_pfn_query_original == nullptr)
@@ -281,16 +342,12 @@ namespace
 
         if (id == NVAPI_ID_GET_ARCH_INFO)
         {
-            if (answer != nullptr && g_pfn_arch_original == nullptr)
-            {
-                g_pfn_arch_entry = answer;
-                if (create_arch_hook(answer))
-                    mgpu::diag::info("[ARCHTEST] GetArchInfo detour installed");
-                else
-                    mgpu::diag::warn("[ARCHTEST] GetArchInfo detour could NOT be installed - "
-                                     "passing the real function through unchanged");
-            }
-            return (g_pfn_arch_original != nullptr)
+            // Secondary path: if the proactive install did not happen for some
+            // reason, do it here rather than pass the raw entry through.
+            if (!g_direct_arch_hooked && answer != nullptr)
+                resolve_and_hook_arch_proactively();
+
+            return g_direct_arch_hooked
                        ? reinterpret_cast<void *>(&get_arch_info_shim)
                        : answer;
         }
@@ -488,10 +545,19 @@ bool hook_install()
         mgpu::diag::info(l);
     }
 
+    // Resolve and hook NvAPI_GPU_GetArchInfo NOW, before the caller loads the
+    // private runtime. This is the timing fix: the P1.0c startup probe is the
+    // runtime's FIRST load, and it must not be reached before the direct hook
+    // exists.
+    resolve_and_hook_arch_proactively();
+
     map_target_gpu();
     if (!g_target_known)
         mgpu::diag::warn("[ARCHTEST] neural GPU identity not established - the hook will "
                          "pass every call through and rewrite nothing");
+    if (!g_direct_arch_hooked)
+        mgpu::diag::warn("[ARCHTEST] direct GetArchInfo hook is NOT installed - no architecture "
+                         "rewrite can occur this run");
     return true;
 #endif
 #else
@@ -521,18 +587,38 @@ void hook_remove()
         MH_DisableHook(g_hook_target);
         mgpu::diag::info("[ARCHTEST] hook disabled (original NVAPI entry restored)");
     }
+    g_direct_arch_hooked = false;
     g_hook_live = false;
 #endif
 #endif
 }
 
-void scope_begin()
+void scope_begin(const char *why)
 {
-    if (g_target_known)
+    // PER-SCOPE, NOT CUMULATIVE. There are two distinct scopes now - the
+    // startup private NR load and the real stream arm - and scope_end() reports
+    // whether a rewrite happened "this scope". Without this reset a rewrite
+    // during startup would make the real-stream scope_end() claim a rewrite it
+    // never performed, which is exactly the kind of false positive that would
+    // misreport the experiment. Reset BEFORE arming.
+    g_rewrote.store(false, std::memory_order_relaxed);
+
+    if (g_target_known && g_direct_arch_hooked)
         g_active.store(true, std::memory_order_relaxed);
-    mgpu::diag::info(g_target_known
-        ? "[ARCHTEST] rewrite scope ARMED (private DLSS-NR feature creation)"
-        : "[ARCHTEST] rewrite scope requested but identity is unknown - staying disarmed");
+
+    char l[256];
+    if (g_target_known && g_direct_arch_hooked)
+        std::snprintf(l, sizeof l, "[ARCHTEST] rewrite scope ARMED (%s)",
+                      (why != nullptr) ? why : "unspecified");
+    else if (!g_target_known)
+        std::snprintf(l, sizeof l,
+                      "[ARCHTEST] rewrite scope requested (%s) but identity is unknown - staying disarmed",
+                      (why != nullptr) ? why : "unspecified");
+    else
+        std::snprintf(l, sizeof l,
+                      "[ARCHTEST] rewrite scope requested (%s) but the direct GetArchInfo hook is "
+                      "not installed - staying disarmed", (why != nullptr) ? why : "unspecified");
+    mgpu::diag::info(l);
 }
 
 void scope_end()
@@ -541,6 +627,24 @@ void scope_end()
     mgpu::diag::info(g_rewrote.load()
         ? "[ARCHTEST] rewrite scope DISARMED (a rewrite was applied this scope)"
         : "[ARCHTEST] rewrite scope DISARMED (no rewrite was applied this scope)");
+}
+
+void log_scope_marker(const char *why)
+{
+    char l[224];
+    std::snprintf(l, sizeof l, "[ARCHTEST] ---- scope: %s ----",
+                  (why != nullptr) ? why : "unspecified");
+    mgpu::diag::info(l);
+}
+
+bool direct_arch_hook_installed()
+{
+    return g_direct_arch_hooked;
+}
+
+unsigned matched_gpu_pci()
+{
+    return g_target_pci;
 }
 
 void log_entering_create_feature()
