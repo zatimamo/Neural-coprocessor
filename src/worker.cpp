@@ -43,6 +43,7 @@
 #include "diag.hpp"
 #include "gpu1_context.hpp"
 #include "worker.hpp"
+#include "nvapi_init.hpp"   // NVAPIINIT: the lifetime note at ordered teardown
 
 // T4 (brief section 00, exception 1): the add-on's own module handle,
 // defined in dllmain.cpp and captured at DLL_PROCESS_ATTACH.
@@ -1369,6 +1370,17 @@ namespace
         }
 
         mgpu::adapter::shutdown();
+
+        // NVAPIINIT. The ordered teardown has run: NGX features released first
+        // (stream_shutdown), then gpu1::shutdown, then the window and the
+        // adapter. This is the point where the experiment would release its
+        // NVAPI reference - and it deliberately does not. See nvapi_init.cpp:
+        // the process-wide NvAPI ref-counter is shared with the private DLSS-NR
+        // snippet, the game's own DLSS and MGPU's [RFX] block, and this teardown
+        // cannot prove it is the last user. The reference is released by process
+        // exit, the same lifetime MGPU already gives its NGX session.
+        mgpu::nvapiinit::log_lifetime_note();
+
         mgpu::diag::info("[MGPU][T4] bridge thread exiting cleanly");
 
         if (failed_permanently)

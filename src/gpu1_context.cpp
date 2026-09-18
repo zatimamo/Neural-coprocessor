@@ -42,6 +42,7 @@
 #include "sl_probe.hpp"   // SL1: is our own device an SL proxy
 #include "arch_test.hpp"  // ARCHTEST: the architecture A/B experiment (CONTROL/COMPAT)
 #include "create_contract.hpp"  // CREATECONTRACT: the creation-time parameter A/B
+#include "nvapi_init.hpp"       // NVAPIINIT: the explicit-NVAPI-initialization A/B
 
 // R111. DXGI_STATUS_OCCLUDED comes from dxgi.h by way of <dxgi1_4.h> above.
 // Guarded because it is a SUCCESS code and a build where it went missing
@@ -2701,6 +2702,64 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
     // returns false without touching nvapi64, so this block changes no decision,
     // no object, no parameter and no duration.
     {
+        // ---- NVAPIINIT: the A/B variable, and it must come FIRST ----
+        //
+        // NvAPI_Initialize is called here - before log_mode(), before
+        // get_selection(), before hook_install() and therefore before every
+        // NVAPI call MGPU makes anywhere. The chain that follows, in order:
+        //
+        //   1. nvapiinit::initialize_once()          <- loads nvapi64.dll and
+        //                                               calls NvAPI_Initialize
+        //   2. archtest::hook_install()  (:~2760)    <- LoadLibraryW("nvapi64.dll")
+        //                                               and GetProcAddress, the
+        //                                               first NVAPI touch today
+        //   3. resolve_and_hook_arch_proactively()   <- nvapi_QueryInterface
+        //                                                 (0xD8265D24)
+        //   4. map_target_gpu()                      <- NvAPI_EnumPhysicalGPUs,
+        //                                                 NvAPI_GPU_GetPCIIdentifiers
+        //   5. nr_load_private_snippet()  (:~2770)   <- private NR DLL load
+        //   6. NGX Init / Init_Ext / Populate
+        //   7. CreateFeature(Reserved18)
+        //
+        // Placing it after the architecture hook would invalidate the
+        // experiment, because the hook has already used NVAPI by then.
+        //
+        // In nvapi_control this is a log line and nothing else: no NVAPI module
+        // is loaded and no NVAPI call is made by this module, so the control arm
+        // is exactly today's behaviour.
+        mgpu::nvapiinit::log_variant();
+        mgpu::nvapiinit::initialize_once();
+        mgpu::nvapiinit::log_core_path();
+
+        // ---- NVAPIINIT HARD STOP ----
+        //
+        // In the initialized arm, a NvAPI_Initialize that does not return
+        // NVAPI_OK means the experiment cannot test its one variable, so it must
+        // not run at all. Proceeding would produce a launch whose result cannot
+        // be interpreted, which is worse than producing no result.
+        //
+        // This return happens BEFORE archtest::hook_install(), before
+        // nr_load_private_snippet(), before NGX Init and before CreateFeature.
+        // Nothing has been created at this point - no hook, no module, no
+        // session, no object - so there is nothing to unwind. It is the same
+        // early-exit convention the rest of this probe already uses ("PROBE
+        // FAILED at <step> ... Bridge continues").
+        //
+        // In the control arm MGPU_NVAPI_EXPLICIT_INIT is undefined, this whole
+        // branch does not compile, and execution proceeds exactly as today.
+#ifdef MGPU_NVAPI_EXPLICIT_INIT
+        if (!mgpu::nvapiinit::usable())
+        {
+            char nl[224];
+            snprintf(nl, sizeof nl,
+                     "[NVAPIINIT] NvAPI_Initialize FAILED result=%d",
+                     mgpu::nvapiinit::init_result());
+            mgpu::diag::error(nl);
+            mgpu::diag::error("[NVAPIINIT] experiment aborted before ARCHTEST/NGX");
+            return false;
+        }
+#endif
+
         mgpu::archtest::log_mode();
         mgpu::contract::log_variant();
         mgpu::adapter::selection_result asel;

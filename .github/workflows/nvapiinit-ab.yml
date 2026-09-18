@@ -1,0 +1,343 @@
+# ============================================================================
+# NVAPIINIT-AB - explicit NvAPI_Initialize A/B
+# ============================================================================
+# ONE revision, TWO binaries. The only difference is one compile definition,
+# MGPU_NVAPI_EXPLICIT_INIT.
+#
+#   nvapi_control     : current behaviour. No explicit NvAPI_Initialize.
+#   nvapi_initialized : NvAPI_Initialize once, before MGPU makes ANY NVAPI call
+#                       and before the private runtime is loaded.
+#
+# EVERYTHING ELSE IS FROZEN AND IDENTICAL IN BOTH ARMS:
+#     MGPU_ARCH_COMPAT=ON          architecture spoof, GPU identity, MinHook
+#     MGPU_CONTRACT_EXPANDED=ON    expanded CreateFeature parameter contract
+#     same NR DLL, same driver, same caller, same resolution, same transport
+#
+# Both arms are asserted at configure time, so a mis-set flag cannot silently
+# change a frozen variable.
+#
+# WHY THIS EXPERIMENT
+#   The private DLSS-NR runtime fails like this:
+#       NvAPI_D3D12_GetCudaIndependentDescriptorObject failed - nvapi status -1
+#       NvAPI_D3D12_CreateCuModule failed - nvapi status -1
+#       DLSSNR: init_kernels() failed
+#   NVIDIA's nvapi.h states NvAPI_Initialize "must be called before calling
+#   other NvAPI_ functions" and that it is "now mandatory". MGPU's normal path
+#   never calls it; NeuralScreen does, before any architecture query.
+#
+# INTERPRETATION, FIXED IN ADVANCE
+#   CONTROL CreateFeature = 0xBAD00002 and INITIALIZED = Success
+#       -> missing NvAPI_Initialize confirmed as the blocker.
+#   INITIALIZED changes 0xBAD00002 to a DIFFERENT failure
+#       -> stop and report the new boundary.
+#   BOTH 0xBAD00002
+#       -> reject missing NVAPI initialization as the CreateFeature blocker.
+#   If NvAPI_Initialize itself fails -> stop, no workarounds.
+#   If either arm shows Init = FAIL_OutOfDate, record that separately and do not
+#   treat that arm's CreateFeature result as a clean comparison.
+#
+# The compare job fails the run if the two add-on hashes are identical.
+# ============================================================================
+
+name: nvapiinit-ab
+
+on:
+  workflow_dispatch:
+  push:
+    # Same dedicated branch as ARCHTEST and CREATECONTRACT. Not main.
+    branches: [archtest-ab]
+    paths:
+      - 'src/nvapi_init.cpp'
+      - 'src/nvapi_init.hpp'
+      - 'src/gpu1_context.cpp'
+      - 'src/worker.cpp'
+      - 'CMakeLists.txt'
+      - '.github/workflows/nvapiinit-ab.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RESHADE_SHA: 18deaa52de0c425a78b329e9cb3c497281cd00ec
+  NGX_SHA: a291cc7d2cc642a51566f3dfd5376f635cd1b284
+  MINHOOK_SHA: c3fcafdc10146beb5919319d0683e44e3c30d537
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: nvapi_control
+            nvapi: "OFF"
+            cfg: "NVAPI_CONTROL"
+          - variant: nvapi_initialized
+            nvapi: "ON"
+            cfg: "NVAPI_INITIALIZED"
+
+    name: mgpu_${{ matrix.variant }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Containment check
+        shell: bash
+        run: |
+          PATTERN='GetClockCalibration'
+          FOUND=0
+          for DIR in src assets; do
+            [ -d "$DIR" ] || continue
+            if grep -rnE "$PATTERN" "$DIR"; then FOUND=1; fi
+          done
+          if [ "$FOUND" -ne 0 ]; then
+            echo "::error::Out-of-scope symbol: GetClockCalibration is still guarded (P2.2)"
+            exit 1
+          fi
+
+      # This experiment must not intercept, patch or spoof CUDA. It tests
+      # initialization and nothing else.
+      - name: Verify NVAPIINIT scope
+        shell: bash
+        run: |
+          test -f src/nvapi_init.cpp
+          test -f src/nvapi_init.hpp
+          grep -q 'NVAPIINIT' src/nvapi_init.cpp
+          grep -q 'NvAPI_Initialize' src/nvapi_init.cpp
+          if grep -nE 'CreateCuModule|GetCudaIndependentDescriptorObject|MH_CreateHook|D3D12CreateDevice' src/nvapi_init.cpp; then
+            echo "::error::nvapi_init.cpp is doing something outside its scope"
+            exit 1
+          fi
+          echo "NVAPIINIT scope verified: initialization only, no CUDA interception."
+
+      - name: Fetch ReShade headers at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/reshade.tar.gz \
+            "https://codeload.github.com/crosire/reshade/tar.gz/${RESHADE_SHA}"
+          tar -xzf _dl/reshade.tar.gz -C _dl "reshade-${RESHADE_SHA}/include"
+          rm -rf ext/reshade
+          mv "_dl/reshade-${RESHADE_SHA}/include" ext/reshade
+          test -f ext/reshade/reshade.hpp
+          grep -q 'define RESHADE_API_VERSION 20' ext/reshade/reshade.hpp
+
+      - name: Fetch NVIDIA NGX headers at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/ngx.tar.gz \
+            "https://codeload.github.com/NVIDIA/DLSS/tar.gz/${NGX_SHA}"
+          tar -xzf _dl/ngx.tar.gz -C _dl --wildcards "*/include"
+          rm -rf ext/ngx
+          mv _dl/*/include ext/ngx
+          test -f ext/ngx/nvsdk_ngx.h
+          grep -rq 'NVSDK_NGX_Feature_Reserved18' ext/ngx || {
+            echo "::error::Pin drift - no NVSDK_NGX_Feature_Reserved18"; exit 1; }
+
+      - name: Fetch and build MinHook at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/minhook.tar.gz \
+            "https://codeload.github.com/TsudaKageyu/minhook/tar.gz/${MINHOOK_SHA}"
+          tar -xzf _dl/minhook.tar.gz -C _dl
+          rm -rf ext/minhook
+          mv _dl/minhook-* ext/minhook
+          test -f ext/minhook/include/MinHook.h
+          cmake -S ext/minhook -B ext/minhook/build -A x64 \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+          cmake --build ext/minhook/build --config Release
+          LIB=$(find ext/minhook/build -type f \( -iname 'minhook.x64.lib' -o -iname '*minhook*.lib' \) | head -n1)
+          if [ -z "$LIB" ]; then
+            echo "::error::no MinHook static library found"
+            find ext/minhook/build -type f | sort | head -50 || true
+            exit 1
+          fi
+          echo "discovered MinHook library: $LIB"
+          mkdir -p ext/minhook/lib
+          cp "$LIB" ext/minhook/lib/MinHook.lib
+
+      # All three flags are asserted, so a frozen variable cannot drift and the
+      # two arms cannot differ by anything except MGPU_NVAPI_EXPLICIT_INIT.
+      - name: Configure (${{ matrix.variant }})
+        shell: bash
+        run: |
+          cmake -B build -A x64 \
+            -DMGPU_ARCH_COMPAT=ON \
+            -DMGPU_CONTRACT_EXPANDED=ON \
+            -DMGPU_NVAPI_EXPLICIT_INIT=${{ matrix.nvapi }} \
+            -DMGPU_MINHOOK_DIR="${{ github.workspace }}/ext/minhook" 2>&1 | tee _cfg.txt
+
+          grep -qi "ARCHTEST variant = COMPAT" _cfg.txt || {
+            echo "::error::frozen variable drifted: MGPU_ARCH_COMPAT must be ON in BOTH arms"
+            grep -ni 'ARCHTEST variant' _cfg.txt || true; exit 1; }
+
+          grep -qi "CREATECONTRACT variant = CONTRACT_EXPANDED" _cfg.txt || {
+            echo "::error::frozen variable drifted: MGPU_CONTRACT_EXPANDED must be ON in BOTH arms"
+            grep -ni 'CREATECONTRACT variant' _cfg.txt || true; exit 1; }
+
+          grep -qi "NVAPIINIT variant = ${{ matrix.cfg }}" _cfg.txt || {
+            echo "::error::configure did not report the expected NVAPIINIT variant"
+            echo "expected (case-insensitive): NVAPIINIT variant = ${{ matrix.cfg }}"
+            grep -ni 'NVAPIINIT variant' _cfg.txt || true; exit 1; }
+
+          grep -q "MinHook library linked from" _cfg.txt || {
+            echo "::error::configured WITHOUT MinHook - the arch hook would fail closed"; exit 1; }
+
+          echo "--- all three variant lines ---"
+          grep -niE 'variant = ' _cfg.txt || true
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Verify artifact name
+        shell: bash
+        run: |
+          if find build -name 'mgpu_bridge.addon64.dll' -type f | grep -q .; then
+            echo "::error::SUFFIX appended to .dll instead of replacing it"; exit 1
+          fi
+          ADDON=$(find build -name 'mgpu_bridge.addon64' -type f | head -n1)
+          if [ -z "$ADDON" ]; then
+            echo "::error::mgpu_bridge.addon64 not produced"
+            find build -maxdepth 3 -type f || true; exit 1
+          fi
+          echo "ADDON_PATH=$ADDON" >> "$GITHUB_ENV"
+          echo "Output verified: $ADDON"
+
+      - name: Verify shipped presets are empty
+        shell: bash
+        run: |
+          FAIL=0
+          grep -nE '^\s*Techniques\s*=\s*\S' assets/gpu1.ini && FAIL=1
+          grep -n 'DEBUG' assets/gpu1.ini && FAIL=1
+          [ "$FAIL" -eq 0 ] || { echo "::error::shipped preset is not clean"; exit 1; }
+
+      - name: Verify shipped config
+        shell: bash
+        run: |
+          grep -qE '^\s*Frames\s*=\s*0\s*$' assets/mgpu.ini || {
+            echo "::error::assets/mgpu.ini does not set Frames=0"; exit 1; }
+          grep -qE '^\s*Depth\s*=\s*1\s*$' assets/mgpu.ini || {
+            echo "::error::assets/mgpu.ini does not set Depth=1"; exit 1; }
+          grep -qE '^\s*MVec\s*=\s*3\s*$' assets/mgpu.ini || {
+            echo "::error::assets/mgpu.ini does not set MVec=3"; exit 1; }
+
+      # The rename lives here and ONLY here, exactly as build.yml does it.
+      - name: Stage deploy set (${{ matrix.variant }})
+        shell: bash
+        run: |
+          mkdir -p _deploy
+          cp "$ADDON_PATH" _deploy/nvngx.dll_mgpu_bridge.addon64
+          cp assets/gpu1.ini      _deploy/
+          cp assets/mgpu.ini      _deploy/
+          cp assets/ReShade2.ini  _deploy/
+          cp assets/README.txt    _deploy/
+          cp LICENSE              _deploy/
+          mkdir -p _deploy/reshade-shaders/Shaders
+          cp assets/reshade-shaders/Shaders/mgpu_depth_tap.fx _deploy/reshade-shaders/Shaders/
+          find _deploy -type f | sort
+          test -f _deploy/nvngx.dll_mgpu_bridge.addon64
+          case "$(ls _deploy)" in
+            *nvngx.dll_*) ;;
+            *) echo "::error::lost the nvngx.dll_ caller-gate prefix"; exit 1 ;;
+          esac
+
+      - name: Verify the artifact is exactly the seven-file deploy set
+        shell: bash
+        run: |
+          COUNT=$(find _deploy -type f | wc -l)
+          if [ "$COUNT" -ne 7 ]; then
+            echo "::error::_deploy holds $COUNT files, expected 7"
+            find _deploy -type f | sort; exit 1
+          fi
+
+      - name: Record the variant marker and hashes
+        shell: bash
+        run: |
+          {
+            echo "variant            = ${{ matrix.variant }}"
+            echo "MGPU_ARCH_COMPAT   = ON            (frozen)"
+            echo "MGPU_CONTRACT_EXPANDED = ON        (frozen)"
+            echo "MGPU_NVAPI_EXPLICIT_INIT = ${{ matrix.nvapi }}   (the only variable)"
+            echo "commit             = ${GITHUB_SHA}"
+            echo "run                = ${GITHUB_RUN_ID}"
+            echo "built              = $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > NVAPIINIT_VARIANT.txt
+          cat NVAPIINIT_VARIANT.txt
+
+          {
+            echo "NVAPIINIT artifact hashes - ${{ matrix.variant }}"
+            echo
+            echo "Deploy set (7 files):"
+            ( cd _deploy && find . -type f | sort | while read f; do
+                printf '%s  %s\n' "$(sha256sum "$f" | awk '{print $1}')" "$f"
+              done )
+            echo
+            echo "Add-on alone (the file the compare job keys on):"
+            printf '%s  %s\n' \
+              "$(sha256sum _deploy/nvngx.dll_mgpu_bridge.addon64 | awk '{print $1}')" \
+              "nvngx.dll_mgpu_bridge.addon64"
+          } > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Move diagnostics into the artifact directory
+        shell: bash
+        run: |
+          cp NVAPIINIT_VARIANT.txt SHA256SUMS.txt _deploy/
+          find _deploy -type f | sort
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mgpu_${{ matrix.variant }}
+          path: |
+            _deploy/
+            SHA256SUMS.txt
+            NVAPIINIT_VARIANT.txt
+          if-no-files-found: error
+
+  compare:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: arts
+
+      - name: Compare the two variants
+        shell: bash
+        run: |
+          set -e
+          find arts -type f | sort
+          CTRL=arts/mgpu_nvapi_control/_deploy/nvngx.dll_mgpu_bridge.addon64
+          INIT=arts/mgpu_nvapi_initialized/_deploy/nvngx.dll_mgpu_bridge.addon64
+          for f in "$CTRL" "$INIT"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::expected artefact missing: $f"
+              find arts -type f | sort; exit 1
+            fi
+          done
+          HC=$(sha256sum "$CTRL" | awk '{print $1}')
+          HI=$(sha256sum "$INIT" | awk '{print $1}')
+          echo "nvapi_control     = $HC"
+          echo "nvapi_initialized = $HI"
+          if [ "$HC" = "$HI" ]; then
+            echo "::error::the two binaries are IDENTICAL - the variable never changed"
+            exit 1
+          fi
+          {
+            echo "NVAPIINIT artifact hashes"
+            echo "nvapi_control     nvngx.dll_mgpu_bridge.addon64 = $HC"
+            echo "nvapi_initialized nvngx.dll_mgpu_bridge.addon64 = $HI"
+            echo "distinct = yes"
+          } > HASHES.txt
+          cat HASHES.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mgpu_nvapi_hashes
+          path: HASHES.txt
+          if-no-files-found: error

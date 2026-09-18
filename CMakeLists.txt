@@ -63,6 +63,12 @@ add_library(mgpu_bridge SHARED
     # adds the extra keys or is a log line only. It writes interface values
     # into MGPU's existing parameter block and builds nothing.
     src/create_contract.cpp
+    # NVAPIINIT: the explicit-NVAPI-initialization A/B. Compiled into BOTH
+    # variants of that experiment; MGPU_NVAPI_EXPLICIT_INIT decides whether it
+    # takes the single NvAPI reference or is a log line only. It uses MGPU's
+    # existing dynamic-NVAPI route (LoadLibraryW + GetProcAddress +
+    # nvapi_QueryInterface), so no new link library and no NVAPI header.
+    src/nvapi_init.cpp
 )
 
 target_include_directories(mgpu_bridge PRIVATE
@@ -219,6 +225,33 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# NVAPIINIT. The explicit-NVAPI-initialization A/B.
+#
+#   MGPU_NVAPI_EXPLICIT_INIT absent  ->  nvapi_control.
+#                                        current behaviour: no explicit
+#                                        NvAPI_Initialize anywhere on the path.
+#   MGPU_NVAPI_EXPLICIT_INIT defined ->  nvapi_initialized.
+#                                        NvAPI_Initialize once, before every
+#                                        NVAPI call MGPU makes and before the
+#                                        private runtime is loaded.
+#
+# BOTH variants of this experiment build with MGPU_ARCH_COMPAT=ON and
+# MGPU_CONTRACT_EXPANDED=ON (the CI job sets all three flags), so the
+# architecture spoof, GPU identity, caller, NR DLL, driver, expanded
+# CreateFeature contract, resolution and transport are frozen. This definition
+# is the only experimental variable.
+# ---------------------------------------------------------------------------
+option(MGPU_NVAPI_EXPLICIT_INIT
+       "NVAPIINIT initialized variant: call NvAPI_Initialize explicitly before any NVAPI use"
+       OFF)
+if(MGPU_NVAPI_EXPLICIT_INIT)
+    target_compile_definitions(mgpu_bridge PRIVATE MGPU_NVAPI_EXPLICIT_INIT=1)
+    message(STATUS "MGPU: NVAPIINIT variant = NVAPI_INITIALIZED")
+else()
+    message(STATUS "MGPU: NVAPIINIT variant = NVAPI_CONTROL")
+endif()
+
+# ---------------------------------------------------------------------------
 # ARCHTEST: MinHook, the x64 trampoline provider.
 #
 # The detour needs a callable ORIGINAL: the overwritten prologue copied
@@ -256,8 +289,7 @@ else()
     message(STATUS "MGPU: MGPU_MINHOOK_DIR not set - ARCHTEST COMPAT will fail closed (no interception)")
 endif()
 
-option(MGPU_BUILD_TESTS "Build CPU-only adapter policy tests" OFF)
-if(MGPU_BUILD_TESTS)
+option(MGPU_BUILD_TESTS "Build CPU-only adapter policy tests" OFF)if(MGPU_BUILD_TESTS)
     enable_testing()
     add_executable(mgpu_adapter_selection_test
         tests/adapter_selection_test.cpp
