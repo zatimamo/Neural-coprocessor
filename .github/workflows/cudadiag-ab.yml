@@ -330,19 +330,62 @@ jobs:
           echo "unknown-identity paths: want_known guard line ${WK:-none} precedes the single match=no at ${NO:-none}; NOT_COMPARED in $NOTCMP place(s)"
 
           # ---- SUPERSEDED WORDING MUST NOT REAPPEAR ------------------------
-          # Assembled from fragments so this check's own text does not contain
-          # the phrases it forbids.
+          # Conceptual variants count, not only the exact phrases the audit
+          # named: a one-definition claim restated in other words is the same
+          # mistake, and it is what shipped in the previous variant marker.
+          #
+          # TWO SCOPES, deliberately different:
+          #
+          #  (1) TREE-WIDE for the four concept-specific phrases below. None of
+          #      them can occur as ordinary English, so searching src/ and
+          #      CMakeLists.txt as well as this file is safe.
+          #  (2) THIS FILE ONLY for the four conceptual variants of the
+          #      one-definition claim. The shortest of them is a common English
+          #      phrase that occurs in roughly 28 legitimate PRE-EXISTING
+          #      comments across src/ and CMakeLists.txt, so a tree-wide search
+          #      for it would fail the build on prose that has nothing to do
+          #      with the claim. Inside this file all four are unambiguous.
+          #      The positive control below proves that scoping is still needed.
+          #
+          # Fragments are assembled from pieces so this check's own text does
+          # not contain what it forbids.
+          #
+          # Deliberately NOT forbidden anywhere, because they are correct: a
+          # bare mention of mgpu_nvapi_control, and "behavioral reference".
           P_CAUSE="makes Init"" return Success"
           P_ONEDEF="exactly one compile"" definition"
           P_ALREADY="differs from the ALREADY""-RUN"
           P_DXHDR="internal DX"" header"
+          P_ONLYDIFF="only difference from mgpu_""nvapi_control"
+          P_BUILDPLUS="mgpu_nvapi_control build ""plus"
+          P_CFACT="counterfactual \(mgpu_""nvapi_control\)"
+          P_NOTHINGELSE="and nothing ""else"
+
           FORBID=$(grep -rnE "$P_CAUSE|$P_ONEDEF|$P_ALREADY|$P_DXHDR" \
                    src CMakeLists.txt .github/workflows/cudadiag-ab.yml 2>/dev/null || true)
           [ -z "$FORBID" ] || {
             echo "$FORBID"
             echo "::error::superseded wording is still present in the tree"
             FAIL=1; }
-          echo "superseded causal/counterfactual/provenance wording: absent"
+
+          FORBIDWF=$(grep -nE "$P_ONLYDIFF|$P_BUILDPLUS|$P_CFACT|$P_NOTHINGELSE" \
+                     .github/workflows/cudadiag-ab.yml 2>/dev/null || true)
+          [ -z "$FORBIDWF" ] || {
+            echo "$FORBIDWF"
+            echo "::error::superseded one-definition wording is still present in this workflow"
+            FAIL=1; }
+
+          # Positive control for the scoping decision. If the ordinary-English
+          # fragment ever stops occurring elsewhere in the tree, this says so and
+          # asks for the scope to be re-checked, rather than silently allowing
+          # someone to widen the check and break the build on unrelated prose.
+          COLLOQ=$(grep -rF "$P_NOTHINGELSE" src CMakeLists.txt 2>/dev/null | wc -l)
+          echo "ordinary-English occurrences of the shortest variant fragment outside this workflow: $COLLOQ"
+          [ "$COLLOQ" -ge 1 ] || {
+            echo "::error::the shortest variant fragment no longer occurs as ordinary English outside this workflow - re-check whether the file-scoped wording gate is still the right shape before widening it"
+            FAIL=1; }
+
+          echo "superseded wording absent: 4 concept-specific phrases tree-wide, 4 conceptual variants in this workflow"
 
           # ---- A FAILED __out VALUE IS NEVER READ -------------------------
           out_read_proof read_descriptor_handle 'pParams->handle' \
@@ -548,8 +591,12 @@ jobs:
           mkdir -p ext/minhook/lib
           cp "$LIB" ext/minhook/lib/MinHook.lib
 
-      # All four flags are asserted. This artifact is the recorded
-      # mgpu_nvapi_control build plus MGPU_CUDA_DIAG, and nothing else.
+      # All four flags are asserted. This build preserves the experiment settings
+      # of the clean NVAPI-control baseline and adds MGPU_CUDA_DIAG observational
+      # instrumentation. It is NOT claimed that the binary is the old baseline
+      # artifact plus one compile definition: the source revision itself carries
+      # the CUDA-DIAG integration. The historical baseline run is a behavioural
+      # reference, not a byte-for-byte A/B artifact.
       - name: Configure (cudadiag)
         shell: bash
         run: |
@@ -665,18 +712,35 @@ jobs:
         run: |
           {
             echo "variant            = cudadiag"
-            echo "MGPU_CUDA_DIAG     = ON            (the only difference from mgpu_nvapi_control)"
-            echo "MGPU_ARCH_COMPAT   = ON            (frozen; also what makes the ids reachable)"
-            echo "MGPU_CONTRACT_EXPANDED = ON        (frozen)"
-            echo "MGPU_NVAPI_EXPLICIT_INIT = OFF     (frozen; the rejected experiment's control)"
+            echo
+            echo "This build preserves the experiment settings of the clean"
+            echo "NVAPI-control baseline:"
+            echo "    MGPU_ARCH_COMPAT=ON"
+            echo "    MGPU_CONTRACT_EXPANDED=ON"
+            echo "    MGPU_NVAPI_EXPLICIT_INIT=OFF"
+            echo
+            echo "and adds MGPU_CUDA_DIAG observational instrumentation."
+            echo
+            echo "The historical mgpu_nvapi_control run is the behavioral reference."
+            echo "It is NOT a byte-for-byte A/B artifact and this build is not claimed"
+            echo "to differ from it by only one compile definition: the source revision"
+            echo "itself carries the CUDA-DIAG integration."
+            echo
             echo "commit             = ${GITHUB_SHA}"
             echo "run                = ${GITHUB_RUN_ID}"
             echo "built              = $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo
-            echo "NOT AN A/B. There is no second arm and no compare job: the raw"
-            echo "counterfactual (mgpu_nvapi_control) is already on the record with"
-            echo "P1.0c Init=Success, P4.1 Init=Success and CreateFeature=0xBAD00002"
-            echo "at both 1280x720 and 3840x2160."
+            echo "HISTORICAL BASELINE OBSERVATIONS (values recorded by the earlier"
+            echo "mgpu_nvapi_control run; they are observations, not a counterfactual"
+            echo "binary identity claim about this artifact):"
+            echo "    baseline P1.0c Init        = Success"
+            echo "    baseline P4.1  Init        = Success"
+            echo "    baseline CreateFeature     = 0xBAD00002 at 1280x720 and 3840x2160"
+            echo
+            echo "NOT AN A/B. There is no second arm and no compare job. Whether THIS"
+            echo "run is a valid basis for the diagnostic is decided at run time by the"
+            echo "validity gate: valid only if this run's P1.0c Init AND P4.1 Init are"
+            echo "both Success; if either is FAIL_OutOfDate the NGX portion is void."
           } > CUDADIAG_VARIANT.txt
           cat CUDADIAG_VARIANT.txt
 
