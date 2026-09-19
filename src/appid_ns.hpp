@@ -67,8 +67,8 @@
 //     descriptor -1 -> 0  and  CuModule -1 -> 0
 //         -> the ApplicationId was part of the blocker.
 //     both still -1 with valid Init
-//         -> the ApplicationId is EXONERATED, and the work returns to
-//            PROCESSCONTEXT-AB.
+//         -> the ApplicationId is EXONERATED, and the investigation returns to
+//            the multi-device / process-context question.
 //   Either Init FAIL_OutOfDate voids the NGX portion of the run; nothing in it
 //   may be read as a result.
 // ============================================================================

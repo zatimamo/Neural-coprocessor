@@ -1,0 +1,77 @@
+# ============================================================================
+# MGPU-AutoLab configuration
+# ============================================================================
+# Parsed by a deliberately SMALL YAML subset parser inside autolab.py - no
+# third-party dependency, no version skew, identical behaviour on every machine.
+# The subset is:
+#
+#   key: value                  scalar
+#   key:                        nested mapping (the block below it, indented)
+#   key:                        list (following "- item" lines, indented)
+#   - item                      one scalar list entry
+#   # comment                   whole line or trailing, outside quotes
+#   scalars: 'text'  "text"  123  true  false  []  {}
+#
+# Tabs are not allowed for indentation. Anything outside the subset is a hard
+# error naming the line, rather than a silently wrong value - a deterministic
+# orchestrator may not guess what a config file meant.
+# ============================================================================
+
+repository: zatimamo/Neural-coprocessor
+branch: archtest-ab
+
+paths:
+  # Absolute. Forward slashes work on Windows and avoid backslash-escaping.
+  cyberpunk_exe: 'F:/PC_GAMES/Cbrpnk 2zero77/bin/x64/Cyberpunk2077.exe'
+  install_dir:   'F:/PC_GAMES/Cbrpnk 2zero77/bin/x64'
+  # The MGPU add-on, exactly as Cyberpunk loads it. This is the ONLY file in the
+  # game directory AutoLab ever writes.
+  addon_name:    'nvngx.dll_mgpu_bridge.addon64'
+  # The ReShade log AutoLab tails. It is removed before each game run and
+  # archived after it; nothing else in the game directory is touched.
+  reshade_log:   'ReShade.log'
+  # The private DLSS-NR runtime, relative to install_dir. AutoLab verifies its
+  # hash and NEVER replaces it.
+  nr_dll:        'mgpu/nvngx_dlssnr.dll'
+
+# The NeuralScreen runtime this whole investigation is measured against.
+required_nr_dll_sha256: DCC0DC2414AEDEC4A8E084647070383BE068554042587180C20C784D4772D36F
+
+safety:
+  # ------------------------------------------------------------------------
+  # THE GAME-LAUNCH GATE. While this is false, AutoLab refuses to start
+  # Cyberpunk, whatever the command line says. Experiments that do not need the
+  # game - PROCESSCONTEXT is one - still run to completion.
+  #
+  # It is false so that AutoLab can be developed and tested against synthetic
+  # fixtures without a game launch. Set it to true (or pass
+  # --allow-game-launch) when you are ready for AutoLab to drive the game.
+  # ------------------------------------------------------------------------
+  allow_game_launch: false
+  # Refuse to run if the game is already running. There is no reason to make
+  # this configurable and it is checked regardless.
+  require_game_not_running: true
+
+launch:
+  # Left empty: the game executable from paths.cyberpunk_exe is launched
+  # directly with working_dir = install_dir. If your normal launch goes through
+  # a launcher, put that executable here instead and it will be used unchanged.
+  exe: ''
+  args: []
+  working_dir: ''
+
+timeouts:
+  # PROCESSCONTEXT runs four arms, each loading a ~166 MB DLL and creating
+  # devices. Generous, because a slow load is not a result.
+  processcontext_seconds: 420
+  # The game run. Fixed at 90 s by the experiment definition.
+  game_run_seconds: 90
+  # After CloseMainWindow, how long to wait before forcing termination.
+  post_close_wait_seconds: 10
+  gh_wait_seconds: 2700
+  gh_poll_seconds: 10
+
+# Relative to the repository root (the directory two levels above this file).
+# Both are ignored by git: they are run outputs, not sources.
+results_dir: results
+cache_dir: cache

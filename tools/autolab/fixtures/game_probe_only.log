@@ -1,0 +1,12 @@
+[MGPU][P1.0c] Init: result=0x00000001 (NVSDK_NGX_Result_Success) device=0x000001D4A2B0C000 luid=00000000-0000E18E app_id=0 sdk_version=0x0000015 log_callback=NOT INSTALLED data_path="."
+[MGPU][P1.0c] snippet Init_Ext: result=0x00000001 (NVSDK_NGX_Result_Success) device=0x000001D4A2B0C000 params=0x000001D4A2B12000
+[CUDADIAG] GetCudaIndependentDescriptorObject seq=1 tid=20344 scope=P1.0c mismatch_seen=no pParams=0000000000000000
+[CUDADIAG] GetCudaIndependentDescriptorObject before pDevice=(null) expected=unknown match=NOT_COMPARED (no identity was published by the game thread)
+[CUDADIAG] GetCudaIndependentDescriptorObject status=-14 (0xFFFFFFF2)
+[CUDADIAG]   returned handle NOT READ because NvApi_Status != NVAPI_OK (status=-14)
+[MGPU][P1.0c] CreateFeature(Reserved18) via nvngx_dlssnr.dll (snippet): result=0xBAD00002 (FAIL_PlatformError) handle=0x0000000000000000 1280x720 elapsed=1ms
+[CUDADIAG] CreateCuModule seq=1 tid=20344 scope=P1.0c mismatch_seen=no pBlob=0000000000000000 size=0 phModule=0000000000000000
+[CUDADIAG] CreateCuModule before pDevice=(null) expected=unknown match=NOT_COMPARED (no identity was published by the game thread)
+[CUDADIAG] CreateCuModule status=-14 (0xFFFFFFF2)
+[CUDADIAG]   module handle NOT READ because NvApi_Status != NVAPI_OK (status=-14)
+[MGPU][P4.1] Init: result=0x00000001 (NVSDK_NGX_Result_Success)

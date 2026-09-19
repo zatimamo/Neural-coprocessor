@@ -1,0 +1,10 @@
+PROCESSCONTEXT-AB  mode=single  pid=23112  started=2026-09-19 14:00:00
+[lane]  CreateFeature(NVSDK_NGX_Feature_Reserved18) via the snippet -> 0x00000001 (NVSDK_NGX_Result_Success) handle=0x000001D4A2B0C000 640x360 elapsed=812ms
+[cuda] #1 GetCudaIndependentDescriptorObject 0x0DDAC234 REAL pDevice=0x000001D4A2B0C000 type=0 desc.ptr=0x1A4BAD70000 structSizeIn=48 structSizeOut_before=0 match=yes
+[cuda] #1 REAL status=0 (0x00000000) structSizeOut_after=48 returned_handle=0x1A4BAD7000 
+[cuda] #2 GetCudaIndependentDescriptorObject 0x0DDAC234 CAPABILITY-PROBE pDevice=0000000000000000 type=-1 desc.ptr=0x0 structSizeIn=0 structSizeOut_before=0 match=NA-probe
+[cuda] #2 probe status=-14 (0xFFFFFFF2) NVAPI_INVALID_POINTER - null-argument validation probe; NOT a failure
+[cuda] #1 CreateCuModule 0xAD1A677D REAL pDevice=0x000001D4A2B0C000 pBlob=0x000001D4A1000000 (pointer only; never dereferenced) size=3944768 phModule=0x0000004B2FEFA1C0 match=yes
+[cuda] #1 REAL status=0 (0x00000000) module_handle=0xA000
+[cuda] first CreateCuModule blob size = 3944768 bytes (the blob itself is never read)
+PCAB-RESULT mode=single valid=YES control=OK core_init=0x00000001 caps=0x00000001 snip_init=0x00000001 populate=0x00000001 feature=0x00000001 desc_status=0 desc_calls=2 desc_probes=1 cu_status=0 cu_calls=1 cu_probes=0

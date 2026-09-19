@@ -1,0 +1,8 @@
+PROCESSCONTEXT-AB  mode=dual-active  pid=23112  started=2026-09-19 14:00:00
+[lane]  CreateFeature(NVSDK_NGX_Feature_Reserved18) via the snippet -> 0xBAD00002 (FAIL_PlatformError) handle=0x0000000000000000 640x360 elapsed=4ms
+[cuda] #1 GetCudaIndependentDescriptorObject 0x0DDAC234 REAL pDevice=0x000001D4A2B0C000 type=0 desc.ptr=0x30000004 structSizeIn=48 structSizeOut_before=0 match=yes
+[cuda] #1 REAL status=-1 (0xFFFFFFFF) structSizeOut_after=0 returned_handle=0x0 NOT READ: NvApi_Status != NVAPI_OK
+[cuda] #1 CreateCuModule 0xAD1A677D REAL pDevice=0x000001D4A2B0C000 pBlob=0x000001D4A1000000 (pointer only; never dereferenced) size=3944768 phModule=0x0000004B2FEFA1C0 match=yes
+[cuda] #1 REAL status=-1 (0xFFFFFFFF) module_handle=0x0 NOT READ: NvApi_Status != NVAPI_OK
+[cuda] first CreateCuModule blob size = 3944768 bytes (the blob itself is never read)
+PCAB-RESULT mode=dual-active valid=YES control=FAIL core_init=0x00000001 caps=0x00000001 snip_init=0x00000001 populate=0x00000001 feature=0xBAD00002 desc_status=-1 desc_calls=1 desc_probes=0 cu_status=-1 cu_calls=1 cu_probes=0
