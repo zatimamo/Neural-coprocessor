@@ -42,3 +42,5 @@ nr-selftest.json
 nr-ipc-probe.json
 transport-benchmark.json
 
+build-nr.log
+
