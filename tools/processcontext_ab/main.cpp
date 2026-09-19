@@ -17,6 +17,24 @@
 //   dual-active     ... plus a DIRECT command queue and a tiny CBV/SRV/UAV heap
 //   dual-released   Ti SUPER device created, recorded, then RELEASED
 //
+// THE CONTROL LANE IS NeuralScreen v1.15.0's SEQUENCE, and the order is part of
+// the reproduction rather than an implementation detail:
+//
+//   1. create the RTX 4070 device
+//   2. load the NGX core
+//   3. core Init                  app id 0x1000000
+//   4. AllocateParameters         a private block, not the core's shared one
+//   5. NvAPI_Initialize           ^ after core Init, which is NeuralScreen's order
+//   6. cache every GPU's real architecture, then install the patch over one target
+//   7. install the observational QueryInterface observer
+//   8. load nvngx_dlssnr.dll
+//   9. snippet Init_Ext           app id 0x1000000
+//  10. params->Reset(), the exact 640x360 contract, CreateFeature Reserved18
+//
+// The data path is dirname(--nr-dll) - the directory the runtime actually sits
+// in, which is the directory NeuralScreen hands NGX. The NR DLL path and the
+// derived data path are both logged, and the DLL must be inside the data path.
+//
 // INTERPRETATION, FIXED IN ADVANCE - one rule per arm, in this order:
 //
 //   E) SINGLE does not succeed  -> THE DIAGNOSTIC IS INVALID. Stop. Interpret
@@ -518,7 +536,10 @@ int main(int argc, char **argv)
                      "PROCESSCONTEXT-AB\n"
                      "  --mode single|dual-held|dual-active|dual-released|table\n"
                      "  --nr-dll <path to nvngx_dlssnr.dll>   (required for the four modes)\n"
-                     "  --data-path <NGX data path>           (optional; defaults to the exe dir)\n");
+                     "  --data-path <NGX data path>           (OVERRIDE ONLY. By default the\n"
+                     "                                         data path is dirname(--nr-dll),\n"
+                     "                                         which is NeuralScreen's own data\n"
+                     "                                         path, and the DLL must be inside it.)\n");
         return 1;
     }
 
@@ -576,6 +597,60 @@ int main(int argc, char **argv)
         pcab::logf("!! name carrying that prefix. Until then, this run's SINGLE arm cannot be");
         pcab::logf("!! read as the reference and the whole diagnostic is INVALID (rule E).");
         pcab::logf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    }
+    pcab::logf("");
+
+    // ---- THE DATA PATH, DERIVED FROM --nr-dll ----------------------------
+    //
+    // NeuralScreen hands NGX the directory that holds the snippet. This
+    // diagnostic must hand it THE SAME directory, or the two lanes are not the
+    // same lane - and defaulting to this executable's own directory would put
+    // the reference experiment's data path somewhere NeuralScreen's never is.
+    //
+    // So: dirname(--nr-dll), automatically. --data-path survives only as an
+    // explicit override, and RUN-CONTEXT-AB.cmd never needs it.
+    //
+    // This runs BEFORE the hash gate on purpose. It is pure argument
+    // validation - two strings and no file content - so a run with an
+    // inconsistent pair of paths is refused before anything is hashed or
+    // loaded, and the derivation is testable without a correctly-hashed DLL.
+    wchar_t derived_data[MAX_PATH * 2]{};
+    {
+        wcsncpy(derived_data, nr_dll, MAX_PATH * 2 - 1);
+        wchar_t *slash = wcsrchr(derived_data, L'\\');
+        {
+            wchar_t *fwd = wcsrchr(derived_data, L'/');
+            if (fwd != nullptr && (slash == nullptr || fwd > slash)) slash = fwd;
+        }
+        if (slash != nullptr) *slash = L'\0';
+        else                  wcscpy(derived_data, L".");   // a bare file name
+
+        const bool explicit_override = (data_path != nullptr);
+        if (!explicit_override) data_path = derived_data;
+
+        pcab::logf("[path]  NR DLL path        = %ls", nr_dll);
+        pcab::logf("[path]  derived data path  = %ls%s", data_path,
+                   explicit_override ? "   (from an explicit --data-path override)"
+                                     : "   (derived from --nr-dll; NeuralScreen's data path)");
+
+        // REQUIRE THE DLL TO ACTUALLY BE INSIDE THAT DIRECTORY. A data path
+        // that does not contain the runtime is not the directory the runtime
+        // was told about, and NGX would be pointed at the wrong place.
+        bool inside = false;
+        if (slash != nullptr) inside = (wcscmp(data_path, derived_data) == 0);
+        else                  inside = (wcscmp(data_path, L".") == 0 ||
+                                        wcscmp(data_path, L"") == 0);
+        if (!inside)
+        {
+            pcab::logf("[path]  the NR DLL's own directory is \"%ls\", but the data path is "
+                       "\"%ls\" - the DLL is NOT inside the directory it would be given. "
+                       "Refusing to run.", derived_data, data_path);
+            pcab::logf("PCAB-RESULT mode=%s valid=NO reason=NR_DLL_NOT_IN_DATA_PATH "
+                       "control=NOT_RUN", mode);
+            pcab::log_close();
+            return 1;
+        }
+        pcab::logf("[path]  the NR DLL is inside the data path it will be given - OK");
     }
     pcab::logf("");
 
@@ -824,45 +899,25 @@ int main(int argc, char **argv)
     }
     pcab::logf("");
 
-    // ---- NVAPI: the observer first, then the documented ordering ----------
-    // The lane's device is published to the observer BEFORE anything is resolved
-    // or called, so every private call is reported against it - the same
-    // identity comparison CUDADIAG reports as match=yes/no.
-    pcab::observe_set_expected_device((void *)lane.dev);
-    const bool observed = pcab::observe_install(mode);
-    pcab::logf("[nvapi] observation installed = %s", observed ? "yes" : "NO");
-    pcab::logf("");
-
-    // ---- NvAPI_Initialize: step 2 of the required order -------------------
-    if (!pcab::nv_load_and_initialize())
-    {
-        pcab::logf("[nvapi] NVAPI could not be brought up - this is an environment result, not a "
-                   "context result, and the run answers nothing");
-        pcab::logf("PCAB-RESULT mode=%s valid=NO reason=NVAPI_INIT_FAILED control=NOT_RUN", mode);
-        pcab::log_close();
-        return 1;
-    }
-    pcab::logf("");
-
-    // ---- the NGX core, loaded BEFORE core Init ---------------------------
+    // ---- the NGX core, loaded BEFORE anything NGX is initialised ---------
+    //
+    // NeuralScreen loads the core first and only then initialises it. NVAPI is
+    // NOT initialised yet at this point and must not be: an explicit
+    // NvAPI_Initialize before core Init is not NeuralScreen's sequence, and
+    // this diagnostic exists to reproduce that sequence rather than to improve
+    // on it.
     if (!pcab::ngx_load_core())
     {
         pcab::logf("PCAB-RESULT mode=%s valid=NO reason=NGX_CORE_LOAD_FAILED control=NOT_RUN", mode);
         pcab::log_close();
         return 1;
     }
-    pcab::logf("");
 
-    // ---- the lane's entry points -----------------------------------------
-    // The snippet's own entry points are resolved AFTER the patch is installed
-    // and after the DLL is loaded, which is step 4/5 of the required order; only
-    // the core's Init and AllocateParameters are needed before it.
+    // ---- the lane's core entry points ------------------------------------
     HMODULE core = pcab::ngx_core();
-
-    pcab::pf_init             p_init   = (pcab::pf_init)            pick(core, "NVSDK_NGX_D3D12_Init", "core");
-    pcab::pf_alloc_params     p_alloc  = (pcab::pf_alloc_params)    pick(core, "NVSDK_NGX_D3D12_AllocateParameters", "core");
+    pcab::pf_init          p_init  = (pcab::pf_init)       pick(core, "NVSDK_NGX_D3D12_Init", "core");
+    pcab::pf_alloc_params  p_alloc = (pcab::pf_alloc_params) pick(core, "NVSDK_NGX_D3D12_AllocateParameters", "core");
     pcab::logf("");
-
     if (p_init == nullptr || p_alloc == nullptr)
     {
         pcab::logf("[lane]  a required core entry point is missing; the lane cannot run");
@@ -872,16 +927,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // The data path: NeuralScreen passes its own; the directory holding this
-    // executable is the honest default when none is given.
-    wchar_t default_data[MAX_PATH * 2]{};
-    if (data_path == nullptr)
-    {
-        wcsncpy(default_data, self, MAX_PATH * 2 - 1);
-        wchar_t *slash = wcsrchr(default_data, L'\\');
-        if (slash != nullptr) *slash = L'\0';
-        data_path = default_data;
-    }
+    // The data path was derived from --nr-dll near the top of main(), before
+    // the hash gate, and is already logged there. It is NOT this executable's
+    // directory: the reference experiment must hand NGX the same directory
+    // NeuralScreen hands it.
     pcab::logf("[lane]  data_path=\"%ls\" app_id=0x%016llX sdk_version=NVSDK_NGX_Version_API",
                data_path, (unsigned long long)pcab::NS_APPLICATION_ID);
 
@@ -889,13 +938,20 @@ int main(int argc, char **argv)
     //
     //   1. core NVSDK_NGX_D3D12_Init                 app id 0x1000000
     //   2. NVSDK_NGX_D3D12_AllocateParameters        a PRIVATE block this lane owns
-    //   3. nv_set_arch_target + arch_cache_real + install the arch patch
-    //      ^ AFTER core Init and AFTER AllocateParameters, never before
-    //   4. load the exact nvngx_dlssnr.dll
-    //   5. snippet NVSDK_NGX_D3D12_Init_Ext          app id 0x1000000
-    //   6. params->Reset()
-    //   7. the full 640x360 creation contract
-    //   8. CreateFeature(NVSDK_NGX_Feature_Reserved18)
+    //   3. NvAPI_Initialize
+    //   4. nv_set_arch_target + arch_cache_real + install the arch patch
+    //   5. install the observational QueryInterface observer
+    //   6. load the exact nvngx_dlssnr.dll
+    //   7. snippet NVSDK_NGX_D3D12_Init_Ext          app id 0x1000000
+    //   8. params->Reset()
+    //   9. the full 640x360 creation contract
+    //  10. CreateFeature(NVSDK_NGX_Feature_Reserved18)
+    //
+    // NvAPI_Initialize is AFTER core Init and AllocateParameters, because that
+    // is NeuralScreen's working sequence. The observer is installed as LATE as
+    // it can be while still being in place before the private runtime loads: it
+    // only needs to see the two CUDA ids, so it has no business perturbing core
+    // Init or the architecture setup.
     //
     // From the moment the lane starts, a failure is a RESULT about the lane
     // (valid=YES, control=FAIL) rather than an inability to run, so that an
@@ -954,7 +1010,20 @@ int main(int argc, char **argv)
         }
     }
 
-    // 3. the architecture patch. Cached for EVERY GPU first, with nothing
+    // 3. NvAPI_Initialize. AFTER core Init and AFTER AllocateParameters: this is
+    //    NeuralScreen's sequence, and an explicit NvAPI_Initialize before core
+    //    Init is not part of it.
+    if (!pcab::nv_load_and_initialize())
+    {
+        pcab::logf("[nvapi] NVAPI could not be brought up - this is an environment result, not a "
+                   "context result, and the run answers nothing");
+        pcab::logf("PCAB-RESULT mode=%s valid=NO reason=NVAPI_INIT_FAILED control=NOT_RUN", mode);
+        pcab::log_close();
+        return 1;
+    }
+    pcab::logf("");
+
+    // 4. the architecture patch. Cached for EVERY GPU first, with nothing
     //    hooked, then installed over exactly one target entry.
     //
     //    Two separate statements on purpose. Writing this as one `a() || b()`
@@ -971,9 +1040,25 @@ int main(int argc, char **argv)
                    "DLSSNR 310.8.0 runtime is expected to refuse the real Ada architecture, so a "
                    "failure downstream of this has a cause that is NOT the hypothesis under test.");
     }
+    pcab::logf("");
 
-    // 4. the exact private runtime, by path, AFTER the patch and before the
-    //    snippet session that needs it.
+    // 5. the observational observer, installed AS LATE AS IT CAN BE while still
+    //    being in place before the private runtime is loaded.
+    //
+    //    It hooks nvapi_QueryInterface to see the two CUDA ids and nothing else,
+    //    so it has no business being installed early enough to perturb core
+    //    Init or the architecture setup. The lane's device is published to it
+    //    here, immediately before installation, because that is the first moment
+    //    it needs the identity and the device already exists.
+    pcab::observe_set_expected_device((void *)lane.dev);
+    const bool observed = pcab::observe_install(mode);
+    pcab::logf("[nvapi] observation installed = %s (installed after NVAPI init, the architecture "
+               "cache and the arch patch, and before the private runtime loads)",
+               observed ? "yes" : "NO");
+    pcab::logf("");
+
+    // 6. the exact private runtime, by path, AFTER the patch and AFTER the
+    //    observer, and before the snippet session that needs it.
     if (!pcab::ngx_load_snippet(nr_dll))
     {
         pcab::logf("PCAB-RESULT mode=%s valid=NO reason=SNIPPET_LOAD_FAILED control=NOT_RUN", mode);
@@ -981,7 +1066,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // 4b. the snippet's own entry points, resolved now that it is loaded.
+    // 6b. the snippet's own entry points, resolved now that it is loaded.
     HMODULE snip = pcab::ngx_snippet();
     pcab::pf_init_ext       p_sinit  = (pcab::pf_init_ext)       pick(snip, "NVSDK_NGX_D3D12_Init_Ext", "snippet");
     pcab::pf_create_feature p_create = (pcab::pf_create_feature) pick(snip, "NVSDK_NGX_D3D12_CreateFeature", "snippet");
@@ -994,7 +1079,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // 5. the snippet's own Reserved18 session, same app id, with our block.
+    // 7. the snippet's own Reserved18 session, same app id, with our block.
     lane.snip_init = (unsigned)p_sinit(pcab::NS_APPLICATION_ID, data_path, lane.dev,
                                        NVSDK_NGX_Version_API, lane.params);
     pcab::logf("[lane]  snippet NVSDK_NGX_D3D12_Init_Ext(app_id=0x%016llX) -> 0x%08X (%s)",

@@ -228,12 +228,16 @@ jobs:
             note "observe_set_expected_device is not declared"
           grep -qF 'pcab::observe_set_expected_device((void *)lane.dev);' tools/processcontext_ab/main.cpp ||
             note "the lane device is never published to the observer"
-          # Published BEFORE the observer is installed AND before anything NGX.
+          # Published BEFORE the observer is installed. It is deliberately NOT
+          # asserted to precede NvAPI_Initialize any more: the observer is now
+          # installed as late as it can be - after NVAPI init, the architecture
+          # cache and the arch patch, and before the private runtime loads - so
+          # that it cannot perturb core Init or the architecture setup. The
+          # order assertions for that live in the reference-contract step.
           PUB=$(grep -n 'pcab::observe_set_expected_device' tools/processcontext_ab/main.cpp | head -n1 | cut -d: -f1)
           INSD=$(grep -n 'pcab::observe_install(mode)' tools/processcontext_ab/main.cpp | head -n1 | cut -d: -f1)
-          NVINI=$(grep -n 'pcab::nv_load_and_initialize()' tools/processcontext_ab/main.cpp | head -n1 | cut -d: -f1)
-          [ -n "$PUB" ] && [ -n "$INSD" ] && [ -n "$NVINI" ] && [ "$PUB" -lt "$INSD" ] && [ "$PUB" -lt "$NVINI" ] || {
-            echo "::error::the device identity is published after the observer or after NVAPI init (pub $PUB, install $INSD, nvapi $NVINI)"; exit 1; }
+          [ -n "$PUB" ] && [ -n "$INSD" ] && [ "$PUB" -lt "$INSD" ] || {
+            echo "::error::the device identity is published after the observer is installed (pub $PUB, install $INSD)"; exit 1; }
 
           # ---- the hook is on the resolver, and there is exactly one ------
           N=$(grep -cE 'MH_CreateHook\(entry, \(LPVOID\)&query_detour' "$F" || true)
@@ -282,22 +286,42 @@ jobs:
           esac
           # The spoof must be conditional: a real value that is already accepted
           # is not rewritten, which is NeuralScreen's behaviour.
-          grep -qE 'if \(pInfo->architecture != SPOOF_ARCHITECTURE\)' "$F" || {
+          grep -qF 'const bool spoofing = (e->spoof && out.architecture != SPOOF_ARCHITECTURE);' "$F" || {
             echo "::error::the architecture rewrite is unconditional"; exit 1; }
           grep -q 'SPOOF_ARCHITECTURE   = 0x1B0u' tools/processcontext_ab/nv.h || {
             echo "::error::the accepted architecture value has drifted"; exit 1; }
-          # NVIDIA's own code still serves the call: the detour calls the
-          # original first and rewrites only the returned value.
-          grep -qF 'const int r = g_arch_original(gpu, pInfo);' "$F" || {
-            echo "::error::the architecture detour does not call the original"; exit 1; }
-          # Per-GPU: a cache filled before the hook, one spoof target, and every
-          # other GPU served its OWN cached real value.
+          # A KNOWN cached handle is served FROM THE CACHE. The real function
+          # must not be called for one: calling through would let the variable
+          # under test - a live second D3D12 device - feed back into the
+          # architecture query after the reference values were read.
+          #
+          # Enforced structurally: the ONLY call to the real entry point in this
+          # file is the UNKNOWN-handle passthrough.
+          N=$(grep -c 'g_arch_original(' "$F" || true)
+          [ "$N" -eq 1 ] || {
+            echo "::error::expected exactly 1 call to the genuine GetArchInfo (the unknown-handle passthrough), found $N"
+            grep -n 'g_arch_original(' "$F" || true; exit 1; }
+          grep -qF 'return g_arch_original(gpu, pInfo);' "$F" || {
+            echo "::error::the unknown-handle passthrough does not return the genuine call"; exit 1; }
+          grep -qF 'UNKNOWN handle' "$F" || {
+            echo "::error::the unknown-handle path does not log UNKNOWN"; exit 1; }
+          grep -qF 'PASSTHROUGH to the genuine GetArchInfo' "$F" || {
+            echo "::error::the unknown-handle path does not log PASSTHROUGH"; exit 1; }
+          # The known-handle path: the caller's version stamp is saved, the cache
+          # is copied, the stamp is restored, and NVAPI_OK is returned.
+          grep -qF 'const unsigned requested = pInfo->version;' "$F" || {
+            echo "::error::the caller's requested version stamp is not saved"; exit 1; }
+          grep -qF 'out.version = requested;' "$F" || {
+            echo "::error::the caller's requested version stamp is not restored"; exit 1; }
+          grep -qF 'return NVAPI_OK_STATUS;' "$F" || {
+            echo "::error::the cached path does not return NVAPI_OK"; exit 1; }
+          grep -qF 'const bool spoofing = (e->spoof && out.architecture != SPOOF_ARCHITECTURE);' "$F" || {
+            echo "::error::the spoof is not gated on the target entry AND its real generation needing it"; exit 1; }
+          grep -qF 'ITS OWN cached real result' "$F" || {
+            echo "::error::the non-target path does not state that it returns the cached real value"; exit 1; }
+          # Per-GPU: a cache filled before the hook, one spoof target.
           grep -qF 'e.spoof = (g_arch_target_set && e.raw_pci != 0 && e.raw_pci == g_arch_target_raw);' "$F" || {
             echo "::error::the spoof target is not selected by exact raw PCI identity"; exit 1; }
-          grep -qF 'if (!e->spoof)' "$F" || {
-            echo "::error::the detour has no non-target branch, so it spoofs indiscriminately"; exit 1; }
-          grep -qF 'EVERY OTHER GPU GETS ITS OWN CACHED REAL RESULT' "$F" || {
-            echo "::error::the non-target path does not state that it returns the cached real value"; exit 1; }
           # The NR DLL is hashed through CNG, not a hand-rolled digest.
           grep -q 'BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM' "$F" || {
             echo "::error::the SHA256 is not computed with CNG"; exit 1; }
@@ -535,37 +559,70 @@ jobs:
           [ -z "$H" ] || { echo "$H"; note "the superseded version literal is back"; }
 
           # ---- REQUIRED: the order, asserted by line position -------------
+          #
+          # NeuralScreen v1.15.0's sequence. Note where NvAPI_Initialize sits:
+          # AFTER core Init and AFTER AllocateParameters, and the observer after
+          # the architecture work and before the private runtime loads.
           line_of() { grep -nF -- "$2" "$1" | head -n1 | cut -d: -f1; }
-          L_DEV=$(line_of "$M"    'D3D12CreateDevice(ad_4070')
-          L_NVAPI=$(line_of "$M"  'pcab::nv_load_and_initialize()')
-          L_CORE=$(line_of "$M"   'pcab::ngx_load_core()')
-          L_INIT=$(line_of "$M"   'lane.core_init = (unsigned)p_init(pcab::NS_APPLICATION_ID,')
-          L_ALLOC=$(line_of "$M"  'lane.alloc = (unsigned)p_alloc(&params)')
-          L_CACHE=$(line_of "$M"  'pcab::arch_cache_real()')
-          L_PATCH=$(line_of "$M"  'pcab::arch_patch_install()')
-          L_SNIP=$(line_of "$M"   'pcab::ngx_load_snippet(nr_dll)')
-          L_SINIT=$(line_of "$M"  'lane.snip_init = (unsigned)p_sinit(pcab::NS_APPLICATION_ID,')
-          L_RESET=$(line_of "$M"  'apply_reference_contract(lane.params)')
-          L_CREATE=$(line_of "$M" 'p_create(lane.list, NVSDK_NGX_Feature_Reserved18')
-          for V in L_DEV L_NVAPI L_CORE L_INIT L_ALLOC L_CACHE L_PATCH L_SNIP L_SINIT L_RESET L_CREATE; do
+          L_DEV=$(line_of "$M"     'D3D12CreateDevice(ad_4070')
+          L_CORE=$(line_of "$M"    'pcab::ngx_load_core()')
+          L_INIT=$(line_of "$M"    'lane.core_init = (unsigned)p_init(pcab::NS_APPLICATION_ID,')
+          L_ALLOC=$(line_of "$M"   'lane.alloc = (unsigned)p_alloc(&params)')
+          L_NVAPI=$(line_of "$M"   'pcab::nv_load_and_initialize()')
+          L_TARGET=$(line_of "$M"  'pcab::nv_set_arch_target(VENDOR_NVIDIA, PCI_RTX_4070);')
+          L_CACHE=$(line_of "$M"   'pcab::arch_cache_real()')
+          L_PATCH=$(line_of "$M"   'pcab::arch_patch_install()')
+          L_OBSERVE=$(line_of "$M" 'pcab::observe_install(mode)')
+          L_SNIP=$(line_of "$M"    'pcab::ngx_load_snippet(nr_dll)')
+          L_SINIT=$(line_of "$M"   'lane.snip_init = (unsigned)p_sinit(pcab::NS_APPLICATION_ID,')
+          L_RESET=$(line_of "$M"   'apply_reference_contract(lane.params)')
+          L_CREATE=$(line_of "$M"  'p_create(lane.list, NVSDK_NGX_Feature_Reserved18')
+          for V in L_DEV L_CORE L_INIT L_ALLOC L_NVAPI L_TARGET L_CACHE L_PATCH L_OBSERVE \
+                   L_SNIP L_SINIT L_RESET L_CREATE; do
             eval "v=\$$V"
             [ -n "$v" ] || note "the required step $V was not found in main.cpp"
           done
           order_ok() { [ -n "$1" ] && [ -n "$2" ] && [ "$1" -lt "$2" ]; }
-          order_ok "$L_DEV" "$L_NVAPI"     || note "the RTX 4070 device is not created before NvAPI_Initialize"
-          order_ok "$L_NVAPI" "$L_CORE"    || note "NvAPI_Initialize is not before the NGX core load"
-          order_ok "$L_CORE" "$L_INIT"     || note "the NGX core is not loaded before core Init"
-          order_ok "$L_INIT" "$L_ALLOC"    || note "core Init is not before AllocateParameters"
-          order_ok "$L_ALLOC" "$L_CACHE"   || note "the architecture cache is not after AllocateParameters"
-          order_ok "$L_CACHE" "$L_PATCH"   || note "the real architectures are not cached before the hook"
-          order_ok "$L_PATCH" "$L_SNIP"    || note "the architecture patch is not installed before the snippet load"
-          order_ok "$L_SNIP" "$L_SINIT"    || note "the snippet is not loaded before snippet Init_Ext"
-          order_ok "$L_SINIT" "$L_RESET"   || note "Reset is not after snippet Init_Ext"
-          order_ok "$L_RESET" "$L_CREATE"  || note "CreateFeature is not after the creation contract"
-          # The one the stale revision got wrong, asserted on its own so a
-          # failure names exactly which rule broke.
-          order_ok "$L_INIT" "$L_PATCH"    || note "THE ARCHITECTURE PATCH IS INSTALLED BEFORE CORE INIT"
-          echo "order: device=$L_DEV nvapi=$L_NVAPI core=$L_CORE init=$L_INIT alloc=$L_ALLOC cache=$L_CACHE patch=$L_PATCH snippet=$L_SNIP sinit=$L_SINIT reset=$L_RESET create=$L_CREATE"
+          order_ok "$L_DEV" "$L_CORE"        || note "the RTX 4070 device is not created first"
+          order_ok "$L_CORE" "$L_INIT"       || note "the NGX core is not loaded before core Init"
+          order_ok "$L_INIT" "$L_ALLOC"      || note "core Init is not before AllocateParameters"
+          order_ok "$L_ALLOC" "$L_NVAPI"     || note "NvAPI_Initialize is not AFTER AllocateParameters"
+          order_ok "$L_NVAPI" "$L_TARGET"    || note "the spoof target is named before NvAPI_Initialize"
+          order_ok "$L_TARGET" "$L_CACHE"    || note "the real architectures are not cached after the target is named"
+          order_ok "$L_CACHE" "$L_PATCH"     || note "the real architectures are not cached before the hook"
+          order_ok "$L_PATCH" "$L_OBSERVE"   || note "the observer is not installed after the architecture patch"
+          order_ok "$L_OBSERVE" "$L_SNIP"    || note "the observer is not installed before the private runtime loads"
+          order_ok "$L_SNIP" "$L_SINIT"      || note "the snippet is not loaded before snippet Init_Ext"
+          order_ok "$L_SINIT" "$L_RESET"     || note "Reset is not after snippet Init_Ext"
+          order_ok "$L_RESET" "$L_CREATE"    || note "CreateFeature is not after the creation contract"
+          # The three the stale revisions got wrong, each asserted on its own so
+          # a failure names exactly which rule broke.
+          order_ok "$L_INIT" "$L_NVAPI"      || note "NvAPI_Initialize IS CALLED BEFORE CORE INIT"
+          order_ok "$L_INIT" "$L_PATCH"      || note "THE ARCHITECTURE PATCH IS INSTALLED BEFORE CORE INIT"
+          order_ok "$L_INIT" "$L_OBSERVE"    || note "THE OBSERVER IS INSTALLED BEFORE CORE INIT"
+          echo "order: device=$L_DEV core=$L_CORE init=$L_INIT alloc=$L_ALLOC nvapi=$L_NVAPI target=$L_TARGET cache=$L_CACHE patch=$L_PATCH observe=$L_OBSERVE snippet=$L_SNIP sinit=$L_SINIT reset=$L_RESET create=$L_CREATE"
+
+          # ---- REQUIRED: the data path is dirname(--nr-dll) ---------------
+          grep -qF 'const bool explicit_override = (data_path != nullptr);' "$M" || \
+            note "--data-path is not treated as an explicit override"
+          grep -qF 'if (!explicit_override) data_path = derived_data;' "$M" || \
+            note "the data path is not derived from --nr-dll"
+          grep -qF 'wcsncpy(derived_data, nr_dll' "$M" || \
+            note "the derived data path does not start from the NR DLL path"
+          grep -qF 'NR DLL path' "$M" || note "the NR DLL path is not logged"
+          grep -qF 'derived data path' "$M" || note "the derived data path is not logged"
+          grep -qF 'the DLL is NOT inside the directory it would be given' "$M" || \
+            note "there is no containment check that the DLL is inside the data path"
+          grep -qF 'reason=NR_DLL_NOT_IN_DATA_PATH' "$M" || \
+            note "a DLL outside the data path does not invalidate the run"
+          # The executable's own directory must no longer be the default.
+          H=$(grep -nF 'default_data' "$M" || true)
+          [ -z "$H" ] || { echo "$H"; note "the data path still defaults to the executable directory"; }
+          # The derivation must precede the hash gate and the load.
+          L_DERIVE=$(line_of "$M" 'if (!explicit_override) data_path = derived_data;')
+          L_HASH=$(line_of "$M"   'if (!pcab::sha256_file(nr_dll, hex, &size))')
+          order_ok "$L_DERIVE" "$L_HASH" || note "the data path is not derived before the hash gate"
+          echo "data path: derive=$L_DERIVE hashgate=$L_HASH"
 
           # ---- REJECTED: the superseded constructs ------------------------
           for S in 'p_init(0ULL' 'p_sinit(0ULL' 'GetCapabilityParameters'; do
@@ -744,6 +801,59 @@ jobs:
           RC=$?
           [ "$RC" -eq 1 ] || { echo "::error::an unknown argument exited $RC, expected 1"; exit 1; }
           echo "(d) argument path ok, exit $RC"
+
+          # (e) THE DATA PATH DERIVATION. The reference experiment must be handed
+          #     dirname(--nr-dll), which is NeuralScreen's data path, and NOT the
+          #     diagnostic's own directory. Exercised for real, with no GPU: the
+          #     derivation runs before the hash gate.
+          mkdir -p refdir
+          printf 'not the neural runtime' > refdir/nvngx_dlssnr.dll
+          ../"$EXE_PATH" --mode single --nr-dll refdir/nvngx_dlssnr.dll > derive.txt 2>&1
+          RC=$?
+          cat derive.txt
+          grep -q '\[path\]  NR DLL path' derive.txt || { echo "::error::the NR DLL path is not logged"; exit 1; }
+          grep -q '\[path\]  derived data path' derive.txt || { echo "::error::the derived data path is not logged"; exit 1; }
+          grep -q 'derived data path  = refdir' derive.txt || {
+            echo "::error::the data path was not derived from --nr-dll (expected refdir)"
+            grep -n 'derived data path' derive.txt || true; exit 1; }
+          grep -q 'the NR DLL is inside the data path it will be given - OK' derive.txt || {
+            echo "::error::the containment check did not pass for a DLL inside its own directory"; exit 1; }
+          [ "$RC" -eq 1 ] || { echo "::error::expected the run to stop later at the hash gate (exit 1), got $RC"; exit 1; }
+          grep -q 'NR_DLL_SHA256_MISMATCH' derive.txt || {
+            echo "::error::the run did not reach the hash gate after the derivation"; exit 1; }
+          echo "(e) data path derived from --nr-dll, containment check passed, then the hash gate"
+
+          # (f) AN EXPLICIT --data-path THAT DOES NOT CONTAIN THE DLL must be
+          #     REFUSED, before anything is hashed, loaded or created.
+          mkdir -p otherdir
+          ../"$EXE_PATH" --mode single --nr-dll refdir/nvngx_dlssnr.dll --data-path otherdir > notin.txt 2>&1
+          RC=$?
+          cat notin.txt
+          [ "$RC" -eq 1 ] || { echo "::error::a DLL outside the data path exited $RC, expected 1"; exit 1; }
+          grep -q 'is NOT inside the directory it would be given' notin.txt || {
+            echo "::error::the containment check did not fire"; exit 1; }
+          grep -q 'valid=NO reason=NR_DLL_NOT_IN_DATA_PATH' notin.txt || {
+            echo "::error::the run was not invalidated for a DLL outside the data path"; exit 1; }
+          grep -q 'NR DLL SHA256' notin.txt && {
+            echo "::error::the run hashed the DLL before checking that it is inside the data path"; exit 1; }
+          for S in 'D3D12CreateDevice' 'NvAPI_Initialize' 'CreateFeature'; do
+            if grep -q -- "$S" notin.txt; then
+              echo "::error::'$S' happened before the data-path containment check refused the run"
+              exit 1
+            fi
+          done
+          echo "(f) a DLL outside the data path is refused before any hash, device or call"
+
+          # (g) the explicit override is still honoured when it IS the DLL's own
+          #     directory, so --data-path remains usable.
+          ../"$EXE_PATH" --mode single --nr-dll refdir/nvngx_dlssnr.dll --data-path refdir > override.txt 2>&1
+          RC=$?
+          grep -q 'from an explicit --data-path override' override.txt || {
+            echo "::error::an explicit --data-path that matches is not honoured"
+            cat override.txt; exit 1; }
+          grep -q 'NR_DLL_SHA256_MISMATCH' override.txt || {
+            echo "::error::the override run did not reach the hash gate"; exit 1; }
+          echo "(g) a matching --data-path override is accepted, then the hash gate"
 
       # ---------------------------------------------------------------------
       # 10. The artifact: exactly the four files the deliverable names.

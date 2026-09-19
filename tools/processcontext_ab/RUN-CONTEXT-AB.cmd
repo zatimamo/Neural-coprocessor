@@ -11,6 +11,15 @@ rem  The NR DLL defaults to nvngx_dlssnr.dll beside this script. It is gated on
 rem  its SHA256 before it is loaded, so the wrong build cannot be measured by
 rem  accident.
 rem
+rem  THE DATA PATH IS DERIVED, NOT SUPPLIED. The diagnostic takes the directory
+rem  that holds --nr-dll - which is the directory NeuralScreen hands NGX - so
+rem  this script never passes --data-path and must not need to. Pass the full
+rem  path to the NeuralScreen runtime and the reference data path follows:
+rem
+rem      RUN-CONTEXT-AB.cmd "C:\...\neuralscreen-v1.15.0-full\native\nvngx_dlssnr.dll"
+rem
+rem  giving the data path "C:\...\neuralscreen-v1.15.0-full\native".
+rem
 rem  WHY THE EXECUTABLE IS COPIED BEFORE EACH RUN
 rem      The DLSSNR snippet inspects its CALLER's module file name and refuses a
 rem      caller whose name does not contain "nvngx.dll" with 0xBAD00002

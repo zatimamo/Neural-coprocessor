@@ -26,23 +26,49 @@ second-adapter state established before that lane starts:
 THE REFERENCE LANE, IN THE ORDER NeuralScreen USES
 
     create the RTX 4070 D3D12 device
-    NvAPI_Initialize
-    load the NGX core
-    core NVSDK_NGX_D3D12_Init                 app id 0x1000000
-    NVSDK_NGX_D3D12_AllocateParameters        a PRIVATE block, then require
-                                              Success and a non-null pointer
-    cache the real GetArchInfo for EVERY GPU, then install the architecture
-    patch over exactly ONE target entry
+    load the NGX core                      (NvAPI is NOT initialised yet)
+    core NVSDK_NGX_D3D12_Init              app id 0x1000000
+    NVSDK_NGX_D3D12_AllocateParameters     a PRIVATE block, then require
+                                           Success and a non-null pointer
+    NvAPI_Initialize                       ^ AFTER core Init and AFTER
+                                           AllocateParameters, which is
+                                           NeuralScreen's order
+    name the ONE spoof target, cache the real GetArchInfo for EVERY GPU,
+    then install the architecture patch over that single target entry
+    install the observational QueryInterface observer
     load the exact nvngx_dlssnr.dll
-    snippet NVSDK_NGX_D3D12_Init_Ext          app id 0x1000000
+    snippet NVSDK_NGX_D3D12_Init_Ext       app id 0x1000000
     params->Reset()
     the 640x360 creation contract
     CreateFeature(NVSDK_NGX_Feature_Reserved18)
 
-The architecture patch is installed AFTER core Init and AFTER
-AllocateParameters, never before. Every GPU that is not the target is served its
-OWN cached real architecture, read before the hook existed; only the target is
-rewritten to 0x1B0 / 0x3 / 0xA1.
+The observer is installed as LATE as it can be while still being in place before
+the private runtime loads. It hooks nvapi_QueryInterface to see the two CUDA ids
+and nothing else, so it has no business being installed early enough to perturb
+core Init or the architecture setup.
+
+The architecture hook does NOT call the real GetArchInfo for a handle it cached
+before the hook existed. It saves the caller's version stamp, copies the cached
+real NV_GPU_ARCH_INFO, restores the stamp, spoofs only the target entry and only
+when its real generation needs it, and returns NVAPI_OK. Calling through would
+let the live second D3D12 device - the variable under test - feed back into the
+architecture query after the reference values were read. An UNKNOWN handle is
+the only case that reaches the genuine function, once, unchanged.
+
+THE DATA PATH
+
+The data path is dirname(--nr-dll): the directory the runtime actually sits in,
+which is the directory NeuralScreen hands NGX. It is NOT this executable's
+directory. Both paths are logged:
+
+    [path]  NR DLL path        = <where --nr-dll points>
+    [path]  derived data path  = <its directory>
+
+The DLL must be inside the data path it would be given; a run whose --data-path
+override points somewhere else is invalidated with
+NR_DLL_NOT_IN_DATA_PATH before anything is hashed, loaded or created.
+--data-path exists only as an explicit override, and RUN-CONTEXT-AB.cmd never
+needs it.
 
 THE SINGLE REFERENCE GATE - all eight, or the reference is invalid
 

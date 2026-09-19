@@ -81,58 +81,79 @@ namespace
         return p->version & 0xFFFFu;
     }
 
+    // NvApi_Status values this file names. Both are public nvapi.h constants.
+    const int NVAPI_OK_STATUS = 0;
+    const int NVAPI_INVALID_ARGUMENT = -5;
+
     int __cdecl arch_detour(void *gpu, NV_GPU_ARCH_INFO *pInfo)
     {
-        if (g_arch_original == nullptr) return -1;
-        // NVIDIA's own code still serves the call, so every real error code and
-        // every side effect is preserved. Only the returned VALUES are then
-        // replaced, and only for the caller's declared structure.
-        const int r = g_arch_original(gpu, pInfo);
-        if (r != 0 || pInfo == nullptr) return r;
+        if (pInfo == nullptr) return NVAPI_INVALID_ARGUMENT;
 
         ArchEntry *e = find_arch(gpu);
-        if (e == nullptr)
+        if (e == nullptr || !e->have_real)
         {
-            // A handle cached before the hook was installed is the only kind
-            // this patch knows how to speak for. An unknown one gets the
-            // genuine answer, untouched.
+            // AN UNKNOWN HANDLE, or a GPU whose real architecture the pre-hook
+            // query could not read. There is nothing cached to serve either way,
+            // so the genuine function answers - ONCE - and its result is
+            // returned UNCHANGED.
             ++g_arch_unknown;
-            return r;
+            logf("[arch] UNKNOWN handle %p (%s) - PASSTHROUGH to the genuine GetArchInfo, "
+                 "result returned unchanged",
+                 gpu, (e == nullptr) ? "not in the pre-hook cache"
+                                     : "cached but its real value could not be read");
+            if (g_arch_original == nullptr) return NVAPI_INVALID_ARGUMENT;
+            return g_arch_original(gpu, pInfo);
         }
 
-        if (!e->spoof)
-        {
-            // EVERY OTHER GPU GETS ITS OWN CACHED REAL RESULT.
-            // Not the target's, and not a shared value: this is the whole point
-            // of caching per handle before the hook went in.
-            if (e->have_real && declared_size(pInfo) >= sizeof(NV_GPU_ARCH_INFO))
-            {
-                pInfo->architecture   = e->real.architecture;
-                pInfo->implementation = e->real.implementation;
-                pInfo->revision       = e->real.revision;
-            }
-            ++g_arch_passthrough;
-            return r;
-        }
+        // ---- A KNOWN CACHED HANDLE -----------------------------------------
+        //
+        // The real function is NOT called. This is the whole point: the values
+        // were read BEFORE the hook existed, so they cannot have been influenced
+        // by anything the experiment has done since - least of all by the live
+        // second D3D12 device this diagnostic is testing. Calling through here
+        // would feed the variable under test back into the architecture query.
+        //
+        //   1. save the caller's requested version stamp
+        //   2. copy the cached real NV_GPU_ARCH_INFO
+        //   3. restore the requested version stamp
+        //   4. spoof only the target entry, and only when its real generation
+        //      needs it
+        //   5. return NVAPI_OK
+        const unsigned requested = pInfo->version;
+        const unsigned requested_size = declared_size(pInfo);
 
-        // The single eligible target. Rewrite ONLY when the runtime would
-        // reject the real value - NeuralScreen's behaviour.
-        if (declared_size(pInfo) < sizeof(NV_GPU_ARCH_INFO))
+        NV_GPU_ARCH_INFO out = e->real;
+
+        const bool spoofing = (e->spoof && out.architecture != SPOOF_ARCHITECTURE);
+        if (spoofing)
         {
-            ++g_arch_too_small;
-            logf("[arch] a caller declared only %u bytes for the architecture structure; "
-                 "the spoof needs %u, so NOTHING is rewritten for that caller",
-                 declared_size(pInfo), (unsigned)sizeof(NV_GPU_ARCH_INFO));
-            return r;
-        }
-        if (pInfo->architecture != SPOOF_ARCHITECTURE)
-        {
-            pInfo->architecture   = SPOOF_ARCHITECTURE;
-            pInfo->implementation = SPOOF_IMPLEMENTATION;
-            pInfo->revision       = SPOOF_REVISION;
+            out.architecture   = SPOOF_ARCHITECTURE;
+            out.implementation = SPOOF_IMPLEMENTATION;
+            out.revision       = SPOOF_REVISION;
             ++g_arch_rewrites;
         }
-        return r;
+        else
+        {
+            // Every other GPU gets ITS OWN cached real result, and so does the
+            // target when its real value is already the accepted one.
+            ++g_arch_passthrough;
+        }
+        out.version = requested;                 // the caller's stamp, restored
+
+        // Never write outside the structure the caller declared. Both
+        // NV_GPU_ARCH_INFO_V1 and V2 are 16 bytes, so this is a guard against a
+        // caller this code has never seen rather than a live case.
+        unsigned n = requested_size;
+        if (n > (unsigned)sizeof(out)) n = (unsigned)sizeof(out);
+        if (requested_size < sizeof(NV_GPU_ARCH_INFO))
+        {
+            ++g_arch_too_small;
+            logf("[arch] a caller declared only %u bytes for the architecture structure "
+                 "(the full one is %u); serving the cache truncated to what it declared",
+                 requested_size, (unsigned)sizeof(NV_GPU_ARCH_INFO));
+        }
+        if (n > 0) std::memcpy(pInfo, &out, n);
+        return NVAPI_OK_STATUS;
     }
 }
 
