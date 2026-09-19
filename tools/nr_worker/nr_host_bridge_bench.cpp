@@ -582,6 +582,12 @@ namespace
         T &operator*() const { return *p_; }
         explicit operator bool() const { return p_ != nullptr; }
 
+        //: Comparison against a bare pointer. nullptr converts to T*, so this
+        //: covers "com == nullptr" as well: the Com itself is deliberately not
+        //: implicitly convertible to T*, so the comparison must be spelled out.
+        bool operator==(T *other) const { return p_ == other; }
+        bool operator!=(T *other) const { return p_ != other; }
+
         T *release() { T *r = p_; p_ = nullptr; return r; }
 
         void reset(T *p = nullptr)
@@ -1385,7 +1391,7 @@ namespace
 
                     HRESULT hr = game_.dev->CreatePlacedResource(game_heap_.get(), sl.off, &rd,
                                                                  D3D12_RESOURCE_STATE_COMMON,
-                                                                 nullptr, &sl.game);
+                                                                 nullptr, IID_PPV_ARGS(&sl.game));
                     if (FAILED(hr) || sl.game == nullptr)
                     {
                         err = std::string("CreatePlacedResource on the game device (class ") +
@@ -1396,7 +1402,7 @@ namespace
                     }
                     hr = worker_.dev->CreatePlacedResource(worker_heap_.get(), sl.off, &rd,
                                                             D3D12_RESOURCE_STATE_COMMON,
-                                                            nullptr, &sl.worker);
+                                                            nullptr, IID_PPV_ARGS(&sl.worker));
                     if (FAILED(hr) || sl.worker == nullptr)
                     {
                         err = std::string("CreatePlacedResource on the worker device (class ") +
@@ -3228,7 +3234,7 @@ namespace
                 const std::vector<std::uint64_t> &ts = on_game ? game_ts : worker_ts;
                 const double freq = (double)(on_game ? game_.timestamp_frequency
                                                      : worker_.timestamp_frequency);
-                stages.replace(4u + l, decode_gpu_pair(ts, frames_, 4u + l, freq, true, verdict));
+                stages.replace_all(4u + l, decode_gpu_pair(ts, frames_, 4u + l, freq, true, verdict));
             }
         }
         else
