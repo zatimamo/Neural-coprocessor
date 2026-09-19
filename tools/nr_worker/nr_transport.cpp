@@ -117,6 +117,7 @@ namespace nr
         {
             SharedKind      kind = SharedKind::NOT_CREATED;
             ID3D12Heap     *heap_game = nullptr;
+            ID3D12Heap     *heap_worker = nullptr;   // the SAME heap, opened on the other device
             ID3D12Resource *res_game = nullptr;
             ID3D12Resource *res_worker = nullptr;
             HANDLE          handle = nullptr;
@@ -302,14 +303,21 @@ namespace nr
 
             static unsigned counter = 0;
             wchar_t name[160];
-            std::swprintf(name, 160, L"MGPU_NR_SHARED_%lu_%u",
+            std::swprintf(name, 160, L"MGPU_NR_SHARED_HEAP_%lu_%u",
                           (unsigned long)GetCurrentProcessId(), counter++);
-            hr = game.dev->CreateSharedHandle(out.res_game, nullptr, GENERIC_ALL, name,
+            // THE HEAP IS WHAT GETS SHARED, NOT THE PLACED RESOURCE. Microsoft's
+            // own words: "Both heaps and committed resources can be shared." A
+            // placed resource is in neither list, and asking for a handle to one
+            // returns E_INVALIDARG - measured on this rig, which is how this
+            // comment came to exist.
+            hr = game.dev->CreateSharedHandle(out.heap_game, nullptr, GENERIC_ALL, name,
                                               &out.handle);
             if (FAILED(hr) || out.handle == nullptr)
             {
-                record(failures, "CreateSharedHandle", hr, std::string(game.who) + ": the shared handle");
-                err = "CreateSharedHandle failed";
+                record(failures, "CreateSharedHandle(heap)", hr,
+                       std::string(game.who) + ": the shared handle could not be created for the "
+                       "cross-adapter HEAP");
+                err = "CreateSharedHandle failed for the cross-adapter heap";
                 return false;
             }
 
@@ -317,18 +325,33 @@ namespace nr
             hr = worker.dev->OpenSharedHandleByName(name, GENERIC_ALL, &opened);
             if (FAILED(hr) || opened == nullptr)
             {
-                record(failures, "OpenSharedHandleByName", hr,
-                       std::string(worker.who) + ": the shared handle could not be opened");
+                record(failures, "OpenSharedHandleByName(heap)", hr,
+                       std::string(worker.who) + ": the cross-adapter heap could not be opened");
                 err = "OpenSharedHandleByName failed on the worker device";
                 return false;
             }
-            hr = worker.dev->OpenSharedHandle(opened, IID_PPV_ARGS(&out.res_worker));
+            hr = worker.dev->OpenSharedHandle(opened, IID_PPV_ARGS(&out.heap_worker));
             CloseHandle(opened);
+            if (FAILED(hr) || out.heap_worker == nullptr)
+            {
+                record(failures, "OpenSharedHandle(heap)", hr,
+                       std::string(worker.who) + ": the heap object could not be opened");
+                err = "OpenSharedHandle failed for the heap on the worker device";
+                return false;
+            }
+
+            // The same description, at the same offset, on the SAME memory: this
+            // is the "compatible resource description mapped to the heap from
+            // another device" the documentation describes.
+            hr = worker.dev->CreatePlacedResource(out.heap_worker, 0, &rd,
+                                                  D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                  IID_PPV_ARGS(&out.res_worker));
             if (FAILED(hr) || out.res_worker == nullptr)
             {
-                record(failures, "OpenSharedHandle", hr,
-                       std::string(worker.who) + ": the shared resource could not be opened");
-                err = "OpenSharedHandle failed on the worker device";
+                record(failures, "CreatePlacedResource(worker device)", hr,
+                       std::string(worker.who) + ": the matching placed resource could not be "
+                       "created on the shared heap");
+                err = "CreatePlacedResource failed on the worker device";
                 return false;
             }
 
@@ -694,10 +717,12 @@ namespace nr
                 {
                     if (probe2.res_worker) probe2.res_worker->Release();
                     if (probe2.res_game) probe2.res_game->Release();
+                    if (probe2.heap_worker) probe2.heap_worker->Release();
                     if (probe2.heap_game) probe2.heap_game->Release();
                     if (probe2.handle) CloseHandle(probe2.handle);
                     if (probe.res_worker) probe.res_worker->Release();
                     if (probe.res_game) probe.res_game->Release();
+                    if (probe.heap_worker) probe.heap_worker->Release();
                     if (probe.heap_game) probe.heap_game->Release();
                     if (probe.handle) CloseHandle(probe.handle);
                     err = "neither a cross-adapter buffer nor a cross-adapter texture could be "
@@ -710,6 +735,7 @@ namespace nr
             // that there is exactly one creation path for the report to describe.
             if (probe.res_worker) probe.res_worker->Release();
             if (probe.res_game) probe.res_game->Release();
+            if (probe.heap_worker) probe.heap_worker->Release();
             if (probe.heap_game) probe.heap_game->Release();
             if (probe.handle) CloseHandle(probe.handle);
         }
@@ -800,6 +826,7 @@ namespace nr
                 if (slot.local_game) { slot.local_game->Release(); slot.local_game = nullptr; }
                 if (slot.shared.res_worker) { slot.shared.res_worker->Release(); slot.shared.res_worker = nullptr; }
                 if (slot.shared.res_game) { slot.shared.res_game->Release(); slot.shared.res_game = nullptr; }
+                if (slot.shared.heap_worker) { slot.shared.heap_worker->Release(); slot.shared.heap_worker = nullptr; }
                 if (slot.shared.heap_game) { slot.shared.heap_game->Release(); slot.shared.heap_game = nullptr; }
                 if (slot.shared.handle) { CloseHandle(slot.shared.handle); slot.shared.handle = nullptr; }
             }
