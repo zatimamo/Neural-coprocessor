@@ -197,15 +197,15 @@ namespace
     {
         if (params == nullptr)
         {
-            logf("[contract] params is null - nothing to apply");
+            pcab::logf("[contract] params is null - nothing to apply");
             return;
         }
         params->Reset();                     // NeuralScreen resets before filling
-        logf("[contract] params->Reset() done; applying the NeuralScreen 640x360 contract");
+        pcab::logf("[contract] params->Reset() done; applying the NeuralScreen 640x360 contract");
 
         params->Set(NVSDK_NGX_Parameter_CreationNodeMask,   1u);
         params->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
-        logf("[contract] CreationNodeMask=1 VisibilityNodeMask=1");
+        pcab::logf("[contract] CreationNodeMask=1 VisibilityNodeMask=1");
 
         params->Set("DLSSNR.Width",  (unsigned)CTRL_W);
         params->Set("DLSSNR.Height", (unsigned)CTRL_H);
@@ -215,20 +215,20 @@ namespace
         params->Set("DLSSNR.OutputHeight", (unsigned)CTRL_H);
         params->Set("DLSSNR.Output.Width",  (unsigned)CTRL_W);
         params->Set("DLSSNR.Output.Height", (unsigned)CTRL_H);
-        logf("[contract] DLSSNR.Width/Height=%u/%u Input=%u/%u Output=%u/%u "
+        pcab::logf("[contract] DLSSNR.Width/Height=%u/%u Input=%u/%u Output=%u/%u "
              "DLSSNR.Output.Width/Height=%u/%u",
              CTRL_W, CTRL_H, CTRL_W, CTRL_H, CTRL_W, CTRL_H, CTRL_W, CTRL_H);
 
         params->Set("DLSSNR.Upscaling", 0u);
         params->Set("DLSSNR.Scale", 1.0f);
         params->Set("DLSSNR.ScalingRatio", 1.0f);
-        logf("[contract] DLSSNR.Upscaling=0 DLSSNR.Scale=1.0 DLSSNR.ScalingRatio=1.0");
+        pcab::logf("[contract] DLSSNR.Upscaling=0 DLSSNR.Scale=1.0 DLSSNR.ScalingRatio=1.0");
 
         params->Set("DLSSNR.Hint.Render.Preset", 0u);
         params->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, 0);
-        logf("[contract] DLSSNR.Hint.Render.Preset=0 DLSS.Feature.Create.Flags=0");
+        pcab::logf("[contract] DLSSNR.Hint.Render.Preset=0 DLSS.Feature.Create.Flags=0");
 
-        logf("[contract] NO generic Width/Height is set - NeuralScreen does not set them, and "
+        pcab::logf("[contract] NO generic Width/Height is set - NeuralScreen does not set them, and "
              "adding them here would make this lane differ from the reference it reproduces");
     }
 

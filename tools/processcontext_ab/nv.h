@@ -44,6 +44,17 @@ namespace pcab
     const unsigned NVAPI_ID_GET_CUDA_DESCRIPTOR = 0x0DDAC234u;
     const unsigned NVAPI_ID_CREATE_CU_MODULE    = 0xAD1A677Du;
 
+    // Four NvU32, exactly as nvapi.h declares it. The struct must come BEFORE
+    // the version constants below, because those are expressed with sizeof().
+    struct NV_GPU_ARCH_INFO
+    {
+        unsigned version;
+        unsigned architecture;
+        unsigned implementation;
+        unsigned revision;
+    };
+    static_assert(sizeof(NV_GPU_ARCH_INFO) == 16, "NV_GPU_ARCH_INFO is four NvU32");
+
     // NV_GPU_ARCH_INFO_VER_2 == MAKE_NVAPI_VERSION(NV_GPU_ARCH_INFO_V2, 2),
     // which expands to `sizeof(struct) | (version << 16)`:
     //
@@ -64,15 +75,6 @@ namespace pcab
     // NeuralScreen's V1 fallback safe to implement with one struct.
     const unsigned NV_GPU_ARCH_INFO_VER_2 = sizeof(NV_GPU_ARCH_INFO) | (2u << 16);
     const unsigned NV_GPU_ARCH_INFO_VER_1 = sizeof(NV_GPU_ARCH_INFO) | (1u << 16);
-
-    struct NV_GPU_ARCH_INFO
-    {
-        unsigned version;
-        unsigned architecture;
-        unsigned implementation;
-        unsigned revision;
-    };
-    static_assert(sizeof(NV_GPU_ARCH_INFO) == 16, "NV_GPU_ARCH_INFO is four NvU32");
 
     // The NGX ApplicationId NeuralScreen v1.15.0 passes to BOTH the core
     // NVSDK_NGX_D3D12_Init and the snippet NVSDK_NGX_D3D12_Init_Ext on its
