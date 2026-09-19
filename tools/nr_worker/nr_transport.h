@@ -124,6 +124,14 @@ namespace nr
         unsigned slot_count = 3u;
         unsigned dxgi_format = 28u;          // DXGI_FORMAT_R8G8B8A8_UNORM
         bool     verify = true;
+        //: Which shared form to use. AUTO tries the buffer first (v1's preference)
+        //: and falls back to the texture only if CREATION fails - which is what
+        //: hid the real problem on this rig: a cross-adapter buffer is created
+        //: happily and then carries nothing, so the fallback never triggered.
+        //: BUFFER and TEXTURE force one form, which is how the two are told apart
+        //: on hardware instead of by argument.
+        enum class SharedPreference { AUTO = 0, BUFFER = 1, TEXTURE = 2 };
+        SharedPreference preference = SharedPreference::AUTO;
     };
 
     struct TransportResult

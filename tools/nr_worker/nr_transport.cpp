@@ -691,18 +691,38 @@ namespace nr
             return false;
         }
 
-        // ---- which shared form works: a probe, one HRESULT per refusal -------
+        // ---- which shared form: a probe, one HRESULT per refusal -------------
         {
+            const bool want_buffer =
+                (opt.preference != TransportOptions::SharedPreference::TEXTURE);
+            const bool want_texture =
+                (opt.preference != TransportOptions::SharedPreference::BUFFER);
+
             SharedSurface probe;
             std::string why;
-            const bool buffer_ok = create_shared(im->game, im->worker,
-                                                 SharedKind::CROSS_ADAPTER_BUFFER,
-                                                 im->slice_pitch, opt.width, opt.height,
-                                                 opt.dxgi_format, (unsigned)im->row_pitch,
-                                                 probe, im->failures, why);
+            bool buffer_ok = false;
+            if (want_buffer)
+            {
+                buffer_ok = create_shared(im->game, im->worker,
+                                          SharedKind::CROSS_ADAPTER_BUFFER,
+                                          im->slice_pitch, opt.width, opt.height,
+                                          opt.dxgi_format, (unsigned)im->row_pitch,
+                                          probe, im->failures, why);
+            }
             if (buffer_ok)
             {
                 im->kind = SharedKind::CROSS_ADAPTER_BUFFER;
+            }
+            else if (!want_texture)
+            {
+                if (probe.res_worker) probe.res_worker->Release();
+                if (probe.res_game) probe.res_game->Release();
+                if (probe.heap_worker) probe.heap_worker->Release();
+                if (probe.heap_game) probe.heap_game->Release();
+                if (probe.handle) CloseHandle(probe.handle);
+                err = "the cross-adapter BUFFER was refused by the driver, and --shared-kind "
+                      "buffer forbids the texture fallback";
+                return false;
             }
             else
             {

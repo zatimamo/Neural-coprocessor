@@ -53,6 +53,8 @@ namespace
         bool     list_adapters = false;
         bool     no_verify = false;
         bool     help = false;
+        nr::TransportOptions::SharedPreference pref =
+            nr::TransportOptions::SharedPreference::AUTO;
     };
 
     void usage()
@@ -65,6 +67,9 @@ namespace
             "  --slots <n>          frame slots in flight (default 3)\n"
             "  --json <path>        the report (default transport-benchmark.json)\n"
             "  --no-verify          skip the readback/hash check (timings only)\n"
+            "  --shared-kind <k>    auto|buffer|texture (default auto: buffer, then texture\n"
+            "                       ONLY if creation fails - which is not the same as the\n"
+            "                       buffer failing to CARRY anything)\n"
             "  --list-adapters      enumerate adapters and exit; no device is created\n"
             "\n"
             "The four acceptance resolutions are 1280x720, 1920x1080, 2560x1440 and\n"
@@ -143,6 +148,21 @@ int main(int argc, char **argv)
         else if (std::strcmp(s, "--slots") == 0 && i + 1 < argc)   a.slots = (unsigned)std::strtoul(argv[++i], nullptr, 10);
         else if (std::strcmp(s, "--json") == 0 && i + 1 < argc)    a.json = argv[++i];
         else if (std::strcmp(s, "--no-verify") == 0)               a.no_verify = true;
+        else if (std::strcmp(s, "--shared-kind") == 0 && i + 1 < argc)
+        {
+            const char *k = argv[++i];
+            if (std::strcmp(k, "buffer") == 0)
+                a.pref = nr::TransportOptions::SharedPreference::BUFFER;
+            else if (std::strcmp(k, "texture") == 0)
+                a.pref = nr::TransportOptions::SharedPreference::TEXTURE;
+            else if (std::strcmp(k, "auto") == 0)
+                a.pref = nr::TransportOptions::SharedPreference::AUTO;
+            else
+            {
+                std::fprintf(stderr, "nr_transport_bench: --shared-kind wants auto|buffer|texture\n");
+                return 2;
+            }
+        }
         else if (std::strcmp(s, "--list-adapters") == 0)           a.list_adapters = true;
         else if (std::strcmp(s, "--help") == 0 || std::strcmp(s, "-h") == 0) a.help = true;
         else
@@ -233,6 +253,7 @@ int main(int argc, char **argv)
         opt.frames = a.frames;
         opt.slot_count = a.slots;
         opt.verify = !a.no_verify;
+        opt.preference = a.pref;
 
         nr::Transport transport;
         nr::TransportResult res;
