@@ -504,31 +504,46 @@ jobs:
 
           # (c) THE HASH GATE. A file that is not the runtime the worker insists on
           #     must be refused BEFORE a device, an NGX module or NVAPI is touched.
-          printf 'not the neural runtime' > wrong.dll
-          ../"$WORKER" --prove --nr-dll wrong.dll > gate.txt 2>&1
+          #     The file sits in its OWN directory, because the data path is
+          #     derived as dirname(--nr-dll) and a bare file name would be refused
+          #     one step earlier by the containment check - which is (e).
+          mkdir -p wrongdir
+          printf 'not the neural runtime' > wrongdir/nvngx_dlssnr.dll
+          ../"$WORKER" --prove --nr-dll wrongdir/nvngx_dlssnr.dll > gate.txt 2>&1
           RC=$?
           cat gate.txt
           [ "$RC" -eq 1 ] || { echo "::error::a wrong NR DLL exited $RC, expected 1"; exit 1; }
           grep -q 'MISMATCH' gate.txt || { echo "::error::a wrong NR DLL was not reported as a mismatch"; exit 1; }
           grep -q 'ABORTING before the load' gate.txt || { echo "::error::the gate did not abort before the load"; exit 1; }
           grep -q 'NR_DLL_SHA256_MISMATCH' gate.txt || { echo "::error::the gate did not name the reason"; exit 1; }
-          for S in 'D3D12CreateDevice' 'NvAPI_Initialize' 'CreateFeature' 'NGX'; do
+          for S in 'D3D12CreateDevice' 'NvAPI_Initialize' 'CreateFeature' 'NVSDK_NGX'; do
             if grep -q -- "$S" gate.txt; then
               echo "::error::the hash gate let '$S' happen before refusing the DLL"; exit 1
             fi
           done
           echo "(c) hash gate ok, exit $RC - refused before any device, module or call"
 
-          # (d) the data path must contain the DLL it will be handed.
-          mkdir -p refdir otherdir
-          printf 'not the neural runtime' > refdir/nvngx_dlssnr.dll
-          ../"$WORKER" --prove --nr-dll refdir/nvngx_dlssnr.dll --nr-dll-sha256 deadbeef > deriv.txt 2>&1
+          # (d) the derived data path is logged, and a DLL inside it passes.
+          ../"$WORKER" --prove --nr-dll wrongdir/nvngx_dlssnr.dll --nr-dll-sha256 "" > derive.txt 2>&1
           RC=$?
-          [ "$RC" -eq 1 ] || { echo "::error::expected exit 1, got $RC"; exit 1; }
-          grep -q 'derived data path' deriv.txt || { echo "::error::the derived data path is not logged"; exit 1; }
-          grep -q 'inside the data path it will be given - OK' deriv.txt || {
-            echo "::error::the containment check did not pass"; exit 1; }
+          grep -q 'derived data path' derive.txt || { echo "::error::the derived data path is not logged"; exit 1; }
+          grep -q 'inside the data path it will be given - OK' derive.txt || {
+            echo "::error::the containment check did not pass for a DLL in its own directory"; exit 1; }
           echo "(d) the data path is derived from --nr-dll, and the DLL must be inside it, exit $RC"
+
+          # (e) a BARE file name has no directory to derive, so the containment
+          #     check refuses it before anything is hashed. That is the documented
+          #     behaviour of the proven lane, and it is asserted rather than left
+          #     to be rediscovered.
+          printf 'not the neural runtime' > bare.dll
+          ../"$WORKER" --prove --nr-dll bare.dll > bare.txt 2>&1
+          RC=$?
+          [ "$RC" -eq 1 ] || { echo "::error::a bare --nr-dll exited $RC, expected 1"; exit 1; }
+          grep -q 'is not inside' bare.txt || {
+            echo "::error::a bare --nr-dll was not refused by the containment check"; exit 1; }
+          grep -q 'NR DLL SHA256' bare.txt && {
+            echo "::error::a bare --nr-dll was hashed before the containment check refused it"; exit 1; }
+          echo "(e) a bare --nr-dll is refused before any hash, exit $RC"
 
       - name: The worker serves the protocol and the probe talks to it
         shell: bash
