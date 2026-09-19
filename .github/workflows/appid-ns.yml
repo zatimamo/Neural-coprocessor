@@ -105,9 +105,17 @@ env:
   NGX_SHA: a291cc7d2cc642a51566f3dfd5376f635cd1b284
   MINHOOK_SHA: c3fcafdc10146beb5919319d0683e44e3c30d537
   # The commit this phase starts from: the state whose behaviour is the CONTROL.
-  # The containment gate below diffs against it, so it must be present in the
-  # clone - hence fetch-depth: 0.
   APPID_NS_BASELINE: a38ffcb6ad732a2af07964272744c2b63c8b46c6
+  # The APPID_NS commit itself.
+  #
+  # The containment gate below diffs THIS PAIR, not baseline..HEAD. The claim it
+  # checks - "exactly one value changed, in six places, and nothing else" - is a
+  # property of the APPID_NS change, which is a fixed range of history. A
+  # baseline..HEAD diff would make the gate fail again the moment any later,
+  # unrelated commit landed, which says nothing about this experiment. Later
+  # commits are governed by their own gates; the content gates further down this
+  # job run against the working tree at HEAD and keep the property true there.
+  APPID_NS_COMMIT: 5654bf34c865ca59e463b6709a2245a62bab289c
 
 jobs:
   build:
@@ -142,21 +150,25 @@ jobs:
         shell: bash
         run: |
           BASE="${APPID_NS_BASELINE}"
-          if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
-            echo "::error::baseline ${BASE} is not in this clone. fetch-depth: 0 is required; if a new phase has started, re-point APPID_NS_BASELINE and say so in the workflow header."
-            exit 1
-          fi
-          echo "baseline ${BASE} -> HEAD $(git rev-parse HEAD)"
+          HEAD_OF_PHASE="${APPID_NS_COMMIT}"
+          for C in "$BASE" "$HEAD_OF_PHASE"; do
+            if ! git cat-file -e "${C}^{commit}" 2>/dev/null; then
+              echo "::error::${C} is not in this clone. fetch-depth: 0 is required; if a new phase has started, re-point APPID_NS_BASELINE / APPID_NS_COMMIT and say so in the workflow header."
+              exit 1
+            fi
+          done
+          echo "the APPID_NS change is the fixed range ${BASE} -> ${HEAD_OF_PHASE}"
+          echo "checked-out HEAD is $(git rev-parse HEAD) (not part of this gate)"
 
-          CHANGED=$(git diff --name-only "${BASE}" HEAD)
-          echo "--- changed paths since the baseline ---"
+          CHANGED=$(git diff --name-only "${BASE}" "${HEAD_OF_PHASE}")
+          echo "--- changed paths in the APPID_NS change ---"
           printf '%s\n' "$CHANGED"
 
           ALLOWED='src/appid_ns\.cpp|src/appid_ns\.hpp|src/gpu1_context\.cpp|CMakeLists\.txt|\.github/workflows/appid-ns\.yml'
           BAD=$(printf '%s\n' "$CHANGED" | grep -vE "^(${ALLOWED})$" || true)
           if [ -n "$BAD" ]; then
             echo "$BAD"
-            echo "::error::this build changes files outside the APPID_NS scope"
+            echo "::error::the APPID_NS change touches files outside its scope"
             exit 1
           fi
 
@@ -166,7 +178,7 @@ jobs:
           # different claims: an added line is allowed only if it is part of this
           # experiment, and a removed line is allowed only if it is the OLD
           # literal form this experiment replaces.
-          DIFFLINES=$(git diff -U0 "${BASE}" HEAD -- src/gpu1_context.cpp \
+          DIFFLINES=$(git diff -U0 "${BASE}" "${HEAD_OF_PHASE}" -- src/gpu1_context.cpp \
                       | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' || true)
           echo "--- changed lines in gpu1_context.cpp ---"
           printf '%s\n' "$DIFFLINES"
