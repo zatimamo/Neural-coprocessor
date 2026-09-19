@@ -82,6 +82,38 @@ Everything else in the game directory is read-only to AutoLab. In particular the
 NR runtime (paths.nr_dll) is hashed and verified, and NEVER replaced: it is the
 fixed instrument the whole investigation is measured against.
 
+TWO RUNTIMES, AND WHY
+
+    paths.nr_dll                 the copy the GAME loads, relative to install_dir
+    paths.neuralscreen_nr_dll    the NEURALSCREEN REFERENCE runtime, absolute
+
+The PROCESSCONTEXT node runs THE REFERENCE LANE, so it uses the second one and
+passes it through untouched. It is not copied into AutoLab's staging directory,
+because the diagnostic derives the NGX data path as dirname(--nr-dll) and that
+directory has to be the one NeuralScreen itself hands NGX. Both are
+hash-verified; a wrong or missing one stops the run in preflight, before CI is
+asked to build anything.
+
+PROCESSCONTEXT, THE FIRST LIVE NODE
+
+    locate paths.neuralscreen_nr_dll        preflight, and again before staging
+    verify DCC0DC...D36F                    both copies, both times
+    launch RUN-CONTEXT-AB.cmd               once for single, once for the rest
+    wait for completion                     bounded by the configured timeout
+    parse the PCAB-RESULT records           one per arm
+    enforce SINGLE as the reference gate    if it fails the second launch never
+                                            happens; the result records the arms
+                                            that were not launched
+    classify with the fixed A/B/C/D/E rules experiments.decide
+    archive the arm logs                    logs/processcontext-<mode>.log
+    write summary.json and summary.txt      report.py
+    stop at the predefined verdict          the graph
+
+AutoLab calls the artifact's OWN launcher rather than re-implementing the
+four-arm sequence, and gives it an explicit arm list - which is how SINGLE can
+stop the other three before they are started. SINGLE therefore runs exactly
+once, and no game is launched for this node.
+
 The original add-on is backed up and its hash verified BEFORE anything is
 written, and restored from a finally block - so normal completion, Ctrl+C, a
 Python exception, a timeout and an invalid result all restore. Restoration also
