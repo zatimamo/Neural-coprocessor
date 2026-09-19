@@ -240,6 +240,19 @@ int main(int argc, char **argv)
 
         const bool opened = transport.open(opt, err);
         const bool ran = opened && transport.run(opt, res);
+        if (!opened)
+        {
+            // THE REFUSALS ARE THE RESULT. When the shared surfaces cannot be
+            // created, the report has to carry the HRESULT and the call that
+            // produced it - otherwise it says "it did not work" and nothing else,
+            // which is not a measurement. The adapter reports are collected on the
+            // same principle: whatever was learned before the failure.
+            res.unsupported = transport.failures();
+            transport.adapter_reports(res.game, res.worker);
+            res.note = res.note.empty()
+                ? "the transport could not be OPENED, so nothing was measured"
+                : res.note;
+        }
         transport.close();
 
         report.begin_object();

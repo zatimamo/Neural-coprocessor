@@ -180,6 +180,15 @@ namespace nr
         //: The timed round trips plus the verification readback.
         bool run(const TransportOptions &opt, TransportResult &res);
 
+        //: Every refusal recorded so far, with its HRESULT. Available even when
+        //: open() FAILED - which is the case that matters most, because "neither
+        //: shared form could be created" is useless without the HRESULTs that say
+        //: why. A benchmark that cannot measure something must still be readable.
+        const std::vector<Failure> &failures() const;
+
+        //: What the two adapters reported, regardless of how far open() got.
+        void adapter_reports(AdapterReport &game, AdapterReport &worker) const;
+
         void close();
 
     private:

@@ -551,6 +551,19 @@ namespace nr
         impl_ = nullptr;
     }
 
+    const std::vector<Failure> &Transport::failures() const
+    {
+        static const std::vector<Failure> none;
+        return (impl_ != nullptr) ? impl_->failures : none;
+    }
+
+    void Transport::adapter_reports(AdapterReport &game, AdapterReport &worker) const
+    {
+        if (impl_ == nullptr) return;
+        game = impl_->game.report;
+        worker = impl_->worker.report;
+    }
+
     bool Transport::enumerate_adapters(std::vector<AdapterReport> &out, std::string &err)
     {
         IDXGIFactory1 *factory = nullptr;
