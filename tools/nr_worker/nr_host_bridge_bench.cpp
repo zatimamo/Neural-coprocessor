@@ -75,6 +75,12 @@
 #include "nr_slots.h"
 
 #include <windows.h>
+// IID_PPV_ARGS lives in combaseapi.h, and WIN32_LEAN_AND_MEAN keeps windows.h
+// from pulling in ole2.h, which is what would otherwise provide it. Without this
+// include every IID_PPV_ARGS use fails - and it fails as a cascade of confusing
+// "function does not take N arguments" errors rather than as a missing macro.
+// ../processcontext_ab/nv.h carries the same note for exactly this reason.
+#include <combaseapi.h>
 #include <bcrypt.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
