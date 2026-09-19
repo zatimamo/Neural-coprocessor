@@ -9,3 +9,13 @@ build/
 # the workspace rather than /tmp: MSYS path translation on Windows runners
 # makes /tmp unreliable for curl/tar arguments.
 _dl/
+
+# PROCESSCONTEXT-AB: the standalone diagnostic's own build and CI scratch. It is
+# a separate CMake project under tools/processcontext_ab/ and never contributes
+# anything to the add-on's build.
+build-pcab/
+_pcab/
+_bt/
+_cfg.txt
+PCAB_VARIANT.txt
+

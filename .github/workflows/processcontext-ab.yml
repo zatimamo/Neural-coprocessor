@@ -1,0 +1,622 @@
+# ============================================================================
+# PROCESSCONTEXT-AB - standalone diagnostic build
+# ============================================================================
+# THIS BUILDS ONE ARTIFACT AND NOTHING ELSE. It does not build the MGPU add-on,
+# it does not deploy, it does not touch src/, and it never launches Cyberpunk.
+# The diagnostic is its own CMake project under tools/processcontext_ab/, with a
+# separate target, so an MGPU regression and a diagnostic regression cannot be
+# confused for one another.
+#
+# THE QUESTION, FIXED IN ADVANCE
+#   Does D3D12 device / queue / descriptor state that a process already carries
+#   explain why the private NVAPI CUDA-interop calls
+#       0x0DDAC234  NvAPI_D3D12_GetCudaIndependentDescriptorObject
+#       0xAD1A677D  NvAPI_D3D12_CreateCuModule
+#   return NVAPI_ERROR inside Cyberpunk but succeed in NeuralScreen?
+#
+#   Four arms, each in its own process, each running the same NeuralScreen-
+#   equivalent reference lane on the RTX 4070 and differing ONLY in second-
+#   adapter state established before that lane starts:
+#       single          nothing else at all            (the reference)
+#       dual-held       Ti SUPER device held, no NGX, no swapchain
+#       dual-active     ... plus a DIRECT queue and a live CBV/SRV/UAV heap
+#       dual-released   Ti SUPER device created, recorded, then released
+#
+#   E) SINGLE does not succeed     -> INVALID, stop, interpret nothing.
+#   A) SINGLE ok + DUAL-HELD fails -> simultaneous multi-adapter state suffices.
+#   B) A and DUAL-ACTIVE fails     -> an ACTIVE second command/descriptor state.
+#   C) DUAL-RELEASED fails         -> process-global NVIDIA state outlives release.
+#   D) all four succeed            -> the multi-device hypothesis is EXONERATED.
+#
+# WHAT THIS JOB REFUSES TO BUILD
+#   PROCESSCONTEXT-AB claims to be a pure observer, so the pass-through contract
+#   is enforced on the SOURCE rather than trusted. The build fails if the
+#   observation layer writes to a caller-owned output, copies memory, reads the
+#   blob, retries a call, replaces a status, publishes a real pointer with a
+#   plain store instead of a CAS, contains a loop around a genuine call, or
+#   contains any return from a wrapper other than the verbatim status and the
+#   named unreachable null-guard constant.
+#
+#   It also fails if the diagnostic references the MGPU add-on's sources at all.
+#   A diagnostic that is not standalone cannot be evidence about a standalone
+#   question, and a diagnostic that quietly includes MGPU code is a change to
+#   MGPU behaviour by another name.
+#
+# GPU-FREE BEHAVIOURAL TESTS
+#   The runners have no NVIDIA adapter, so the four arms cannot be exercised
+#   here. Three paths can be, and are: the table path with no logs present, the
+#   usage path, and the NR-DLL hash gate with a file that must be REFUSED. The
+#   third is the one that matters most: it proves on every build that a wrong
+#   snippet build is rejected BEFORE anything is loaded or created.
+# ============================================================================
+
+name: processcontext-ab
+
+on:
+  workflow_dispatch:
+  push:
+    # Same dedicated branch as ARCHTEST, CREATECONTRACT, NVAPIINIT, CUDADIAG and
+    # RESHADENATIVE. Not main.
+    branches: [archtest-ab]
+    paths:
+      - 'tools/processcontext_ab/**'
+      - '.github/workflows/processcontext-ab.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NGX_SHA: a291cc7d2cc642a51566f3dfd5376f635cd1b284
+  MINHOOK_SHA: c3fcafdc10146beb5919319d0683e44e3c30d537
+
+jobs:
+  build:
+    runs-on: windows-latest
+    name: processcontext-ab
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------------
+      # 1. The diagnostic must be standalone. If it reaches into the add-on,
+      #    then "PROCESSCONTEXT-AB changed nothing about MGPU" stops being true
+      #    by construction rather than by intent.
+      # ---------------------------------------------------------------------
+      - name: The diagnostic is standalone
+        shell: bash
+        run: |
+          test -d tools/processcontext_ab
+          for F in main.cpp nv.cpp nv.h observe.cpp observe.hpp CMakeLists.txt README.txt RUN-CONTEXT-AB.cmd; do
+            test -f "tools/processcontext_ab/$F" || { echo "::error::missing tools/processcontext_ab/$F"; exit 1; }
+          done
+
+          # No include that climbs out of the directory, and no reference to any
+          # add-on translation unit or header.
+          H=$(grep -rnE '#include[[:space:]]*"\.\./|#include[[:space:]]*<\.\./' tools/processcontext_ab || true)
+          [ -z "$H" ] || { echo "$H"; echo "::error::the diagnostic includes a path outside its own directory"; exit 1; }
+
+          H=$(grep -rnE 'gpu1_context|arch_test\.(cpp|hpp)|reshade_native|cuda_diag|create_contract|adapter\.hpp|mgpu::' tools/processcontext_ab || true)
+          [ -z "$H" ] || { echo "$H"; echo "::error::the diagnostic references MGPU add-on sources"; exit 1; }
+
+          # And the add-on must not have grown a reference to the diagnostic.
+          H=$(grep -rnE 'processcontext_ab|PROCESSCONTEXT|PCAB_' src CMakeLists.txt assets 2>/dev/null || true)
+          [ -z "$H" ] || { echo "$H"; echo "::error::the MGPU add-on references the diagnostic"; exit 1; }
+          echo "standalone verified: no MGPU reference in either direction."
+
+      # ---------------------------------------------------------------------
+      # 2. The pass-through contract, on the source.
+      # ---------------------------------------------------------------------
+      - name: Verify the observation layer is a pass-through
+        shell: bash
+        run: |
+          F=tools/processcontext_ab/observe.cpp
+
+          # The two ids this diagnostic exists to observe must be the public,
+          # documented values, and the caller's arithmetic must be the
+          # documented 48-byte structure.
+          grep -q '0x0DDAC234u' tools/processcontext_ab/nv.h || { echo "::error::the descriptor id is not the documented 0x0DDAC234"; exit 1; }
+          grep -q '0xAD1A677Du' tools/processcontext_ab/nv.h || { echo "::error::the CuModule id is not the documented 0xAD1A677D"; exit 1; }
+          grep -qE 'static_assert\(sizeof\(GetDescParams\) == 48' "$F" || { echo "::error::the 48-byte descriptor-params contract is not asserted"; exit 1; }
+
+          # Every id printed goes through one zero-padded formatter. The observer
+          # work this descends from had a real bug where 0x150e828 was compared
+          # against a zero-padded 0x0150e828, and it is not being reintroduced.
+          grep -qE 'void id_hex\(unsigned id, char out\[11\]\)' "$F" || { echo "::error::the zero-padded id formatter is missing"; exit 1; }
+          H=$(grep -nE '0x150e828|0x150E828' "$F" || true)
+          [ -z "$H" ] || { echo "$H"; echo "::error::an unpadded NvAPI_Initialize id literal is present"; exit 1; }
+
+          FAIL=0
+          note() { echo "::error::$1"; FAIL=1; }
+          # hits() drops comment-only lines, so a comment that mentions a word
+          # cannot fail the build and a real statement cannot pass it. It also
+          # fails the build if grep itself errors, so a malformed pattern cannot
+          # silently verify nothing.
+          hits() {
+            local raw rc out
+            raw=$(grep -nE "$1" "$F"); rc=$?
+            if [ "$rc" -gt 1 ]; then
+              echo "::error::the gate's own grep failed (exit $rc) on pattern: $1"; exit 1
+            fi
+            if [ "$rc" -eq 1 ]; then printf ''; return 0; fi
+            out=$(printf '%s\n' "$raw" | grep -vE '^[0-9]+:[ \t]*(//|\*|/\*)' || true)
+            printf '%s' "$out"
+          }
+
+          # ---- exactly two genuine calls, each unconditional ----------------
+          # Written as the initialiser of `status`, so each call happens exactly
+          # once, with the original arguments, on every path that reaches it.
+          CALLS=$(grep -cE 'const int status = real\(' "$F" || true)
+          [ "$CALLS" -eq 2 ] || { note "expected exactly 2 genuine calls (found $CALLS)"; }
+          V=$(grep -cE '^[ \t]*return status;' "$F" || true)
+          [ "$V" -eq 2 ] || { note "expected exactly 2 verbatim status returns (found $V)"; }
+          G=$(grep -cE '^[ \t]*return NVAPI_ERROR_UNREACHABLE;' "$F" || true)
+          [ "$G" -eq 2 ] || { note "expected exactly 2 unreachable null-guard returns (found $G)"; }
+          grep -qE 'const int NVAPI_ERROR_UNREACHABLE = -1;' "$F" || note "the null-guard constant is not defined as -1"
+
+          # The two wrappers, isolated. Every return-count check below is scoped
+          # to THIS text, because the rest of the file legitimately returns too
+          # (the installer, the resolver, the summary) and a file-wide count
+          # would be meaningless.
+          W=$(awk '/^    int __cdecl wrap_get_desc/,/^    void \*__cdecl query_detour/' "$F")
+          [ -n "$W" ] || { echo "::error::could not isolate the two wrappers"; exit 1; }
+          WCODE=$(printf '%s\n' "$W" | grep -vE '^[ \t]*(//|\*|/\*)' || true)
+          WR=$(printf '%s\n' "$WCODE" | grep -cE '\breturn\b' || true)
+          [ "$WR" -eq 4 ] || {
+            note "the wrappers hold $WR returns; exactly 4 are permitted (2 verbatim + 2 guards)"
+            printf '%s\n' "$WCODE" | grep -nE '\breturn\b' || true
+          }
+
+          # No arithmetic, negation or numeric literal in a wrapper return: a
+          # rewritten status would look exactly like one.
+          H=$(printf '%s\n' "$WCODE" | grep -nE 'return\s+(status\s*[-+*/%]|!status|-[0-9]|[0-9]|0x)' || true)
+          [ -z "$H" ] || { echo "$H"; note "a status is not returned verbatim"; }
+
+          # ---- no writes to caller-owned memory ----------------------------
+          H=$(hits '\*\s*phModule\s*=[^=]')
+          [ -z "$H" ] || { echo "$H"; note "writes *phModule, a caller-owned __out"; }
+          H=$(hits 'p->(structSizeIn|structSizeOut|pDevice|type|desc|handle)\s*=[^=]')
+          [ -z "$H" ] || { echo "$H"; note "writes a caller-owned field of pParams"; }
+          H=$(hits 'memcpy|memmove|memset|memcmp')
+          [ -z "$H" ] || { echo "$H"; note "copies or compares memory"; }
+          H=$(hits 'pBlob\s*\[|pBlob\s*\+|pBlob\s*->|\(\*pBlob\)')
+          [ -z "$H" ] || { echo "$H"; note "inspects the blob"; }
+          # The blob's SIZE may be recorded; the blob's CONTENTS may never be.
+          grep -qE 'first_cu_blob_size|g_first_blob_size' "$F" || note "the blob-size observation is missing"
+          grep -qF '(pointer only; ' "$F" || note "the log does not state that pBlob is a pointer only"
+          grep -qF 'never dereferenced' "$F" || note "the log does not state that pBlob is never dereferenced"
+
+          # ---- a failed __out value is never read --------------------------
+          # The read must be gated on the status, and the guard must be in the
+          # same conditional chain, so there is no path that reads it on failure.
+          grep -qF 'NOT READ: NvApi_Status != NVAPI_OK' "$F" || note "the 'not read on failure' wording is missing"
+          grep -qE 'if \(status != 0\)[ \t]*handle_note' "$F" || note "the descriptor read is not gated on the status"
+          grep -qE 'if \(status != 0\)[ \t]*note' "$F" || note "the module-handle read is not gated on the status"
+
+          # ---- real-pointer publication is a CAS, never a store ------------
+          CAS=$(grep -cE 'g_real_(desc|cu)\.compare_exchange_strong\(' "$F" || true)
+          [ "$CAS" -eq 2 ] || { note "expected 2 publication CASes, found $CAS"; }
+          H=$(hits 'g_real_(desc|cu)\s*\.\s*store\s*\(')
+          [ -z "$H" ] || { echo "$H"; note "publishes a real pointer with a plain store"; }
+          grep -qE 'std::memory_order_release,' "$F" || note "the CAS success ordering is not release"
+          grep -qE 'std::memory_order_acquire\)\)' "$F" || note "the CAS failure ordering is not acquire"
+          grep -qE 'UNWRAPPED, so behaviour is unchanged' "$F" || note "the different-pointer path does not state that behaviour is unchanged"
+
+          # ---- no loop around a genuine call ------------------------------
+          # Scoped to the two wrappers: log_stack() legitimately loops to print
+          # the stack, and it never calls into NVAPI.
+          H=$(printf '%s\n' "$W" | grep -nE '\b(for|while)\s*\(|\bdo\s*\{' || true)
+          [ -z "$H" ] || { echo "$H"; note "a genuine call sits inside a loop"; }
+
+          # ---- the hook is on the resolver, and there is exactly one ------
+          N=$(grep -cE 'MH_CreateHook\(entry, \(LPVOID\)&query_detour' "$F" || true)
+          [ "$N" -eq 1 ] || { note "expected exactly 1 MH_CreateHook(&query_detour), found $N"; }
+          grep -qF 'nvapi_QueryInterface' "$F" || note "the resolver hook is not on nvapi_QueryInterface"
+          grep -qF 'the TRAMPOLINE, not the patched entry' "$F" || note "the original pointer is not taken from MinHook's trampoline"
+          # A probe is not a result, and that distinction must be in the code.
+          grep -qF 'null-argument validation probe; ' "$F" || note "the probe classification wording is missing"
+          grep -qF 'real_descriptor_status = (s.descriptor_calls > s.descriptor_probes)' "$F" || note "a probe status can be reported as the real call's result"
+          grep -qF 'real_cumodule_status   = (s.cumodule_calls > s.cumodule_probes)' "$F" || note "a probe status can be reported as the real call's result"
+
+          [ "$FAIL" -eq 0 ] || exit 1
+          echo "pass-through verified: two unconditional calls, verbatim statuses, no output write, no blob read, no retry."
+
+      # ---------------------------------------------------------------------
+      # 3. NVAPI bring-up and the architecture patch.
+      # ---------------------------------------------------------------------
+      - name: Verify the NVAPI ordering and the architecture patch
+        shell: bash
+        run: |
+          F=tools/processcontext_ab/nv.cpp
+          # NvAPI_Initialize must be the FIRST id resolved through the resolver.
+          FIRST=$(grep -n 'g_query(' "$F" | head -n1)
+          case "$FIRST" in
+            *NVAPI_ID_INITIALIZE*) echo "first resolver call: $FIRST" ;;
+            *) echo "::error::the first id resolved is not NvAPI_Initialize: $FIRST"; exit 1 ;;
+          esac
+          # The spoof must be conditional: a real value that is already accepted
+          # is not rewritten, which is NeuralScreen's behaviour.
+          grep -qE 'if \(pInfo->architecture != SPOOF_ARCHITECTURE\)' "$F" || {
+            echo "::error::the architecture rewrite is unconditional"; exit 1; }
+          grep -q 'SPOOF_ARCHITECTURE   = 0x1B0u' tools/processcontext_ab/nv.h || {
+            echo "::error::the accepted architecture value has drifted"; exit 1; }
+          # NVIDIA's own code still serves the call: the detour calls the
+          # original first and rewrites only the returned value.
+          grep -qF 'const int r = g_arch_original(hPhysicalGpu, pInfo);' "$F" || {
+            echo "::error::the architecture detour does not call the original"; exit 1; }
+          # The NR DLL is hashed through CNG, not a hand-rolled digest.
+          grep -q 'BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM' "$F" || {
+            echo "::error::the SHA256 is not computed with CNG"; exit 1; }
+
+      # ---------------------------------------------------------------------
+      # 4. The four arms and the fixed interpretation.
+      # ---------------------------------------------------------------------
+      - name: Verify the arms and the fixed interpretation
+        shell: bash
+        run: |
+          F=tools/processcontext_ab/main.cpp
+
+          # Adapters are identified by PCI device id. There is no ordinal
+          # selection anywhere, which is what makes the four arms comparable.
+          grep -q 'PCI_TI_SUPER  = 0x2705u' "$F" || { echo "::error::the Ti SUPER device id is not 10DE:2705"; exit 1; }
+          grep -q 'PCI_RTX_4070  = 0x2786u' "$F" || { echo "::error::the RTX 4070 device id is not 10DE:2786"; exit 1; }
+          A=$(grep -c 'd.DeviceId == PCI_TI_SUPER' "$F" || true)
+          B=$(grep -c 'd.DeviceId == PCI_RTX_4070' "$F" || true)
+          [ "$A" -eq 1 ] && [ "$B" -eq 1 ] || { echo "::error::expected one device-id selection per adapter (found $A and $B)"; exit 1; }
+          H=$(grep -nE 'EnumAdapters1\([[:space:]]*[0-9]' "$F" || true)
+          [ -z "$H" ] || { echo "$H"; echo "::error::an adapter is selected by a literal ordinal"; exit 1; }
+
+          # The four arms exist under exactly these names.
+          grep -qF 'MODE_NAMES[4] = { "single", "dual-held", "dual-active", "dual-released" }' "$F" || {
+            echo "::error::the four arm names are not the fixed ones"; exit 1; }
+
+          # The snippet build is gated on its hash, before it is loaded.
+          grep -qF 'dcc0dc2414aedec4a8e084647070383be068554042587180c20c784d4772d36f' "$F" || {
+            echo "::error::the required NR DLL SHA256 is missing"; exit 1; }
+          GATE=$(grep -n 'EXPECTED_NR_SHA256' "$F" | head -n1 | cut -d: -f1)
+          LOAD=$(grep -n 'ngx_load_snippet' "$F" | head -n1 | cut -d: -f1)
+          [ -n "$GATE" ] && [ -n "$LOAD" ] && [ "$GATE" -lt "$LOAD" ] || {
+            echo "::error::the hash gate does not precede the snippet load (gate $GATE, load $LOAD)"; exit 1; }
+
+          # The five fixed rules, one per arm, in the fixed order.
+          for S in 'E) INVALID' 'A) SINGLE succeeded and DUAL-HELD failed.' \
+                   'B) SINGLE and DUAL-HELD succeeded, DUAL-ACTIVE failed.' \
+                   'C) SINGLE, DUAL-HELD and DUAL-ACTIVE succeeded, DUAL-RELEASED failed.' \
+                   'D) ALL FOUR ARMS SUCCEEDED.'; do
+            grep -qF "$S" "$F" || { echo "::error::the fixed interpretation is missing: $S"; exit 1; }
+          done
+          # E is decided before anything else.
+          EL=$(grep -n 'E) INVALID' "$F" | head -n1 | cut -d: -f1)
+          AL=$(grep -n 'A) SINGLE succeeded and DUAL-HELD failed.' "$F" | head -n1 | cut -d: -f1)
+          DL=$(grep -n 'D) ALL FOUR ARMS SUCCEEDED.' "$F" | head -n1 | cut -d: -f1)
+          [ "$EL" -lt "$AL" ] && [ "$AL" -lt "$DL" ] || {
+            echo "::error::the interpretation is not in the fixed E, A, B, C, D order"; exit 1; }
+
+          # The caller-gate name check exists and warns loudly, because a run
+          # that skips it fails SINGLE for an unrelated reason.
+          grep -qF 'std::strstr(self_name, "nvngx.dll")' "$F" || {
+            echo "::error::the nvngx.dll caller-gate name check is missing"; exit 1; }
+          grep -qF 'the whole diagnostic is INVALID (rule E)' "$F" || {
+            echo "::error::the caller-gate warning does not say the diagnostic would be INVALID"; exit 1; }
+
+          # Each arm writes its own per-mode log.
+          grep -qF 'std::snprintf(g_log_path, sizeof g_log_path, "context-%s.log", mode_name);' \
+            tools/processcontext_ab/nv.cpp || {
+            echo "::error::the per-mode log file naming has changed"; exit 1; }
+
+      # ---------------------------------------------------------------------
+      # 5. The launcher. The rename is the whole reason the launcher exists.
+      # ---------------------------------------------------------------------
+      - name: Verify the launcher
+        shell: bash
+        run: |
+          F=tools/processcontext_ab/RUN-CONTEXT-AB.cmd
+          grep -qF 'set "RUNNAME=nvngx.dll_processcontext_ab.exe"' "$F" || {
+            echo "::error::the launcher does not run the exe under a name carrying the nvngx.dll prefix"; exit 1; }
+          grep -qF 'copy /y "%EXE%" "%RUNNAME%"' "$F" || {
+            echo "::error::the launcher does not create the prefixed copy"; exit 1; }
+          grep -qF 'for %%M in (single dual-held dual-active dual-released) do' "$F" || {
+            echo "::error::the launcher does not run the four arms in the fixed order"; exit 1; }
+          grep -qF -- '"%RUNNAME%" --mode %%M --nr-dll "%NRDLL%"' "$F" || {
+            echo "::error::each arm is not launched as its own process with the NR DLL"; exit 1; }
+          grep -qF -- '"%EXE%" --mode table' "$F" || {
+            echo "::error::the launcher does not print the fixed table"; exit 1; }
+          # The launcher must not launch the game and must not deploy. It NAMES
+          # Cyberpunk in a note saying it was not launched, so the check is for
+          # the game's executable and for deployment verbs, not for the word.
+          H=$(grep -niE 'Cyberpunk2077|start[[:space:]]+.*\.exe|addon64|xcopy|robocopy|Program Files' "$F" || true)
+          [ -z "$H" ] || { echo "$H"; echo "::error::the launcher launches or deploys something"; exit 1; }
+          # CRLF: a batch file with bare LF line endings is not reliably parsed.
+          CRLF=$(grep -c $'\r' "$F" || true)
+          [ "$CRLF" -ge 30 ] || { echo "::error::$F has only $CRLF CR-terminated lines - it is not CRLF"; exit 1; }
+          echo "launcher verified: four arms, one process each, prefixed name, fixed table."
+
+      # ---------------------------------------------------------------------
+      # 6. Structural substitutes for a compiler, which the rig these sources
+      #    are written on does not have. The preprocessor nesting and the brace
+      #    balance are the two errors that a diff review cannot see.
+      #
+      #    The brace count is taken with `//` comments stripped. That is exact
+      #    here rather than approximate: no string literal and no comment in
+      #    these five files contains a brace, and the gate below asserts that,
+      #    so the count cannot be thrown off by prose.
+      # ---------------------------------------------------------------------
+      - name: Structural checks
+        shell: bash
+        run: |
+          FAIL=0
+          for F in tools/processcontext_ab/main.cpp tools/processcontext_ab/nv.cpp \
+                   tools/processcontext_ab/observe.cpp tools/processcontext_ab/nv.h \
+                   tools/processcontext_ab/observe.hpp; do
+            test -f "$F" || { echo "::error::missing $F"; exit 1; }
+
+            awk '
+              /^[ \t]*#[ \t]*(ifdef|ifndef|if)\b/ { depth++ }
+              /^[ \t]*#[ \t]*endif\b/            { depth--; if (depth < 0) neg = 1 }
+              END {
+                if (depth != 0 || neg) {
+                  printf "::error::%s preprocessor nesting does not close (depth=%d, underflow=%d)\n", FILENAME, depth, neg
+                  exit 1
+                }
+              }
+            ' "$F" || exit 1
+
+            # Brace balance. Braces inside string literals and inside `//`
+            # comments are skipped by the same character walk that counts them,
+            # including a backslash-escaped quote - so the count is a fact about
+            # the code and not about the prose in it. (GNU awk; `sub(/\/\/.*$/)`
+            # alone would NOT be enough, because the closing quote of a string is
+            # followed by whatever code comes after it.)
+            awk '
+              {
+                line = $0
+                instr = 0
+                for (i = 1; i <= length(line); i++) {
+                  c = substr(line, i, 1)
+                  if (instr) {
+                    if (c == "\\") { i++; continue }
+                    if (c == "\"") instr = 0
+                    continue
+                  }
+                  if (c == "\"") { instr = 1; continue }
+                  if (c == "/" && substr(line, i + 1, 1) == "/") break
+                  if (c == "{") depth++
+                  else if (c == "}") { depth--; if (depth < 0) neg = 1 }
+                }
+              }
+              END {
+                if (depth != 0 || neg) {
+                  printf "::error::%s brace imbalance (depth=%d, underflow=%d) - a missing or extra brace\n", FILENAME, depth, neg
+                  exit 1
+                }
+              }
+            ' "$F" || exit 1
+
+            # Positive control for the walk above: it must SEE the braces it is
+            # counting. A walk that skipped everything would report every file as
+            # balanced, which is exactly the failure mode a brace check exists to
+            # prevent.
+            NB=$(grep -c '{' "$F" || true)
+            [ "$NB" -ge 2 ] || { echo "::error::$F has only $NB opening braces - the brace count is not seeing the code"; exit 1; }
+
+            echo "$F: nesting closes, braces balance"
+          done
+
+          # No conditional compilation at all in the diagnostic: the arms differ
+          # by RUNTIME state, never by a compile-time switch. A #if in these
+          # files would mean two different binaries claim to be one experiment.
+          H=$(grep -nE '^[ \t]*#[ \t]*(if|ifdef|ifndef|else|elif)' \
+                tools/processcontext_ab/main.cpp tools/processcontext_ab/nv.cpp \
+                tools/processcontext_ab/observe.cpp tools/processcontext_ab/nv.h \
+                tools/processcontext_ab/observe.hpp || true)
+          [ -z "$H" ] || { echo "$H"; echo "::error::the diagnostic contains conditional compilation"; FAIL=1; }
+
+          [ "$FAIL" -eq 0 ] || exit 1
+          echo "structural checks passed."
+
+      # ---------------------------------------------------------------------
+      # 7. Dependencies, pinned. Same SHAs as every other workflow in this repo.
+      # ---------------------------------------------------------------------
+      - name: Fetch NVIDIA NGX headers at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/ngx.tar.gz \
+            "https://codeload.github.com/NVIDIA/DLSS/tar.gz/${NGX_SHA}"
+          tar -xzf _dl/ngx.tar.gz -C _dl --wildcards "*/include"
+          rm -rf ext/ngx
+          mv _dl/*/include ext/ngx
+          test -f ext/ngx/nvsdk_ngx.h
+          grep -rq 'NVSDK_NGX_Feature_Reserved18' ext/ngx || {
+            echo "::error::Pin drift - no NVSDK_NGX_Feature_Reserved18"; exit 1; }
+
+      - name: Fetch and build MinHook at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/minhook.tar.gz \
+            "https://codeload.github.com/TsudaKageyu/minhook/tar.gz/${MINHOOK_SHA}"
+          tar -xzf _dl/minhook.tar.gz -C _dl
+          rm -rf ext/minhook
+          mv _dl/minhook-* ext/minhook
+          test -f ext/minhook/include/MinHook.h
+          cmake -S ext/minhook -B ext/minhook/build -A x64 \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+          cmake --build ext/minhook/build --config Release
+          LIB=$(find ext/minhook/build -type f \( -iname 'minhook.x64.lib' -o -iname '*minhook*.lib' \) | head -n1)
+          if [ -z "$LIB" ]; then
+            echo "::error::no MinHook static library found"
+            find ext/minhook/build -type f | sort | head -50 || true
+            exit 1
+          fi
+          echo "discovered MinHook library: $LIB"
+          mkdir -p ext/minhook/lib
+          cp "$LIB" ext/minhook/lib/MinHook.lib
+          test -f ext/minhook/lib/MinHook.lib
+
+      # ---------------------------------------------------------------------
+      # 8. Configure and build. This is the exact build command, recorded.
+      # ---------------------------------------------------------------------
+      - name: Configure (processcontext-ab)
+        shell: bash
+        run: |
+          cmake -S tools/processcontext_ab -B build-pcab -A x64 \
+            -DPCAB_NGX_DIR="${{ github.workspace }}/ext/ngx" \
+            -DPCAB_MINHOOK_DIR="${{ github.workspace }}/ext/minhook" 2>&1 | tee _cfg.txt
+          grep -q "PROCESSCONTEXT-AB: NGX headers from" _cfg.txt || {
+            echo "::error::configured without the NGX headers"; exit 1; }
+          grep -q "PROCESSCONTEXT-AB: MinHook from" _cfg.txt || {
+            echo "::error::configured without MinHook"; exit 1; }
+          grep -q "PROCESSCONTEXT-AB: output" _cfg.txt || {
+            echo "::error::the output path was not announced"; exit 1; }
+          echo "--- configure summary ---"
+          grep -n "PROCESSCONTEXT-AB" _cfg.txt
+
+      - name: Build (processcontext-ab)
+        run: cmake --build build-pcab --config Release
+
+      - name: Verify the artifact
+        shell: bash
+        run: |
+          EXE=$(find build-pcab -name 'processcontext_ab.exe' -type f | head -n1)
+          if [ -z "$EXE" ]; then
+            echo "::error::processcontext_ab.exe was not produced"
+            find build-pcab -maxdepth 3 -type f || true
+            exit 1
+          fi
+          echo "EXE_PATH=$EXE" >> "$GITHUB_ENV"
+          echo "output: $EXE"
+
+          # The instrumentation must be IN the binary that ships, not merely in
+          # the source tree. Every one of these is a string literal this build
+          # emits, so a compile-out shows up here.
+          for S in PROCESSCONTEXT-AB PCAB-RESULT GetCudaIndependentDescriptorObject \
+                   CreateCuModule NVSDK_NGX_Feature_Reserved18 nvngx.dll \
+                   'context-%s.log' 'dual-released'; do
+            if ! grep -qa -- "$S" "$EXE"; then
+              echo "::error::'$S' is not present in $EXE - the diagnostic was compiled out"
+              exit 1
+            fi
+          done
+          # And the forbidden strings must NOT be in it: this binary carries no
+          # game path, no add-on module name and no deployment path. The game's
+          # SUBJECT is named in the output on purpose; its executable is not.
+          for S in 'Cyberpunk2077' '.addon64' 'ReShade' 'Streamline' 'PC_GAMES' 'bin\x64'; do
+            if grep -qa -- "$S" "$EXE"; then
+              echo "::error::'$S' is present in $EXE - this binary is not a standalone diagnostic"
+              exit 1
+            fi
+          done
+          echo "instrumentation strings present; no game path, add-on name or deployment path."
+
+      # ---------------------------------------------------------------------
+      # 9. The three GPU-free behavioural tests. The runner has no NVIDIA
+      #    adapter, so these are the paths that can be exercised here - and the
+      #    third is the one that matters: a wrong snippet build must be REFUSED
+      #    before anything is loaded or created.
+      # ---------------------------------------------------------------------
+      - name: Behavioural tests (no GPU required)
+        shell: bash
+        run: |
+          set +e
+          mkdir -p _bt && cd _bt
+
+          # (a) the table path, with no arm logs present: it must print the fixed
+          #     table and refuse to interpret anything.
+          ../"$EXE_PATH" --mode table > table.txt 2>&1
+          RC=$?
+          cat table.txt
+          grep -q 'PROCESSCONTEXT-AB  -  FIXED RESULT TABLE' table.txt || { echo "::error::the fixed table header is missing"; exit 1; }
+          grep -q 'MODE            VALID  LANE' table.txt || { echo "::error::the fixed column header is missing"; exit 1; }
+          grep -q 'NO VERDICT: mode "single" is absent' table.txt || { echo "::error::an absent reference arm was not refused"; exit 1; }
+          [ "$RC" -eq 4 ] || { echo "::error::table with no logs exited $RC, expected 4"; exit 1; }
+          echo "(a) table path ok, exit $RC"
+
+          # (b) a mode without --nr-dll is a usage error, not a silent run.
+          ../"$EXE_PATH" --mode single > usage.txt 2>&1
+          RC=$?
+          [ "$RC" -eq 1 ] || { echo "::error::--mode single without --nr-dll exited $RC, expected 1"; exit 1; }
+          grep -q -- '--nr-dll is required' usage.txt || { echo "::error::the usage error does not name --nr-dll"; exit 1; }
+          echo "(b) usage path ok, exit $RC"
+
+          # (c) THE HASH GATE. A file that is not the required snippet build must
+          #     be REFUSED, and refused BEFORE anything is loaded or created.
+          printf 'not the neural runtime' > wrong.dll
+          ../"$EXE_PATH" --mode single --nr-dll wrong.dll > gate.txt 2>&1
+          RC=$?
+          cat gate.txt
+          [ "$RC" -eq 1 ] || { echo "::error::a wrong NR DLL exited $RC, expected 1"; exit 1; }
+          grep -q 'MISMATCH' gate.txt || { echo "::error::a wrong NR DLL was not reported as a mismatch"; exit 1; }
+          grep -q 'ABORTING before the load' gate.txt || { echo "::error::the gate did not abort before the load"; exit 1; }
+          grep -q 'valid=NO reason=NR_DLL_SHA256_MISMATCH' gate.txt || { echo "::error::the gate did not record an invalid arm"; exit 1; }
+          # Nothing may have been created or resolved on this path.
+          for S in 'D3D12CreateDevice' 'NvAPI_Initialize' 'nvapi_QueryInterface detoured' 'CreateFeature'; do
+            if grep -q -- "$S" gate.txt; then
+              echo "::error::the hash gate let '$S' happen before refusing the DLL"
+              exit 1
+            fi
+          done
+          echo "(c) hash gate ok, exit $RC - refused before any load, device or call"
+
+          # (d) an unknown argument is refused rather than ignored.
+          ../"$EXE_PATH" --mode single --frobnicate > arg.txt 2>&1
+          RC=$?
+          [ "$RC" -eq 1 ] || { echo "::error::an unknown argument exited $RC, expected 1"; exit 1; }
+          echo "(d) argument path ok, exit $RC"
+
+      # ---------------------------------------------------------------------
+      # 10. The artifact: exactly the four files the deliverable names.
+      # ---------------------------------------------------------------------
+      - name: Stage and hash the artifact
+        shell: bash
+        run: |
+          mkdir -p _pcab
+          cp "$EXE_PATH"                       _pcab/processcontext_ab.exe
+          cp tools/processcontext_ab/RUN-CONTEXT-AB.cmd _pcab/
+          cp tools/processcontext_ab/README.txt         _pcab/
+
+          ( cd _pcab && sha256sum processcontext_ab.exe RUN-CONTEXT-AB.cmd README.txt ) > _pcab/SHA256SUMS.txt
+          cat _pcab/SHA256SUMS.txt
+
+          COUNT=$(find _pcab -type f | wc -l)
+          [ "$COUNT" -eq 4 ] || { echo "::error::the artifact holds $COUNT files, expected 4"; find _pcab -type f | sort; exit 1; }
+          test -f _pcab/processcontext_ab.exe
+          test -f _pcab/RUN-CONTEXT-AB.cmd
+          test -f _pcab/README.txt
+          test -f _pcab/SHA256SUMS.txt
+
+          {
+            echo "variant   = processcontext-ab"
+            echo
+            echo "PROCESSCONTEXT-AB: four arms, one process each, one fixed table."
+            echo "It answers whether process-global / multi-device D3D12 state explains"
+            echo "why the private NVAPI CUDA-interop calls 0x0DDAC234 and 0xAD1A677D"
+            echo "fail inside Cyberpunk but succeed in NeuralScreen."
+            echo
+            echo "commit    = ${GITHUB_SHA}"
+            echo "run       = ${GITHUB_RUN_ID}"
+            echo "built     = $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "build command:"
+            echo "  cmake -S tools/processcontext_ab -B build-pcab -A x64 \\"
+            echo "        -DPCAB_NGX_DIR=<ext/ngx> -DPCAB_MINHOOK_DIR=<ext/minhook>"
+            echo "  cmake --build build-pcab --config Release"
+            echo
+            echo "pins:"
+            echo "  NVIDIA/DLSS       ${NGX_SHA}"
+            echo "  TsudaKageyu/minhook ${MINHOOK_SHA}"
+            echo
+            echo "This diagnostic does NOT modify MGPU, NeuralScreen, Cyberpunk or any"
+            echo "NVIDIA binary, and it never launches the game. It does not deploy."
+          } > PCAB_VARIANT.txt
+          cat PCAB_VARIANT.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: processcontext-ab
+          path: |
+            _pcab/
+            PCAB_VARIANT.txt
+          if-no-files-found: error

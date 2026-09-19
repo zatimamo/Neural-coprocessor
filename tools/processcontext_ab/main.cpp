@@ -1,0 +1,1033 @@
+// ============================================================================
+// PROCESSCONTEXT-AB
+//
+// ONE question, fixed in advance:
+//
+//   Does the D3D12 device / queue / descriptor state that Cyberpunk carries when
+//   the neural lane runs explain why the private NVAPI CUDA-interop calls
+//   (0x0DDAC234 GetCudaIndependentDescriptorObject, 0xAD1A677D CreateCuModule)
+//   return NVAPI_ERROR there but succeed in NeuralScreen?
+//
+// The method is a four-arm single-variable A/B. Every arm runs the SAME
+// NeuralScreen-equivalent CONTROL lane, in its own process, on the RTX 4070, and
+// differs ONLY in second-adapter state established before that lane starts:
+//
+//   single          nothing else at all                       (the reference)
+//   dual-held       RTX 4070 Ti SUPER device, created + held, no NGX, no swapchain
+//   dual-active     ... plus a DIRECT command queue and a tiny CBV/SRV/UAV heap
+//   dual-released   Ti SUPER device created, recorded, then RELEASED
+//
+// INTERPRETATION, FIXED IN ADVANCE - one rule per arm, in this order:
+//
+//   E) SINGLE does not succeed  -> THE DIAGNOSTIC IS INVALID. Stop. Interpret
+//      nothing. Every other arm's result is unreadable, because the reference
+//      lane itself did not reproduce, so no difference can be attributed to the
+//      variable.
+//   A) SINGLE ok + DUAL-HELD fail -> the mere SIMULTANEOUS presence of a second
+//      adapter is sufficient to break the calls.
+//   B) A and DUAL-ACTIVE fails    -> an ACTIVE second command queue / descriptor
+//      heap is what triggers it, not the device alone.
+//   C) DUAL-RELEASED fails        -> process-global NVIDIA state persists after
+//      the second device is released, so release is not a cure.
+//   D) all four succeed           -> the multi-device hypothesis is EXONERATED.
+//
+// WHAT THIS PROGRAM DOES NOT DO
+//   It does not modify MGPU, NeuralScreen, Cyberpunk, or any NVIDIA binary. It
+//   does not patch a result, fabricate a handle, retry a call, or replace an
+//   NvApi_Status. It loads no ReShade and no Streamline. It never selects an
+//   adapter by ordinal: both adapters are identified by PCI device id.
+//
+// WHY THE EXECUTABLE MUST BE NAMED *nvngx.dll*
+//   The DLSSNR snippet inspects the module name of its caller and refuses a
+//   caller whose file name does not contain "nvngx.dll" with 0xBAD00002
+//   FAIL_PlatformError. MGPU answers this by deploying as
+//   "nvngx.dll_mgpu_bridge.addon64"; this diagnostic answers it the same way,
+//   and RUN-CONTEXT-AB.cmd runs the exe under a name that carries the prefix.
+//   The name is checked and reported at startup, because a run that skips this
+//   would fail SINGLE for a reason that has nothing to do with the hypothesis.
+// ============================================================================
+
+#include "nv.h"
+#include "observe.hpp"
+
+#include <dxgi1_6.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cwchar>
+
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d3d12.lib")
+
+namespace
+{
+    // ------------------------------------------------------------- constants
+
+    // 10DE:2705 RTX 4070 Ti SUPER - the second adapter, held by Cyberpunk's process.
+    const unsigned PCI_TI_SUPER  = 0x2705u;
+    // 10DE:2786 RTX 4070 - the adapter NeuralScreen's lane works on.
+    const unsigned PCI_RTX_4070  = 0x2786u;
+    const unsigned VENDOR_NVIDIA = 0x10DEu;
+
+    // The exact snippet build NeuralScreen v1.15.0 runs. A different build has a
+    // different runtime and the comparison would be against the wrong thing, so
+    // the hash is a gate, not a note.
+    const char *EXPECTED_NR_SHA256 =
+        "dcc0dc2414aedec4a8e084647070383be068554042587180c20c784d4772d36f";
+
+    const unsigned CTRL_W = 640u;
+    const unsigned CTRL_H = 360u;
+
+    const char *MODE_NAMES[4] = { "single", "dual-held", "dual-active", "dual-released" };
+
+    // ---------------------------------------------------------------- helpers
+
+    bool ieq_ascii(const char *a, const char *b)
+    {
+        for (; *a && *b; ++a, ++b)
+        {
+            char ca = *a, cb = *b;
+            if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+            if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+            if (ca != cb) return false;
+        }
+        return *a == '\0' && *b == '\0';
+    }
+
+    void hex32(unsigned v, char out[11])
+    {
+        static const char *d = "0123456789ABCDEF";
+        out[0] = '0'; out[1] = 'x';
+        for (int i = 0; i < 8; ++i) out[2 + i] = d[(v >> ((7 - i) * 4)) & 0xF];
+        out[10] = '\0';
+    }
+
+    // A signed status as plain decimal. Round-robin over four slots so that two
+    // calls in one argument list cannot share a buffer and clobber each other -
+    // the same class of bug as reusing one `char b[]` for two %s arguments.
+    const char *dec(int v)
+    {
+        static char bufs[4][16];
+        static unsigned slot = 0;
+        char *b = bufs[slot++ & 3u];
+        std::snprintf(b, 16, "%d", v);
+        return b;
+    }
+
+    // "NVAPI_ERROR", from nvapi.h NvApi_Status. Only the two values this
+    // diagnostic can be judged on are named; everything else is reported
+    // numerically rather than guessed at.
+    const char *nv_status_name(int s)
+    {
+        switch (s)
+        {
+        case  0: return "NVAPI_OK";
+        case -1: return "NVAPI_ERROR";
+        case -5: return "NVAPI_INVALID_ARGUMENT";
+        case -6: return "NVAPI_NVIDIA_DEVICE_NOT_FOUND";
+        case -9: return "NVAPI_INCOMPATIBLE_STRUCT_VERSION";
+        case -14: return "NVAPI_INVALID_POINTER";
+        default: return "see nvapi.h NvApi_Status";
+        }
+    }
+
+    const char *ngx_result_name(unsigned r)
+    {
+        switch (r)
+        {
+        case 0x00000001u: return "NVSDK_NGX_Result_Success";
+        case 0xBAD00001u: return "FAIL_InvalidParameter";
+        case 0xBAD00002u: return "FAIL_PlatformError";
+        case 0xBAD00003u: return "FAIL_NotInitialized";
+        case 0xBAD00004u: return "FAIL_NotSupported";
+        case 0xBAD00005u: return "FAIL_InvalidState";
+        case 0xBAD0000Bu: return "FAIL_UnableToInitializeFeature";
+        case 0xBAD0000Cu: return "FAIL_OutOfDate";
+        case 0xBAD00012u: return "FAIL_FeatureRequirementsQueryFailed";
+        default:          return "see nvsdk_ngx_defs.h";
+        }
+    }
+
+    // ------------------------------------------------------- the CONTROL lane
+
+    struct Lane
+    {
+        bool     reached_create = false;   // CreateFeature was actually invoked
+        unsigned core_init = 0xDEADBEEFu;
+        unsigned caps      = 0xDEADBEEFu;
+        unsigned snip_init = 0xDEADBEEFu;
+        unsigned populate  = 0xDEADBEEFu;
+        unsigned feature   = 0xDEADBEEFu;
+        void    *handle    = nullptr;
+        bool     drained   = false;
+
+        ID3D12Device              *dev    = nullptr;
+        ID3D12CommandQueue        *queue  = nullptr;
+        ID3D12CommandAllocator    *alloc  = nullptr;
+        ID3D12GraphicsCommandList *list   = nullptr;
+        ID3D12Fence               *fence  = nullptr;
+        HANDLE                     event  = nullptr;
+        NVSDK_NGX_Parameter       *params = nullptr;
+    };
+
+    FARPROC pick(HMODULE m, const char *name, const char *who)
+    {
+        FARPROC p = (m != nullptr) ? GetProcAddress(m, name) : nullptr;
+        pcab::logf("[ngx] %-40s (%-7s) -> %p", name, who, (void *)p);
+        return p;
+    }
+
+    // ------------------------------------------------------------ the table
+
+    struct Row
+    {
+        bool present = false;
+        bool valid = false;
+        char reason[64] = "";
+        bool control_ok = false;
+        unsigned core_init = 0, caps = 0, snip_init = 0, populate = 0, feature = 0;
+        int desc_status = -12345;
+        unsigned desc_calls = 0, desc_probes = 0;
+        int cu_status = -12345;
+        unsigned cu_calls = 0, cu_probes = 0;
+    };
+
+    // Parse "PCAB-RESULT key=value key=value ..." into a Row.
+    bool parse_result_line(const char *line, Row &row, const char *want_mode)
+    {
+        const char *p = line;
+        if (std::strncmp(p, "PCAB-RESULT ", 12) != 0) return false;
+        p += 12;
+
+        char mode[64] = "";
+        bool mode_ok = false;
+        row = Row{};
+
+        while (*p != '\0')
+        {
+            while (*p == ' ') ++p;
+            if (*p == '\0') break;
+            const char *eq = std::strchr(p, '=');
+            if (eq == nullptr) break;
+            const char *val = eq + 1;
+            const char *end = std::strchr(val, ' ');
+            const size_t vlen = (end != nullptr) ? (size_t)(end - val) : std::strlen(val);
+            const size_t klen = (size_t)(eq - p);
+
+            char key[48] = "";
+            char v[96] = "";
+            if (klen < sizeof key) { std::memcpy(key, p, klen); key[klen] = '\0'; }
+            if (vlen < sizeof v)   { std::memcpy(v, val, vlen); v[vlen] = '\0'; }
+
+            if (std::strcmp(key, "mode") == 0)
+            {
+                std::snprintf(mode, sizeof mode, "%s", v);
+                mode_ok = (std::strcmp(v, want_mode) == 0);
+            }
+            else if (std::strcmp(key, "valid") == 0)        row.valid = (std::strcmp(v, "YES") == 0);
+            else if (std::strcmp(key, "reason") == 0)       std::snprintf(row.reason, sizeof row.reason, "%s", v);
+            else if (std::strcmp(key, "control") == 0)      row.control_ok = (std::strcmp(v, "OK") == 0);
+            else if (std::strcmp(key, "core_init") == 0)    row.core_init = (unsigned)std::strtoul(v, nullptr, 16);
+            else if (std::strcmp(key, "caps") == 0)         row.caps = (unsigned)std::strtoul(v, nullptr, 16);
+            else if (std::strcmp(key, "snip_init") == 0)    row.snip_init = (unsigned)std::strtoul(v, nullptr, 16);
+            else if (std::strcmp(key, "populate") == 0)     row.populate = (unsigned)std::strtoul(v, nullptr, 16);
+            else if (std::strcmp(key, "feature") == 0)      row.feature = (unsigned)std::strtoul(v, nullptr, 16);
+            else if (std::strcmp(key, "desc_status") == 0)  row.desc_status = (std::strcmp(v, "NA") == 0) ? -12345 : (int)std::strtol(v, nullptr, 0);
+            else if (std::strcmp(key, "desc_calls") == 0)   row.desc_calls = (unsigned)std::strtoul(v, nullptr, 10);
+            else if (std::strcmp(key, "desc_probes") == 0)  row.desc_probes = (unsigned)std::strtoul(v, nullptr, 10);
+            else if (std::strcmp(key, "cu_status") == 0)    row.cu_status = (std::strcmp(v, "NA") == 0) ? -12345 : (int)std::strtol(v, nullptr, 0);
+            else if (std::strcmp(key, "cu_calls") == 0)     row.cu_calls = (unsigned)std::strtoul(v, nullptr, 10);
+            else if (std::strcmp(key, "cu_probes") == 0)    row.cu_probes = (unsigned)std::strtoul(v, nullptr, 10);
+
+            if (end == nullptr) break;
+            p = end + 1;
+        }
+        if (!mode_ok)
+        {
+            pcab::logf("      (ignoring a result line for mode \"%s\", wanted \"%s\")",
+                       mode[0] ? mode : "?", want_mode);
+            return false;
+        }
+        row.present = true;
+        return true;
+    }
+
+    void status_cell(int status, unsigned calls, unsigned probes, char out[40])
+    {
+        if (status == -12345)
+        {
+            std::snprintf(out, 40, "%-12s %u/%up", "NOT-OBSERVED", calls, probes);
+            return;
+        }
+        char h[11];
+        hex32((unsigned)status, h);
+        std::snprintf(out, 40, "%-12s %u/%up", h, calls, probes);
+    }
+
+    int run_table()
+    {
+        Row rows[4];
+        for (int i = 0; i < 4; ++i)
+        {
+            char path[MAX_PATH] = "";
+            std::snprintf(path, sizeof path, "context-%s.log", MODE_NAMES[i]);
+            FILE *f = std::fopen(path, "r");
+            if (f == nullptr)
+            {
+                pcab::logf("[table] %s is missing - mode \"%s\" did not run here",
+                           path, MODE_NAMES[i]);
+                continue;
+            }
+            char line[4096];
+            while (std::fgets(line, sizeof line, f) != nullptr)
+            {
+                const size_t n = std::strlen(line);
+                if (n > 0 && line[n - 1] == '\n') line[n - 1] = '\0';
+                if (parse_result_line(line, rows[i], MODE_NAMES[i])) break;
+            }
+            std::fclose(f);
+            if (!rows[i].present)
+                pcab::logf("[table] %s carries no PCAB-RESULT line - mode \"%s\" produced no result",
+                           path, MODE_NAMES[i]);
+        }
+
+        pcab::logf("");
+        pcab::logf("================================================================================");
+        pcab::logf("PROCESSCONTEXT-AB  -  FIXED RESULT TABLE");
+        pcab::logf("================================================================================");
+        pcab::logf("                             GetCudaIndependent-  CreateCu-");
+        pcab::logf("MODE            VALID  LANE  DescriptorObject    Module        Res18");
+        pcab::logf("--------------------------------------------------------------------------------");
+        char cellA[40], cellB[40];
+        for (int i = 0; i < 4; ++i)
+        {
+            const Row &r = rows[i];
+            if (!r.present)
+            {
+                pcab::logf("%-15s NO     %-5s %-19s %-13s %s",
+                           MODE_NAMES[i], "-", "NOT RUN", "NOT RUN", "NOT RUN");
+                continue;
+            }
+            status_cell(r.desc_status, r.desc_calls, r.desc_probes, cellA);
+            status_cell(r.cu_status, r.cu_calls, r.cu_probes, cellB);
+            char fh[11];
+            if (r.feature == 0xDEADBEEFu) std::snprintf(fh, sizeof fh, "NOT-RUN");
+            else hex32(r.feature, fh);
+            pcab::logf("%-15s %-6s %-5s %-19s %-13s %s",
+                       MODE_NAMES[i],
+                       r.valid ? "YES" : "NO",
+                       r.valid ? (r.control_ok ? "OK" : "FAIL") : "-",
+                       cellA, cellB, fh);
+        }
+        pcab::logf("================================================================================");
+        pcab::logf("cells: <NvAPI_Status> <real-calls>/<null-arg-probes>");
+        pcab::logf("LANE OK = the two private calls returned NVAPI_OK and CreateFeature returned 1");
+        pcab::logf("");
+
+        // ---- the fixed interpretation ----
+        pcab::logf("VERDICT");
+
+        if (!rows[0].present)
+        {
+            pcab::logf("  NO VERDICT: mode \"single\" is absent from this directory. The reference");
+            pcab::logf("  arm is the only arm whose success makes any other arm readable, so");
+            pcab::logf("  without it nothing here can be interpreted.");
+            return 4;
+        }
+        if (!rows[0].valid)
+        {
+            pcab::logf("  E) INVALID. The SINGLE reference lane did not complete, so this run");
+            pcab::logf("     run does not reproduce NeuralScreen's working path and NO arm of it");
+            pcab::logf("     may be interpreted. Read context-single.log: the reference failed");
+            pcab::logf("     before the variable under test was ever introduced.");
+            return 2;
+        }
+        for (int i = 1; i < 4; ++i)
+        {
+            if (!rows[i].present || !rows[i].valid)
+            {
+                pcab::logf("  NO VERDICT: mode \"%s\" %s.", MODE_NAMES[i],
+                           rows[i].present ? "did not complete" : "is absent");
+                pcab::logf("  The four arms must all be valid before a difference can be "
+                           "attributed to");
+                pcab::logf("  the second-adapter variable. Nothing here is interpreted.");
+                if (rows[i].present && rows[i].reason[0] != '\0')
+                    pcab::logf("  (that arm reported reason=%s)", rows[i].reason);
+                return 4;
+            }
+        }
+
+        if (!rows[0].control_ok)
+        {
+            pcab::logf("  E) INVALID. The SINGLE reference lane is valid but did NOT succeed:");
+            pcab::logf("     the private CUDA-interop calls, or CreateFeature, did not reproduce");
+            pcab::logf("     NeuralScreen's working result. Do NOT interpret the other arms - a");
+            pcab::logf("     reference that does not reproduce cannot attribute anything to the");
+            pcab::logf("     variable under test.");
+            return 2;
+        }
+
+        if (!rows[1].control_ok)
+        {
+            pcab::logf("  A) SINGLE succeeded and DUAL-HELD failed.");
+            pcab::logf("     The SIMULTANEOUS PRESENCE of the second adapter (RTX 4070 Ti SUPER)");
+            pcab::logf("     device is sufficient to break the private CUDA-interop calls. No second");
+            pcab::logf("     queue, no descriptor heap and no NGX use on that device were needed.");
+            return 0;
+        }
+
+        if (!rows[2].control_ok)
+        {
+            pcab::logf("  B) SINGLE and DUAL-HELD succeeded, DUAL-ACTIVE failed.");
+            pcab::logf("     The device alone is not enough: an ACTIVE second DIRECT command queue");
+            pcab::logf("     and CBV/SRV/UAV descriptor heap is what triggers the failure. The");
+            pcab::logf("     trigger is active primary command/descriptor state on the second");
+            pcab::logf("     adapter, not multi-adapter presence.");
+            return 0;
+        }
+
+        if (!rows[3].control_ok)
+        {
+            pcab::logf("  C) SINGLE, DUAL-HELD and DUAL-ACTIVE succeeded, DUAL-RELEASED failed.");
+            pcab::logf("     Process-global NVIDIA state PERSISTS after the second D3D12 device is");
+            pcab::logf("     released: releasing the device is not a cure, so the residual state is");
+            pcab::logf("     created at device creation and outlives it. This is the shape that would");
+            pcab::logf("     explain the same failures surviving any amount of device teardown.");
+            return 0;
+        }
+
+        pcab::logf("  D) ALL FOUR ARMS SUCCEEDED.");
+        pcab::logf("     The multi-device explanation is EXONERATED. Neither the simultaneous");
+        pcab::logf("     presence of a second adapter, nor an active second DIRECT queue and");
+        pcab::logf("     descriptor heap, nor residual process-global state after releasing that");
+        pcab::logf("     device reproduces the failure. Whatever breaks these calls inside");
+        pcab::logf("     Cyberpunk is NOT the mere existence of the second device, and the");
+        pcab::logf("     difference must be sought in what the game does with it (bindings,");
+        pcab::logf("     resources, or the caller's own state) rather than in its presence.");
+        return 0;
+    }
+}
+
+// ============================================================================
+//  main
+// ============================================================================
+
+int main(int argc, char **argv)
+{
+    const char *mode = nullptr;
+    static wchar_t w_nr_dll[MAX_PATH * 2]{};
+    static wchar_t w_data[MAX_PATH * 2]{};
+    const wchar_t *nr_dll = nullptr;
+    const wchar_t *data_path = nullptr;
+
+    for (int i = 1; i < argc; ++i)
+    {
+        if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc)
+        {
+            mode = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "--nr-dll") == 0 && i + 1 < argc)
+        {
+            // CP_ACP, not CP_UTF8: these bytes came from the C runtime's narrow
+            // argv, which is the process ANSI codepage - the same bytes cmd.exe
+            // put on the command line. Decoding them as UTF-8 would mangle any
+            // non-ASCII path.
+            MultiByteToWideChar(CP_ACP, 0, argv[++i], -1, w_nr_dll, MAX_PATH * 2);
+            nr_dll = w_nr_dll;
+        }
+        else if (std::strcmp(argv[i], "--data-path") == 0 && i + 1 < argc)
+        {
+            MultiByteToWideChar(CP_ACP, 0, argv[++i], -1, w_data, MAX_PATH * 2);
+            data_path = w_data;
+        }
+        else
+        {
+            std::fprintf(stderr, "PROCESSCONTEXT-AB: unrecognised argument \"%s\"\n", argv[i]);
+            return 1;
+        }
+    }
+
+    if (mode == nullptr)
+    {
+        std::fprintf(stderr,
+                     "PROCESSCONTEXT-AB\n"
+                     "  --mode single|dual-held|dual-active|dual-released|table\n"
+                     "  --nr-dll <path to nvngx_dlssnr.dll>   (required for the four modes)\n"
+                     "  --data-path <NGX data path>           (optional; defaults to the exe dir)\n");
+        return 1;
+    }
+
+    if (std::strcmp(mode, "table") == 0) return run_table();
+
+    int mode_index = -1;
+    for (int i = 0; i < 4; ++i)
+        if (std::strcmp(mode, MODE_NAMES[i]) == 0) mode_index = i;
+    if (mode_index < 0)
+    {
+        std::fprintf(stderr, "PROCESSCONTEXT-AB: unknown --mode \"%s\"\n", mode);
+        return 1;
+    }
+    if (nr_dll == nullptr)
+    {
+        std::fprintf(stderr, "PROCESSCONTEXT-AB: --nr-dll is required for mode \"%s\"\n", mode);
+        return 1;
+    }
+
+    pcab::log_open(mode);
+
+    // ---- who we are ------------------------------------------------------
+    static wchar_t self[MAX_PATH * 2]{};
+    GetModuleFileNameW(nullptr, self, MAX_PATH * 2);
+
+    char self_a[MAX_PATH * 2] = "";
+    WideCharToMultiByte(CP_UTF8, 0, self, -1, self_a, sizeof self_a, nullptr, nullptr);
+    char self_name[MAX_PATH * 2] = "";
+    {
+        const char *b = std::strrchr(self_a, '\\');
+        std::snprintf(self_name, sizeof self_name, "%s", b ? b + 1 : self_a);
+    }
+    const bool gate_ok = (std::strstr(self_name, "nvngx.dll") != nullptr);
+
+    pcab::logf("================================================================================");
+    pcab::logf("PROCESSCONTEXT-AB  mode=%s", mode);
+    pcab::logf("================================================================================");
+    pcab::logf("[self]  exe    = %s", self_a);
+    pcab::logf("[self]  module = %s", self_name);
+    pcab::logf("[self]  cmdline= %ls", GetCommandLineW());
+    if (gate_ok)
+    {
+        pcab::logf("[self]  the module file name contains \"nvngx.dll\" - the DLSSNR snippet's "
+                   "caller check can be satisfied. (The MGPU add-on deploys the same way, under a "
+                   "file name carrying that prefix.)");
+    }
+    else
+    {
+        pcab::logf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        pcab::logf("!! WARNING: this module's file name does NOT contain \"nvngx.dll\".");
+        pcab::logf("!! The DLSSNR snippet inspects the module name of its caller and refuses a");
+        pcab::logf("!! caller that fails this check with 0xBAD00002 FAIL_PlatformError, for a");
+        pcab::logf("!! reason that has NOTHING to do with the hypothesis under test.");
+        pcab::logf("!! Run this diagnostic through RUN-CONTEXT-AB.cmd, which copies the exe to a");
+        pcab::logf("!! name carrying that prefix. Until then, this run's SINGLE arm cannot be");
+        pcab::logf("!! read as the reference and the whole diagnostic is INVALID (rule E).");
+        pcab::logf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    }
+    pcab::logf("");
+
+    // ---- the NR DLL hash gate, BEFORE the load ---------------------------
+    {
+        char hex[65] = "";
+        unsigned long size = 0;
+        if (!pcab::sha256_file(nr_dll, hex, &size))
+        {
+            pcab::logf("[gate]  the NR DLL could not be hashed - nothing is loaded");
+            pcab::logf("PCAB-RESULT mode=%s valid=NO reason=NR_DLL_UNREADABLE control=NOT_RUN",
+                       mode);
+            pcab::log_close();
+            return 1;
+        }
+        pcab::logf("[gate]  --nr-dll      = %ls", nr_dll);
+        pcab::logf("[gate]  NR DLL size   = %lu bytes", size);
+        pcab::logf("[gate]  NR DLL SHA256 = %s", hex);
+        pcab::logf("[gate]  required      = %s", EXPECTED_NR_SHA256);
+        if (!ieq_ascii(hex, EXPECTED_NR_SHA256))
+        {
+            pcab::logf("[gate]  MISMATCH. This is not the snippet build NeuralScreen v1.15.0 runs,");
+            pcab::logf("[gate]  so a comparison against it would be against a different runtime.");
+            pcab::logf("[gate]  ABORTING before the load. Nothing has been created or called.");
+            pcab::logf("PCAB-RESULT mode=%s valid=NO reason=NR_DLL_SHA256_MISMATCH control=NOT_RUN",
+                       mode);
+            pcab::log_close();
+            return 1;
+        }
+        pcab::logf("[gate]  hash matches the required snippet build.");
+    }
+    pcab::logf("");
+
+    // ---- adapters, by PCI device id --------------------------------------
+    IDXGIFactory1 *factory = nullptr;
+    IDXGIAdapter1 *ad_ti = nullptr;
+    IDXGIAdapter1 *ad_4070 = nullptr;
+    DXGI_ADAPTER_DESC1 d_ti{}, d_4070{};
+
+    {
+        const HRESULT fhr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+        if (FAILED(fhr) || factory == nullptr)
+        {
+            pcab::logf("[adapter] CreateDXGIFactory1 hr=0x%08X", (unsigned)fhr);
+            pcab::logf("PCAB-RESULT mode=%s valid=NO reason=NO_DXGI_FACTORY control=NOT_RUN", mode);
+            pcab::log_close();
+            return 1;
+        }
+
+        pcab::logf("[adapter] enumerating every adapter and identifying each one by PCI device id "
+                   "- no ordinal is ever selected");
+        for (unsigned i = 0;; ++i)
+        {
+            IDXGIAdapter1 *a = nullptr;
+            if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
+            if (a == nullptr) break;
+
+            DXGI_ADAPTER_DESC1 d{};
+            a->GetDesc1(&d);
+            const bool is_nv = (d.VendorId == VENDOR_NVIDIA);
+            const bool is_ti = is_nv && d.DeviceId == PCI_TI_SUPER;
+            const bool is_40 = is_nv && d.DeviceId == PCI_RTX_4070;
+
+            pcab::logf("[adapter] ordinal=%u vendor=0x%04X device=0x%04X luid=%08lX:%08lX "
+                       "%ls  <- %s", i, d.VendorId, d.DeviceId,
+                       (unsigned long)d.AdapterLuid.HighPart,
+                       (unsigned long)d.AdapterLuid.LowPart,
+                       d.Description,
+                       is_ti ? "RTX 4070 Ti SUPER (the SECOND adapter, the dual variable)"
+                             : is_40 ? "RTX 4070 (the CONTROL lane's adapter)"
+                                     : "not used by this diagnostic");
+
+            if (is_ti && ad_ti == nullptr) { ad_ti = a; d_ti = d; continue; }
+            if (is_40 && ad_4070 == nullptr) { ad_4070 = a; d_4070 = d; continue; }
+            a->Release();
+        }
+
+        if (ad_ti == nullptr || ad_4070 == nullptr)
+        {
+            pcab::logf("[adapter] required adapters not both present: RTX 4070 Ti SUPER "
+                       "(10DE:%04X) = %s, RTX 4070 (10DE:%04X) = %s",
+                       PCI_TI_SUPER, ad_ti ? "FOUND" : "MISSING",
+                       PCI_RTX_4070, ad_4070 ? "FOUND" : "MISSING");
+            pcab::logf("[adapter] this diagnostic needs BOTH; without the second adapter there is "
+                       "no dual arm to measure, and without the 4070 there is no reference lane.");
+            pcab::logf("PCAB-RESULT mode=%s valid=NO reason=REQUIRED_ADAPTER_MISSING control=NOT_RUN",
+                       mode);
+            pcab::log_close();
+            return 1;
+        }
+        pcab::logf("[adapter] RTX 4070 Ti SUPER -> luid=%08lX:%08lX (selected by device id, not "
+                   "by ordinal)",
+                   (unsigned long)d_ti.AdapterLuid.HighPart, (unsigned long)d_ti.AdapterLuid.LowPart);
+        pcab::logf("[adapter] RTX 4070        -> luid=%08lX:%08lX (selected by device id, not by "
+                   "ordinal)",
+                   (unsigned long)d_4070.AdapterLuid.HighPart,
+                   (unsigned long)d_4070.AdapterLuid.LowPart);
+    }
+    pcab::logf("");
+
+    // ---- the mode's second-adapter state, established BEFORE the lane -----
+    ID3D12Device *dev_ti = nullptr;
+    ID3D12CommandQueue *queue_ti = nullptr;
+    ID3D12DescriptorHeap *heap_ti = nullptr;
+    ID3D12Resource *res_ti = nullptr;
+    bool mode_state_ok = true;
+
+    if (mode_index == 0)
+    {
+        pcab::logf("[mode]  single: no second-adapter state is created at all. This process is "
+                   "the reference lane and nothing else.");
+    }
+    else
+    {
+        HRESULT hr = D3D12CreateDevice(ad_ti, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev_ti));
+        pcab::logf("[mode]  %s: D3D12CreateDevice(Ti SUPER, FL_11_0) hr=0x%08X device=%p",
+                   mode, (unsigned)hr, (void *)dev_ti);
+        if (FAILED(hr) || dev_ti == nullptr)
+        {
+            pcab::logf("[mode]  the second device could not be created - this arm cannot "
+                       "establish its variable, so this run answers nothing");
+            pcab::logf("PCAB-RESULT mode=%s valid=NO reason=SECOND_DEVICE_FAILED control=NOT_RUN",
+                       mode);
+            pcab::log_close();
+            return 1;
+        }
+        pcab::logf("[mode]  recording the second device: desc=\"%ls\" vendor=0x%04X device=0x%04X "
+                   "luid=%08lX:%08lX ptr=%p",
+                   d_ti.Description, d_ti.VendorId, d_ti.DeviceId,
+                   (unsigned long)d_ti.AdapterLuid.HighPart,
+                   (unsigned long)d_ti.AdapterLuid.LowPart, (void *)dev_ti);
+    }
+
+    if (mode_index == 2)      // dual-active
+    {
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+        qd.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+        HRESULT hr = dev_ti->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_ti));
+        pcab::logf("[mode]  dual-active: CreateCommandQueue(DIRECT) hr=0x%08X queue=%p",
+                   (unsigned)hr, (void *)queue_ti);
+        if (FAILED(hr)) mode_state_ok = false;
+
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 8;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        hr = dev_ti->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_ti));
+        pcab::logf("[mode]  dual-active: CreateDescriptorHeap(CBV_SRV_UAV x8, SHADER_VISIBLE) "
+                   "hr=0x%08X heap=%p", (unsigned)hr, (void *)heap_ti);
+        if (FAILED(hr)) mode_state_ok = false;
+
+        // One descriptor actually written, so the heap is not merely allocated.
+        if (heap_ti != nullptr)
+        {
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width = 256;
+            rd.Height = 1;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            const HRESULT rhr = dev_ti->CreateCommittedResource(
+                &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                IID_PPV_ARGS(&res_ti));
+            pcab::logf("[mode]  dual-active: CreateCommittedResource(256B buffer) hr=0x%08X "
+                       "resource=%p", (unsigned)rhr, (void *)res_ti);
+            if (SUCCEEDED(rhr) && res_ti != nullptr)
+            {
+                D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
+                cbv.BufferLocation = res_ti->GetGPUVirtualAddress();
+                cbv.SizeInBytes = 256;
+                D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_ti->GetCPUDescriptorHandleForHeapStart();
+                dev_ti->CreateConstantBufferView(&cbv, cpu);
+                pcab::logf("[mode]  dual-active: one CBV written at cpu.ptr=0x%llX - the heap is "
+                           "live, not merely allocated",
+                           (unsigned long long)cpu.ptr);
+            }
+            else
+            {
+                pcab::logf("[mode]  dual-active: the buffer could not be created; the heap is "
+                           "allocated but empty. The variable is weaker than intended - read this "
+                           "arm with that in mind.");
+            }
+        }
+        pcab::logf("[mode]  dual-active: second-adapter state %s",
+                   mode_state_ok ? "fully established" : "PARTIALLY established (see above)");
+    }
+    else if (mode_index == 3)  // dual-released
+    {
+        pcab::logf("[mode]  dual-released: releasing the second device now and holding NOTHING "
+                   "from it. Any effect that survives is process-global and outlives the device.");
+        const ULONG left = dev_ti->Release();
+        pcab::logf("[mode]  dual-released: Release() returned %lu remaining reference(s); "
+                   "device pointer %p is no longer used", (unsigned long)left, (void *)dev_ti);
+        dev_ti = nullptr;
+    }
+    pcab::logf("");
+
+    // An arm whose variable was not actually established cannot be read as a
+    // measurement of that variable, so it is reported as invalid rather than as
+    // a failure of the private calls.
+    if (!mode_state_ok)
+    {
+        pcab::logf("[mode]  the second-adapter state could not be fully established, so this arm "
+                   "did not create the variable it exists to test. Nothing is interpreted.");
+        pcab::logf("PCAB-RESULT mode=%s valid=NO reason=SECOND_STATE_NOT_ESTABLISHED "
+                   "control=NOT_RUN", mode);
+        pcab::log_close();
+        return 1;
+    }
+
+    // ---- the CONTROL lane: the RTX 4070 device ---------------------------
+    //
+    // NeuralScreen's order is reproduced here: create the device the lane will
+    // use, and only then initialise NVAPI and load the modules.
+    Lane lane;
+    {
+        const HRESULT hr = D3D12CreateDevice(ad_4070, D3D_FEATURE_LEVEL_11_0,
+                                            IID_PPV_ARGS(&lane.dev));
+        pcab::logf("[lane]  D3D12CreateDevice(RTX 4070, FL_11_0) hr=0x%08X device=%p",
+                   (unsigned)hr, (void *)lane.dev);
+        if (FAILED(hr) || lane.dev == nullptr)
+        {
+            pcab::logf("PCAB-RESULT mode=%s valid=NO reason=CONTROL_DEVICE_FAILED control=NOT_RUN",
+                       mode);
+            pcab::log_close();
+            return 1;
+        }
+        pcab::logf("[lane]  control device: desc=\"%ls\" vendor=0x%04X device=0x%04X "
+                   "luid=%08lX:%08lX ptr=%p",
+                   d_4070.Description, d_4070.VendorId, d_4070.DeviceId,
+                   (unsigned long)d_4070.AdapterLuid.HighPart,
+                   (unsigned long)d_4070.AdapterLuid.LowPart, (void *)lane.dev);
+
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        HRESULT qhr = lane.dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&lane.queue));
+        pcab::logf("[lane]  CreateCommandQueue(DIRECT) hr=0x%08X queue=%p",
+                   (unsigned)qhr, (void *)lane.queue);
+        if (FAILED(qhr)) { lane.queue = nullptr; }
+    }
+    if (lane.queue == nullptr)
+    {
+        pcab::logf("[lane]  the control lane has no DIRECT queue, so the recorded list could never "
+                   "be executed or drained. The lane cannot run.");
+        pcab::logf("PCAB-RESULT mode=%s valid=NO reason=CONTROL_QUEUE_FAILED control=NOT_RUN", mode);
+        pcab::log_close();
+        return 1;
+    }
+    pcab::logf("");
+
+    // ---- NVAPI: the observer first, then the documented ordering ----------
+    const bool observed = pcab::observe_install(mode);
+    pcab::logf("[nvapi] observation installed = %s", observed ? "yes" : "NO");
+    pcab::logf("");
+
+    if (!pcab::nv_load_and_initialize())
+    {
+        pcab::logf("[nvapi] NVAPI could not be brought up - this is an environment result, not a "
+                   "context result, and the run answers nothing");
+        pcab::logf("PCAB-RESULT mode=%s valid=NO reason=NVAPI_INIT_FAILED control=NOT_RUN", mode);
+        pcab::log_close();
+        return 1;
+    }
+
+    if (!pcab::arch_patch_install())
+    {
+        pcab::logf("[arch] the NeuralScreen-compatible architecture patch is NOT installed. The "
+                   "DLSSNR 310.8.0 runtime is expected to refuse the real Ada architecture, so a "
+                   "failure downstream of this would have a cause that is NOT the hypothesis "
+                   "under test.");
+    }
+    pcab::logf("");
+
+    // ---- the modules -----------------------------------------------------
+    const bool core_ok = pcab::ngx_load_core();
+    const bool snip_ok = core_ok ? pcab::ngx_load_snippet(nr_dll) : false;
+    pcab::logf("[ngx]   core=%p snippet=%p", (void *)pcab::ngx_core(),
+               (void *)pcab::ngx_snippet());
+    if (!core_ok || !snip_ok)
+    {
+        pcab::logf("PCAB-RESULT mode=%s valid=NO reason=NGX_MODULE_LOAD_FAILED control=NOT_RUN",
+                   mode);
+        pcab::log_close();
+        return 1;
+    }
+    pcab::logf("");
+
+    // ---- the lane itself -------------------------------------------------
+    HMODULE core = pcab::ngx_core();
+    HMODULE snip = pcab::ngx_snippet();
+
+    pcab::pf_init             p_init   = (pcab::pf_init)            pick(core, "NVSDK_NGX_D3D12_Init", "core");
+    pcab::pf_get_cap_params   p_caps   = (pcab::pf_get_cap_params)  pick(core, "NVSDK_NGX_D3D12_GetCapabilityParameters", "core");
+    pcab::pf_populate_params  p_pop    = (pcab::pf_populate_params) pick(snip, "NVSDK_NGX_D3D12_PopulateParameters_Impl", "snippet");
+    pcab::pf_init_ext         p_sinit  = (pcab::pf_init_ext)        pick(snip, "NVSDK_NGX_D3D12_Init_Ext", "snippet");
+    pcab::pf_create_feature   p_create = (pcab::pf_create_feature)  pick(snip, "NVSDK_NGX_D3D12_CreateFeature", "snippet");
+    pcab::logf("");
+
+    if (p_init == nullptr || p_caps == nullptr || p_sinit == nullptr || p_create == nullptr)
+    {
+        pcab::logf("[lane]  a required entry point is missing; the lane cannot run");
+        pcab::logf("PCAB-RESULT mode=%s valid=NO reason=NGX_ENTRYPOINT_MISSING control=NOT_RUN",
+                   mode);
+        pcab::log_close();
+        return 1;
+    }
+
+    // The data path: NeuralScreen passes its own; the directory holding this
+    // executable is the honest default when none is given.
+    wchar_t default_data[MAX_PATH * 2]{};
+    if (data_path == nullptr)
+    {
+        wcsncpy(default_data, self, MAX_PATH * 2 - 1);
+        wchar_t *slash = wcsrchr(default_data, L'\\');
+        if (slash != nullptr) *slash = L'\0';
+        data_path = default_data;
+    }
+    pcab::logf("[lane]  app_id=0 data_path=\"%ls\" sdk_version=NVSDK_NGX_Version_API", data_path);
+
+    // 1. the core session. Init is preferred because it is the form that carries
+    //    NVSDK_NGX_FeatureCommonInfo, which is the only place a log sink can be
+    //    handed in; its own sinks are left ENABLED.
+    {
+        NVSDK_NGX_FeatureCommonInfo common{};
+        lane.core_init = (unsigned)p_init(0ULL, data_path, lane.dev, &common,
+                                          NVSDK_NGX_Version_API);
+        pcab::logf("[lane]  core NVSDK_NGX_D3D12_Init -> 0x%08X (%s)",
+                   lane.core_init, ngx_result_name(lane.core_init));
+    }
+
+    // 2. the capability block.
+    {
+        NVSDK_NGX_Parameter *params = nullptr;
+        lane.caps = (unsigned)p_caps(&params);
+        lane.params = params;
+        pcab::logf("[lane]  GetCapabilityParameters -> 0x%08X (%s) params=%p",
+                   lane.caps, ngx_result_name(lane.caps), (void *)params);
+        if (lane.caps != 0x1u || params == nullptr)
+        {
+            pcab::logf("PCAB-RESULT mode=%s valid=NO reason=CAPABILITY_PARAMS_FAILED control=NOT_RUN",
+                       mode);
+            pcab::log_close();
+            return 1;
+        }
+    }
+
+    // 3. the snippet's own session, with the core's block.
+    lane.snip_init = (unsigned)p_sinit(0ULL, data_path, lane.dev, NVSDK_NGX_Version_API,
+                                       lane.params);
+    pcab::logf("[lane]  snippet NVSDK_NGX_D3D12_Init_Ext -> 0x%08X (%s)",
+               lane.snip_init, ngx_result_name(lane.snip_init));
+
+    // 4. let the snippet register its own parameter keys before anything is set.
+    if (p_pop != nullptr)
+    {
+        lane.populate = (unsigned)p_pop(lane.params);
+        pcab::logf("[lane]  PopulateParameters_Impl -> 0x%08X (%s)",
+                   lane.populate, ngx_result_name(lane.populate));
+    }
+    else
+    {
+        pcab::logf("[lane]  PopulateParameters_Impl is not exported; the block carries only what "
+                   "this program sets");
+    }
+
+    // 5. the size, under BOTH key namespaces. The namespaced pair is what this
+    //    particular feature actually reads; the generic pair is what the header
+    //    documents as required.
+    lane.params->Set(NVSDK_NGX_Parameter_Width, (unsigned)CTRL_W);
+    lane.params->Set(NVSDK_NGX_Parameter_Height, (unsigned)CTRL_H);
+    lane.params->Set("DLSSNR.Width", (unsigned)CTRL_W);
+    lane.params->Set("DLSSNR.Height", (unsigned)CTRL_H);
+    pcab::logf("[lane]  size set: Width/Height and DLSSNR.Width/DLSSNR.Height = %ux%u",
+               CTRL_W, CTRL_H);
+
+    // 6. a private allocator, an open command list, a fence and an event.
+    {
+        HRESULT hr = lane.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                     IID_PPV_ARGS(&lane.alloc));
+        pcab::logf("[lane]  CreateCommandAllocator hr=0x%08X", (unsigned)hr);
+        if (FAILED(hr)) { pcab::logf("PCAB-RESULT mode=%s valid=NO reason=ALLOCATOR_FAILED control=NOT_RUN", mode); pcab::log_close(); return 1; }
+
+        hr = lane.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, lane.alloc, nullptr,
+                                        IID_PPV_ARGS(&lane.list));
+        pcab::logf("[lane]  CreateCommandList hr=0x%08X (open and recording, never Reset)",
+                   (unsigned)hr);
+        if (FAILED(hr)) { pcab::logf("PCAB-RESULT mode=%s valid=NO reason=COMMAND_LIST_FAILED control=NOT_RUN", mode); pcab::log_close(); return 1; }
+
+        hr = lane.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&lane.fence));
+        pcab::logf("[lane]  CreateFence hr=0x%08X", (unsigned)hr);
+        if (FAILED(hr)) { pcab::logf("PCAB-RESULT mode=%s valid=NO reason=FENCE_FAILED control=NOT_RUN", mode); pcab::log_close(); return 1; }
+
+        lane.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        pcab::logf("[lane]  CreateEventW -> %p", lane.event);
+        if (lane.event == nullptr) { pcab::logf("PCAB-RESULT mode=%s valid=NO reason=EVENT_FAILED control=NOT_RUN", mode); pcab::log_close(); return 1; }
+    }
+
+    // 7. THE QUESTION. Everything above is plumbing.
+    {
+        LARGE_INTEGER f{}, t0{}, t1{};
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&t0);
+        NVSDK_NGX_Handle *handle = nullptr;
+        lane.reached_create = true;
+        lane.feature = (unsigned)p_create(lane.list, NVSDK_NGX_Feature_Reserved18,
+                                         lane.params, &handle);
+        QueryPerformanceCounter(&t1);
+        lane.handle = handle;
+        const double ms = (f.QuadPart > 0)
+            ? ((double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart) : 0.0;
+        pcab::logf("[lane]  CreateFeature(NVSDK_NGX_Feature_Reserved18) via the snippet -> "
+                   "0x%08X (%s) handle=%p %ux%u elapsed=%.0fms",
+                   lane.feature, ngx_result_name(lane.feature), (void *)handle,
+                   CTRL_W, CTRL_H, ms);
+    }
+    pcab::logf("");
+
+    // ---- the drain, exactly as MGPU does it ------------------------------
+    //
+    // Not branched on whether CreateFeature succeeded: executing a list NGX
+    // recorded nothing into is harmless, and executing one it half-recorded and
+    // then abandoned is the case that must not be skipped. Releasing a list whose
+    // work is still in flight is the documented device-lost pattern.
+    {
+        const HRESULT chr = lane.list->Close();
+        pcab::logf("[drain] Close hr=0x%08X", (unsigned)chr);
+        if (SUCCEEDED(chr))
+        {
+            ID3D12CommandList *const lists[1] = { lane.list };
+            lane.queue->ExecuteCommandLists(1, lists);
+            const HRESULT shr = lane.queue->Signal(lane.fence, 1);
+            pcab::logf("[drain] Signal(fence,1) hr=0x%08X", (unsigned)shr);
+            if (SUCCEEDED(shr))
+            {
+                lane.fence->SetEventOnCompletion(1, lane.event);
+                const DWORD wr = WaitForSingleObject(lane.event, 10000);
+                lane.drained = (wr == WAIT_OBJECT_0);
+                pcab::logf("[drain] fence wait -> 0x%08X (%s)", (unsigned)wr,
+                           lane.drained ? "drained" : "TIMED OUT - nothing will be released");
+            }
+        }
+        else
+        {
+            pcab::logf("[drain] the list was not in a closable state; nothing is released");
+        }
+    }
+    pcab::logf("");
+
+    // ---- the observation --------------------------------------------------
+    pcab::ObserveSummary obs = pcab::observe_summary();
+    pcab::logf("[cuda]  GetCudaIndependentDescriptorObject (0x0DDAC234): real_calls=%u "
+               "probes=%u real_status=%s",
+               obs.descriptor_calls > obs.descriptor_probes
+                   ? obs.descriptor_calls - obs.descriptor_probes : 0,
+               obs.descriptor_probes,
+               obs.real_descriptor_status == -12345 ? "NOT OBSERVED"
+                                                    : nv_status_name(obs.real_descriptor_status));
+    pcab::logf("[cuda]  CreateCuModule (0xAD1A677D): real_calls=%u probes=%u real_status=%s",
+               obs.cumodule_calls > obs.cumodule_probes
+                   ? obs.cumodule_calls - obs.cumodule_probes : 0,
+               obs.cumodule_probes,
+               obs.real_cumodule_status == -12345 ? "NOT OBSERVED"
+                                                  : nv_status_name(obs.real_cumodule_status));
+    if (obs.mismatch)
+        pcab::logf("[cuda]  the resolver returned a second, different pointer for at least one id; "
+                   "the new pointer was handed back unwrapped, so no caller saw substituted "
+                   "behaviour. The observation below may be partial - read the MISMATCH lines.");
+    if (obs.first_blob_size != 0)
+        pcab::logf("[cuda]  first CreateCuModule blob size = %llu bytes (the blob itself is never "
+                   "read)", obs.first_blob_size);
+    pcab::logf("");
+
+    // ---- the verdict for THIS arm ----------------------------------------
+    const bool desc_ok = (obs.real_descriptor_status == 0);
+    const bool cu_ok   = (obs.real_cumodule_status == 0);
+    const bool feat_ok = (lane.feature == 0x00000001u);
+    const bool control_ok = desc_ok && cu_ok && feat_ok;
+
+    pcab::logf("[result] this arm: descriptor=%s module=%s feature=%s  ->  LANE %s",
+               desc_ok ? "NVAPI_OK" : "not OK",
+               cu_ok ? "NVAPI_OK" : "not OK",
+               feat_ok ? "Success" : "not Success",
+               control_ok ? "OK" : "FAIL");
+
+    // ---- machine-readable line for --mode table --------------------------
+    //
+    // One line, fixed field order, signed decimal statuses so that the parser
+    // needs no sign handling, and NA where a call was not observed at all.
+    pcab::logf("PCAB-RESULT mode=%s valid=YES control=%s core_init=0x%08X caps=0x%08X "
+               "snip_init=0x%08X populate=0x%08X feature=0x%08X "
+               "desc_status=%s desc_calls=%u desc_probes=%u "
+               "cu_status=%s cu_calls=%u cu_probes=%u",
+               mode, control_ok ? "OK" : "FAIL",
+               lane.core_init, lane.caps, lane.snip_init, lane.populate, lane.feature,
+               obs.real_descriptor_status == -12345 ? "NA" : dec(obs.real_descriptor_status),
+               obs.descriptor_calls, obs.descriptor_probes,
+               obs.real_cumodule_status == -12345 ? "NA" : dec(obs.real_cumodule_status),
+               obs.cumodule_calls, obs.cumodule_probes);
+
+    pcab::observe_remove();
+    pcab::arch_patch_remove();
+
+    // Deliberately NOT released: the NGX session, the feature, the command list,
+    // the allocator, the fence and the capability block. MGPU keeps its NGX
+    // session for the process lifetime for the same reason - every crash observed
+    // in this project has been in teardown, none in use - and this process exits
+    // immediately, so the OS reclaims all of it. The second adapter's state is
+    // likewise left exactly as the arm defines it.
+    pcab::logf("[exit]  nothing is torn down on purpose: this process is one arm of a four-arm "
+               "experiment and exits now. mode=%s", mode);
+    pcab::log_close();
+    return 0;
+}

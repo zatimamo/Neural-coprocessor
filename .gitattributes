@@ -1,0 +1,10 @@
+# PROCESSCONTEXT-AB's launcher must reach the working tree with CRLF line
+# endings. cmd.exe is not reliable with a bare-LF batch file, and the artifact
+# the processcontext-ab workflow publishes is the file the user runs, taken from
+# the working tree - so `eol=crlf` is set here rather than left to core.autocrlf,
+# which a runner or a local clone may have configured either way.
+#
+# Scoped to batch files only. There is no catch-all rule here, so no other file's
+# line endings are affected by it.
+*.cmd text eol=crlf
+*.bat text eol=crlf
