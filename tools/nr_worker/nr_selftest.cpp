@@ -81,7 +81,7 @@ namespace
             { nr::Kind::FRAME_SUBMIT,   (std::uint32_t)sizeof(nr::FrameSubmit),    "FRAME_SUBMIT" },
             { nr::Kind::FRAME_COMPLETE, (std::uint32_t)sizeof(nr::FrameComplete),  "FRAME_COMPLETE" },
             { nr::Kind::SHUTDOWN,       (std::uint32_t)sizeof(nr::Shutdown),       "SHUTDOWN" },
-            { nr::Kind::ERROR,          (std::uint32_t)sizeof(nr::Error),          "ERROR" },
+            { nr::Kind::ERROR_MESSAGE,          (std::uint32_t)sizeof(nr::Error),          "ERROR" },
         };
         for (const Expect &e : expected)
         {

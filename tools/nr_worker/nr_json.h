@@ -21,6 +21,14 @@
 #include <utility>
 #include <vector>
 
+// Stats has members called min and max. <windows.h> defines both as macros
+// unless NOMINMAX is set, and the failure that produces is reported at the use
+// site rather than here. Every target in this project sets NOMINMAX; this turns
+// "someone added a target without it" into one clear sentence.
+#if defined(min) || defined(max)
+#error "nr_worker needs NOMINMAX: nr_json.h has members named min and max."
+#endif
+
 namespace nr
 {
     class Json

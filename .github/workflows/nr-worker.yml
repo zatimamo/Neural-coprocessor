@@ -331,9 +331,21 @@ jobs:
           P=tools/nr_worker/nr_proto.h
           for S in 'PROTO_MAGIC' 'PROTO_VERSION = 1u' 'std::uint32_t size;' 'std::uint32_t frame_id;' \
                    'HELLO = 1' 'WORKER_READY = 2' 'CONFIG = 3' 'FRAME_SUBMIT = 4' \
-                   'FRAME_COMPLETE = 5' 'SHUTDOWN = 6' 'ERROR = 7'; do
+                   'FRAME_COMPLETE = 5' 'SHUTDOWN = 6' 'ERROR_MESSAGE = 7'; do
             grep -qF -- "$S" "$P" || { echo "::error::'$S' is missing from the protocol"; exit 1; }
           done
+          # The PROTOCOL calls message 7 ERROR, and the C++ enumerator may not:
+          # <wingdi.h> defines ERROR as 0, so `Kind::ERROR` after <windows.h> is
+          # "illegal token on right side of '::'". Both halves are asserted, so a
+          # later rename back to the colliding identifier fails here.
+          grep -qF 'return "ERROR";' tools/nr_worker/nr_proto.cpp || {
+            echo "::error::message 7 is no longer named ERROR on the wire"; exit 1; }
+          H=$(grep -rnE 'Kind::ERROR([^_]|$)' tools/nr_worker || true)
+          [ -z "$H" ] || {
+            echo "$H"
+            echo "::error::an enumerator named ERROR is used: <windows.h> defines ERROR as a macro"
+            exit 1
+          }
           N=$(grep -c 'static_assert' "$P")
           [ "$N" -ge 10 ] || { echo "::error::only $N static_asserts pin the layout"; exit 1; }
           grep -qF '\\\\.\\pipe\\MGPU_NR_%lu' tools/nr_worker/nr_proto.cpp || {

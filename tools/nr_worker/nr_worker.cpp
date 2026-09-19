@@ -249,7 +249,12 @@ namespace
 
             if (kind == nr::Kind::SHUTDOWN)
             {
-                pcab::logf("[ipc]    SHUTDOWN requested (reason=%u)", inbound.reason);
+                // Re-read through the struct this kind actually IS. `inbound` is
+                // only a buffer - the largest message v1 defines - and its header
+                // has already proved that the real size is sizeof(Shutdown).
+                nr::Shutdown sd;
+                std::memcpy(&sd, &inbound, sizeof(sd));
+                pcab::logf("[ipc]    SHUTDOWN requested (reason=%u)", sd.reason);
                 break;
             }
             if (kind == nr::Kind::HELLO)
@@ -261,7 +266,7 @@ namespace
                 if (!nr::header_ok(hello.h, nr::Kind::HELLO))
                 {
                     nr::Error e;
-                    nr::init(e, nr::Kind::ERROR, inbound.h.frame_id);
+                    nr::init(e, nr::Kind::ERROR_MESSAGE, inbound.h.frame_id);
                     e.stage = 1;
                     e.hr = (std::int32_t)0x8007000DL;   // E_INVALIDARG
                     nr::set_text(e.text, nr::PROTO_TEXT_MAX, nr::header_problem(hello.h, nr::Kind::HELLO));
@@ -274,7 +279,7 @@ namespace
                 if (hello.client_protocol_version != nr::PROTO_VERSION)
                 {
                     nr::Error e;
-                    nr::init(e, nr::Kind::ERROR, inbound.h.frame_id);
+                    nr::init(e, nr::Kind::ERROR_MESSAGE, inbound.h.frame_id);
                     e.stage = 2;
                     e.hr = (std::int32_t)0x8007000DL;
                     nr::set_text(e.text, nr::PROTO_TEXT_MAX,
@@ -333,7 +338,7 @@ namespace
                 if (cfg.input_slot >= (std::uint32_t)nr::InputSlot::COUNT)
                 {
                     nr::Error e;
-                    nr::init(e, nr::Kind::ERROR, inbound.h.frame_id);
+                    nr::init(e, nr::Kind::ERROR_MESSAGE, inbound.h.frame_id);
                     e.stage = 3;
                     e.hr = (std::int32_t)0x8007000DL;
                     nr::set_text(e.text, nr::PROTO_TEXT_MAX, "CONFIG names an unknown input slot");
@@ -409,7 +414,7 @@ namespace
             // channel that will carry shared-memory handles is fatal.
             {
                 nr::Error e;
-                nr::init(e, nr::Kind::ERROR, inbound.h.frame_id);
+                nr::init(e, nr::Kind::ERROR_MESSAGE, inbound.h.frame_id);
                 e.stage = 4;
                 e.hr = (std::int32_t)0x8007000DL;
                 nr::set_text(e.text, nr::PROTO_TEXT_MAX,

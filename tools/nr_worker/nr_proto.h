@@ -65,7 +65,13 @@ namespace nr
         FRAME_SUBMIT = 4,
         FRAME_COMPLETE = 5,
         SHUTDOWN = 6,
-        ERROR = 7,
+        // NOT `ERROR`. <wingdi.h> defines ERROR as 0, so any translation unit
+        // that has seen <windows.h> cannot name an enumerator ERROR - the
+        // compiler reports "illegal token on right side of '::'" at the use site
+        // and not at the declaration, which is a confusing way to find out. The
+        // PROTOCOL name is still ERROR: the wire carries the value 7 and
+        // kind_name() prints "ERROR". Only the C++ identifier differs.
+        ERROR_MESSAGE = 7,
     };
 
     const char *kind_name(Kind k);

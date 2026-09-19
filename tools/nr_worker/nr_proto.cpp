@@ -19,7 +19,7 @@ namespace nr
         case Kind::FRAME_SUBMIT:  return "FRAME_SUBMIT";
         case Kind::FRAME_COMPLETE:return "FRAME_COMPLETE";
         case Kind::SHUTDOWN:      return "SHUTDOWN";
-        case Kind::ERROR:         return "ERROR";
+        case Kind::ERROR_MESSAGE: return "ERROR";
         }
         return "UNKNOWN";
     }
@@ -34,7 +34,7 @@ namespace nr
         case Kind::FRAME_SUBMIT:   return (std::uint32_t)sizeof(FrameSubmit);
         case Kind::FRAME_COMPLETE: return (std::uint32_t)sizeof(FrameComplete);
         case Kind::SHUTDOWN:       return (std::uint32_t)sizeof(Shutdown);
-        case Kind::ERROR:          return (std::uint32_t)sizeof(Error);
+        case Kind::ERROR_MESSAGE:  return (std::uint32_t)sizeof(Error);
         }
         return 0u;
     }
