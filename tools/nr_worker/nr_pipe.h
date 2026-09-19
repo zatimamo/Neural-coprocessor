@@ -30,7 +30,10 @@ namespace nr
         OK,
         TIMEOUT,
         DISCONNECTED,
-        ERROR,
+        // NOT `ERROR`: <wingdi.h> defines ERROR as 0, and this work is compiled
+        // once and linked into two programs. The printed name is still "ERROR";
+        // only the identifier differs.
+        IO_ERROR,
     };
 
     const char *io_result_name(IoResult r);
@@ -80,7 +83,7 @@ namespace nr
             if (size < sizeof(Header) || size > sizeof(T))
             {
                 err = "the peer declared a message size this build cannot hold";
-                return IoResult::ERROR;
+                return IoResult::IO_ERROR;
             }
             if (size == sizeof(Header)) return IoResult::OK;
             return read_exact(reinterpret_cast<unsigned char *>(&msg) + sizeof(Header),

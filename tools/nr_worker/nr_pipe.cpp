@@ -19,7 +19,7 @@ namespace nr
         case IoResult::OK:           return "OK";
         case IoResult::TIMEOUT:      return "TIMEOUT";
         case IoResult::DISCONNECTED: return "DISCONNECTED";
-        case IoResult::ERROR:        return "ERROR";
+        case IoResult::IO_ERROR:     return "ERROR";
         }
         return "?";
     }
@@ -205,7 +205,7 @@ namespace nr
                     char b[128];
                     std::snprintf(b, sizeof b, "ReadFile failed (%lu)", (unsigned long)e);
                     err = b;
-                    return IoResult::ERROR;
+                    return IoResult::IO_ERROR;
                 }
                 if (WaitForSingleObject((HANDLE)event_, slice) != WAIT_OBJECT_0)
                 {
@@ -227,7 +227,7 @@ namespace nr
                     std::snprintf(b, sizeof b, "GetOverlappedResult failed (%lu)",
                                   (unsigned long)g);
                     err = b;
-                    return IoResult::ERROR;
+                    return IoResult::IO_ERROR;
                 }
             }
             else
@@ -235,7 +235,7 @@ namespace nr
                 if (!GetOverlappedResult(h, &ov, &moved, TRUE))
                 {
                     err = "GetOverlappedResult failed for a completed read";
-                    return IoResult::ERROR;
+                    return IoResult::IO_ERROR;
                 }
             }
             if (moved == 0)
@@ -282,7 +282,7 @@ namespace nr
                     char b[128];
                     std::snprintf(b, sizeof b, "WriteFile failed (%lu)", (unsigned long)e);
                     err = b;
-                    return IoResult::ERROR;
+                    return IoResult::IO_ERROR;
                 }
                 if (WaitForSingleObject((HANDLE)event_, slice) != WAIT_OBJECT_0)
                 {
@@ -302,7 +302,7 @@ namespace nr
                 if (!GetOverlappedResult(h, &ov, &moved, TRUE))
                 {
                     err = "GetOverlappedResult failed for a completed write";
-                    return IoResult::ERROR;
+                    return IoResult::IO_ERROR;
                 }
             }
             sent += moved;

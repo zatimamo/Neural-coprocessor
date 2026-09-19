@@ -408,7 +408,10 @@ jobs:
           # failure can be read from the check run and not just from a log that
           # needs repository admin rights to download.
           set +e
-          cmake --build build-nr --config Release 2>&1 | tee build-nr.log
+          # -m -k: build all four projects in parallel AND keep going after a
+          # failure, so ONE run reports every compiler error instead of the first
+          # project to break.
+          cmake --build build-nr --config Release -- -m -k 2>&1 | tee build-nr.log
           RC=${PIPESTATUS[0]}
           if [ "$RC" -ne 0 ]; then
             echo "::error::the nr-worker build failed (exit $RC)"

@@ -43,7 +43,7 @@ namespace nr
     {
         switch (k)
         {
-        case SharedKind::NONE:                    return "NONE";
+        case SharedKind::NOT_CREATED:             return "NONE";
         case SharedKind::CROSS_ADAPTER_BUFFER:    return "CROSS_ADAPTER_BUFFER";
         case SharedKind::CROSS_ADAPTER_TEXTURE2D: return "CROSS_ADAPTER_TEXTURE2D";
         }
@@ -115,7 +115,7 @@ namespace nr
 
         struct SharedSurface
         {
-            SharedKind      kind = SharedKind::NONE;
+            SharedKind      kind = SharedKind::NOT_CREATED;
             ID3D12Heap     *heap_game = nullptr;
             ID3D12Resource *res_game = nullptr;
             ID3D12Resource *res_worker = nullptr;
@@ -523,7 +523,7 @@ namespace nr
         Side          game;
         Side          worker;
         IDXGIFactory1 *factory = nullptr;
-        SharedKind    kind = SharedKind::NONE;
+        SharedKind    kind = SharedKind::NOT_CREATED;
         unsigned      slot_count = 3;
         unsigned      width = 0, height = 0, dxgi_format = 0;
         unsigned      bytes_per_pixel = 4;
@@ -670,10 +670,9 @@ namespace nr
             }
             else
             {
-                if (probe.res_worker) probe.res_worker->Release();
-                if (probe.res_game) probe.res_game->Release();
-                if (probe.heap_game) probe.heap_game->Release();
-
+                // NOTE: the failed buffer probe is NOT released here. It is
+                // released once, below, on both paths - releasing it in this
+                // branch as well would call Release() twice on the same object.
                 SharedSurface probe2;
                 if (!create_shared(im->game, im->worker,
                                    SharedKind::CROSS_ADAPTER_TEXTURE2D, im->slice_pitch,
@@ -683,6 +682,11 @@ namespace nr
                     if (probe2.res_worker) probe2.res_worker->Release();
                     if (probe2.res_game) probe2.res_game->Release();
                     if (probe2.heap_game) probe2.heap_game->Release();
+                    if (probe2.handle) CloseHandle(probe2.handle);
+                    if (probe.res_worker) probe.res_worker->Release();
+                    if (probe.res_game) probe.res_game->Release();
+                    if (probe.heap_game) probe.heap_game->Release();
+                    if (probe.handle) CloseHandle(probe.handle);
                     err = "neither a cross-adapter buffer nor a cross-adapter texture could be "
                           "created; every HRESULT is recorded in the report";
                     return false;

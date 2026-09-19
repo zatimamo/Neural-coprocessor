@@ -73,7 +73,10 @@ namespace nr
 {
     enum class SharedKind
     {
-        NONE = 0,
+        // NOT `NONE`: this enum travels through files that include <windows.h>,
+        // which is a minefield of short upper-case macros. `ERROR` cost a build
+        // to learn that lesson; the shorter name is not worth repeating it.
+        NOT_CREATED = 0,
         CROSS_ADAPTER_BUFFER = 1,
         CROSS_ADAPTER_TEXTURE2D = 2,
     };
@@ -126,7 +129,7 @@ namespace nr
     struct TransportResult
     {
         bool         supported = false;
-        SharedKind   kind = SharedKind::NONE;
+        SharedKind   kind = SharedKind::NOT_CREATED;
         std::string  note;
 
         AdapterReport game;

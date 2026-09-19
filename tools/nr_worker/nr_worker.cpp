@@ -44,6 +44,10 @@
 #include "../processcontext_ab/nv.h"
 
 #include <windows.h>
+// WIN32_LEAN_AND_MEAN keeps <shellapi.h> out of <windows.h>, and
+// CommandLineToArgvW lives there. The command line is read as WIDE text because
+// the arguments name filesystem paths, so the narrow argv is not usable.
+#include <shellapi.h>
 
 #include <cstdio>
 #include <cstring>
