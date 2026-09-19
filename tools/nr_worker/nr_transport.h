@@ -150,6 +150,20 @@ namespace nr
         bool         exact_match = false;
         std::uint32_t verified_frames = 0;
 
+        //: The chain, joint by joint. A single final hash cannot say WHERE a round
+        //: trip went wrong, and "the bytes came back wrong" is not a diagnosis.
+        //: Each of these is the deterministic pattern's hash if that joint is
+        //: intact, and something else if it is not - so the first one that differs
+        //: names the leg that broke.
+        //:   seed_landed     the game's local COLOR texture, straight after the seed
+        //:   ingress_shared  the CROSS-ADAPTER buffer, as the game left it (leg 0)
+        //:   egress_shared   the CROSS-ADAPTER buffer, as the worker left it (leg 2)
+        //:   returned        the game's local OUTPUT texture (leg 3)
+        std::string  seed_landed_sha256;
+        std::string  ingress_shared_sha256;
+        std::string  egress_shared_sha256;
+        std::string  first_broken_joint;
+
         std::string  fence_mode;             // "gpu-queue" or "cpu"
         std::uint32_t slot_waits_gpu = 0;
         std::uint32_t slot_waits_cpu = 0;

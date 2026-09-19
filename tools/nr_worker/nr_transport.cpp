@@ -909,6 +909,92 @@ namespace nr
         fill_pattern(pattern, 0xC0FFEEu);
         res.seed_sha256 = sha256_memory(pattern.data(), pattern.size());
 
+        // ONE readback helper, used at every joint of the chain. When a round trip
+        // comes back wrong, the question is WHICH joint; a single final hash
+        // cannot answer it, and the first run of this benchmark reported a
+        // mismatch with no way to tell whether the seed, the ingress, the worker
+        // or the egress was responsible.
+        std::uint64_t readback_fence = 970000ull;
+        auto readback_sha = [&](ID3D12Resource *src, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT &fp,
+                                D3D12_RESOURCE_STATES &tracked, const char *what,
+                                std::string &out_hex) -> bool {
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC bd{};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = (UINT64)fp.Footprint.RowPitch * opt.height;
+            bd.Height = 1;
+            bd.DepthOrArraySize = 1;
+            bd.MipLevels = 1;
+            bd.Format = DXGI_FORMAT_UNKNOWN;
+            bd.SampleDesc.Count = 1;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+            ID3D12Resource *rb = nullptr;
+            HRESULT rhr = im->game.dev->CreateCommittedResource(
+                &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&rb));
+            if (FAILED(rhr) || rb == nullptr)
+            {
+                record(im->failures, what, rhr, "the readback buffer could not be created");
+                return false;
+            }
+
+            go(im->game.list, src, tracked, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION dst{};
+            D3D12_TEXTURE_COPY_LOCATION from{};
+            dst.pResource = rb;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint = fp;
+            from.pResource = src;
+            from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            from.SubresourceIndex = 0;
+            // A BUFFER source has no subresource and no texture footprint, so the
+            // two forms are distinguished by the resource dimension rather than by
+            // a flag the caller could get wrong.
+            D3D12_RESOURCE_DESC sdesc = src->GetDesc();
+            if (sdesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+            {
+                from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                from.PlacedFootprint = fp;
+                im->game.list->CopyTextureRegion(&dst, 0, 0, 0, &from, nullptr);
+            }
+            else
+            {
+                im->game.list->CopyTextureRegion(&dst, 0, 0, 0, &from, nullptr);
+            }
+
+            const std::uint64_t v = readback_fence++;
+            bool ok = false;
+            if (submit_and_signal(im->game, im->game.fence, v, im->failures))
+            {
+                im->game.fence->SetEventOnCompletion(v, im->game.fence_event);
+                WaitForSingleObject(im->game.fence_event, 30000);
+                void *mapped = nullptr;
+                const D3D12_RANGE rr{ 0, (SIZE_T)bd.Width };
+                if (SUCCEEDED(rb->Map(0, &rr, &mapped)) && mapped != nullptr)
+                {
+                    const unsigned char *srcp = (const unsigned char *)mapped;
+                    const unsigned src_row = opt.width * im->bytes_per_pixel;
+                    std::vector<unsigned char> got((std::size_t)im->payload);
+                    for (unsigned y = 0; y < opt.height; ++y)
+                    {
+                        std::memcpy(got.data() + (std::size_t)y * src_row,
+                                    srcp + (std::size_t)y * fp.Footprint.RowPitch, src_row);
+                    }
+                    rb->Unmap(0, nullptr);
+                    out_hex = sha256_memory(got.data(), got.size());
+                    ok = true;
+                }
+                else
+                {
+                    record(im->failures, what, E_FAIL, "the readback could not be mapped");
+                }
+            }
+            rb->Release();
+            return ok;
+        };
+
         const unsigned color_in = (unsigned)InputSlot::COLOR;
         const unsigned out_slot = (unsigned)InputSlot::OUTPUT;
         {
@@ -940,7 +1026,18 @@ namespace nr
             void *mapped = nullptr;
             const D3D12_RANGE read_range{ 0, 0 };
             hr = upload->Map(0, &read_range, &mapped);
-            if (SUCCEEDED(hr) && mapped != nullptr)
+            if (FAILED(hr) || mapped == nullptr)
+            {
+                // NOT silent. A seed that never landed makes every downstream
+                // measurement a measurement of zeros, and the first run of this
+                // benchmark reported a hash mismatch with no indication of where
+                // the chain broke. It is checked here so it cannot happen again.
+                record(im->failures, "seed/Map(UPLOAD)", FAILED(hr) ? hr : E_FAIL,
+                       "the seed pattern could not be written into the upload buffer");
+                upload->Release();
+                res.note = "the seed could not be uploaded, so the round trip has no known input";
+                return false;
+            }
             {
                 const unsigned src_row = opt.width * im->bytes_per_pixel;
                 unsigned char *dst = (unsigned char *)mapped;
@@ -976,6 +1073,18 @@ namespace nr
             im->game.fence->SetEventOnCompletion(1ull, im->game.fence_event);
             WaitForSingleObject(im->game.fence_event, 30000);
             upload->Release();
+
+            // JOINT 1: did the seed reach the game's own COLOR texture? If it did
+            // not, everything after this is a measurement of zeros - which is
+            // exactly what the first run of this benchmark produced.
+            readback_sha(col.local_game, col.game_footprint,
+                         st_local_game[index_of(0, color_in)],
+                         "stage/seed_landed", res.seed_landed_sha256);
+            if (!res.seed_landed_sha256.empty() && res.seed_landed_sha256 != res.seed_sha256)
+            {
+                res.first_broken_joint = "seed_landed: the seed copy did not reach the local "
+                                         "COLOR texture";
+            }
         }
 
         // ---- the frame loop -------------------------------------------------
@@ -1176,72 +1285,46 @@ namespace nr
             res.total = summarise(totals);
         }
 
-        // ---- verification: read the game's OUTPUT texture back and hash it ---
-        if (opt.verify)
+        // ---- verification: the chain, joint by joint -------------------------
+        // Read back the two shared buffers and the game's OUTPUT texture. The
+        // first joint whose hash is not the seed's names the leg that failed, so
+        // a mismatch is a diagnosis rather than a verdict.
+        if (opt.verify && frames > 0)
         {
             const unsigned last_slot = (frames - 1) % im->slot_count;
-            Slot &out = im->slots[last_slot][out_slot];
+            Slot &in_last = im->slots[last_slot][color_in];
+            Slot &out_last = im->slots[last_slot][out_slot];
 
-            D3D12_HEAP_PROPERTIES hp{};
-            hp.Type = D3D12_HEAP_TYPE_READBACK;
-            D3D12_RESOURCE_DESC bd{};
-            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            bd.Width = out.game_footprint.Footprint.RowPitch * opt.height;
-            bd.Height = 1;
-            bd.DepthOrArraySize = 1;
-            bd.MipLevels = 1;
-            bd.Format = DXGI_FORMAT_UNKNOWN;
-            bd.SampleDesc.Count = 1;
-            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            readback_sha(in_last.shared.res_game, in_last.shared.footprint,
+                         st_shared_game[index_of(last_slot, color_in)],
+                         "stage/ingress_shared", res.ingress_shared_sha256);
+            readback_sha(out_last.shared.res_game, out_last.shared.footprint,
+                         st_shared_game[index_of(last_slot, out_slot)],
+                         "stage/egress_shared", res.egress_shared_sha256);
+            readback_sha(out_last.local_game, out_last.game_footprint,
+                         st_local_game[index_of(last_slot, out_slot)],
+                         "stage/returned", res.returned_sha256);
+            res.exact_match = (res.returned_sha256 == res.seed_sha256);
+            res.verified_frames = 1;
 
-            ID3D12Resource *rb = nullptr;
-            HRESULT hr = im->game.dev->CreateCommittedResource(
-                &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                IID_PPV_ARGS(&rb));
-            if (SUCCEEDED(hr) && rb != nullptr)
+            if (res.first_broken_joint.empty())
             {
-                go(im->game.list, out.local_game, st_local_game[index_of(last_slot, out_slot)],
-                   D3D12_RESOURCE_STATE_COPY_SOURCE);
-                D3D12_TEXTURE_COPY_LOCATION dst{};
-                D3D12_TEXTURE_COPY_LOCATION src{};
-                dst.pResource = rb;
-                dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                dst.PlacedFootprint = out.game_footprint;
-                src.pResource = out.local_game;
-                src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                src.SubresourceIndex = 0;
-                im->game.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-
-                const std::uint64_t v = 950000ull;
-                if (submit_and_signal(im->game, im->game.fence, v, im->failures))
+                if (res.ingress_shared_sha256 != res.seed_sha256)
                 {
-                    im->game.fence->SetEventOnCompletion(v, im->game.fence_event);
-                    WaitForSingleObject(im->game.fence_event, 30000);
-                    void *mapped = nullptr;
-                    const D3D12_RANGE rr{ 0, (SIZE_T)bd.Width };
-                    if (SUCCEEDED(rb->Map(0, &rr, &mapped)) && mapped != nullptr)
-                    {
-                        const unsigned char *srcp = (const unsigned char *)mapped;
-                        const unsigned src_row = opt.width * im->bytes_per_pixel;
-                        std::vector<unsigned char> got((std::size_t)im->payload);
-                        for (unsigned y = 0; y < opt.height; ++y)
-                        {
-                            std::memcpy(got.data() + (std::size_t)y * src_row,
-                                        srcp + (std::size_t)y * out.game_footprint.Footprint.RowPitch,
-                                        src_row);
-                        }
-                        rb->Unmap(0, nullptr);
-                        res.returned_sha256 = sha256_memory(got.data(), got.size());
-                        res.exact_match = (res.returned_sha256 == res.seed_sha256);
-                        res.verified_frames = 1;
-                    }
+                    res.first_broken_joint = "ingress_shared: leg 0 (Ti SUPER local -> shared) did "
+                                             "not land";
                 }
-                rb->Release();
-            }
-            else
-            {
-                record(im->failures, "verify/CreateCommittedResource(READBACK)", hr,
-                       "the verification readback could not be created");
+                else if (res.egress_shared_sha256 != res.seed_sha256)
+                {
+                    res.first_broken_joint = "egress_shared: legs 1 and 2 (shared -> RTX 4070 "
+                                             "local -> shared) did not land - the worker side of "
+                                             "the round trip";
+                }
+                else if (res.returned_sha256 != res.seed_sha256)
+                {
+                    res.first_broken_joint = "returned: leg 3 (shared -> Ti SUPER local) did not "
+                                             "land";
+                }
             }
         }
 

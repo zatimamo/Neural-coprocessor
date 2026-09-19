@@ -286,6 +286,17 @@ int main(int argc, char **argv)
         report.kv("exact_match", res.exact_match);
         report.kv("verified_frames", (std::uint64_t)res.verified_frames);
 
+        // The chain, joint by joint. `first_broken_joint` is empty when the round
+        // trip is intact, and names the leg that failed when it is not.
+        report.key("chain_sha256");
+        report.begin_object();
+        report.kv("seed_landed_local_color", res.seed_landed_sha256.c_str());
+        report.kv("ingress_shared", res.ingress_shared_sha256.c_str());
+        report.kv("egress_shared", res.egress_shared_sha256.c_str());
+        report.kv("returned_local_output", res.returned_sha256.c_str());
+        report.end_object();
+        report.kv("first_broken_joint", res.first_broken_joint.c_str());
+
         report.key("untimed_slot_checks");
         report.begin_array();
         for (std::size_t i = 0; i < res.untimed_slot_checks.size(); ++i)
@@ -340,6 +351,12 @@ int main(int argc, char **argv)
                     res.fence_mode.empty() ? "unknown" : res.fence_mode.c_str(),
                     res.frames_completed, res.frames_requested,
                     opt.verify ? (res.exact_match ? "YES" : "NO") : "(not verified)");
+        if (opt.verify && !res.first_broken_joint.empty())
+        {
+            std::printf("  seed     =%s\n  returned =%s\n", res.seed_sha256.c_str(),
+                        res.returned_sha256.c_str());
+            std::printf("  FIRST BROKEN JOINT: %s\n", res.first_broken_joint.c_str());
+        }
         for (std::size_t i = 0; i < res.unsupported.size(); ++i)
         {
             std::printf("  UNSUPPORTED %s hr=%s  %s\n", res.unsupported[i].stage.c_str(),
