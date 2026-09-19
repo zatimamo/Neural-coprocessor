@@ -92,6 +92,10 @@ namespace
     std::atomic<int> g_cu_probe_status{STATUS_UNSET};
     std::atomic<bool> g_resolver_null{false};
 
+    // The FIRST REAL CreateCuModule blob size, published by the same
+    // compare-and-swap-out-of-zero discipline, so a later call cannot change it.
+    std::atomic<unsigned long long> g_first_blob_size{0};
+
     void record_real(std::atomic<int> &slot, int status)
     {
         int expected = STATUS_UNSET;
