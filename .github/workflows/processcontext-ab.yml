@@ -242,8 +242,27 @@ jobs:
           grep -qF 'the TRAMPOLINE, not the patched entry' "$F" || note "the original pointer is not taken from MinHook's trampoline"
           # A probe is not a result, and that distinction must be in the code.
           grep -qF 'null-argument validation probe; ' "$F" || note "the probe classification wording is missing"
-          grep -qF 'real_descriptor_status = (s.descriptor_calls > s.descriptor_probes)' "$F" || note "a probe status can be reported as the real call's result"
-          grep -qF 'real_cumodule_status   = (s.cumodule_calls > s.cumodule_probes)' "$F" || note "a probe status can be reported as the real call's result"
+          # A probe is not a result, and the separation must be STRUCTURAL:
+          # separate storage per kind, with exactly one writer each, so no
+          # arithmetic can move a probe's status into a real result.
+          N=$(grep -cE 'std::atomic<int> g_(desc|cu)_(real|probe)_status' "$F" || true)
+          [ "$N" -eq 4 ] || { note "expected 4 separate real/probe status slots, found $N"; }
+          for S in 'record_real(g_desc_real_status' 'record_real(g_cu_real_status' \
+                   'record_probe(g_desc_probe_status' 'record_probe(g_cu_probe_status'; do
+            C=$(grep -cF "$S" "$F" || true)
+            [ "$C" -eq 1 ] || { note "expected exactly 1 '$S', found $C"; }
+          done
+          grep -qF 'read_status(g_desc_real_status)' "$F" || note "the summary does not read the real descriptor slot"
+          grep -qF 'read_status(g_cu_real_status)' "$F" || note "the summary does not read the real cumodule slot"
+          # The old shape, which reported a probe's status as a real one, must be gone.
+          H=$(hits 'descriptor_calls > s\.descriptor_probes|cumodule_calls > s\.cumodule_probes')
+          [ -z "$H" ] || { echo "$H"; note "the superseded probe-count arithmetic is back"; }
+
+          # A null resolver answer is returned UNCHANGED, for both ids.
+          N=$(grep -cF 'if (answer == nullptr)' "$F" || true)
+          [ "$N" -eq 2 ] || { note "expected 2 null-answer guards on the resolver, found $N"; }
+          N=$(grep -cF 'No wrapper is manufactured for' "$F" || true)
+          [ "$N" -eq 2 ] || { note "expected 2 'no wrapper is manufactured' statements, found $N"; }
 
           [ "$FAIL" -eq 0 ] || exit 1
           echo "pass-through verified: two unconditional calls, verbatim statuses, no output write, no blob read, no retry."
@@ -269,8 +288,16 @@ jobs:
             echo "::error::the accepted architecture value has drifted"; exit 1; }
           # NVIDIA's own code still serves the call: the detour calls the
           # original first and rewrites only the returned value.
-          grep -qF 'const int r = g_arch_original(hPhysicalGpu, pInfo);' "$F" || {
+          grep -qF 'const int r = g_arch_original(gpu, pInfo);' "$F" || {
             echo "::error::the architecture detour does not call the original"; exit 1; }
+          # Per-GPU: a cache filled before the hook, one spoof target, and every
+          # other GPU served its OWN cached real value.
+          grep -qF 'e.spoof = (g_arch_target_set && e.raw_pci != 0 && e.raw_pci == g_arch_target_raw);' "$F" || {
+            echo "::error::the spoof target is not selected by exact raw PCI identity"; exit 1; }
+          grep -qF 'if (!e->spoof)' "$F" || {
+            echo "::error::the detour has no non-target branch, so it spoofs indiscriminately"; exit 1; }
+          grep -qF 'EVERY OTHER GPU GETS ITS OWN CACHED REAL RESULT' "$F" || {
+            echo "::error::the non-target path does not state that it returns the cached real value"; exit 1; }
           # The NR DLL is hashed through CNG, not a hand-rolled digest.
           grep -q 'BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM' "$F" || {
             echo "::error::the SHA256 is not computed with CNG"; exit 1; }
@@ -442,6 +469,130 @@ jobs:
           echo "structural checks passed."
 
       # ---------------------------------------------------------------------
+      # THE SOURCE-CONTRACT GATE.
+      #
+      # The stale-experiment problem this exists to prevent: the tree once
+      # carried a PROCESSCONTEXT whose control lane did not reproduce
+      # NeuralScreen at all - app id 0, the core's shared capability block
+      # instead of a private AllocateParameters block, the architecture patch
+      # installed BEFORE core Init, a generic Width/Height the reference does
+      # not set, and a version stamp that no driver accepts. Every one of those
+      # is invisible in a build that succeeds, and the run they produce still
+      # looks like a result.
+      #
+      # So the corrected reference contract is asserted HERE, on the source, and
+      # the build fails if any of it is missing or if any superseded construct
+      # reappears.
+      # ---------------------------------------------------------------------
+      - name: Verify the corrected reference contract is in the source
+        shell: bash
+        run: |
+          D=tools/processcontext_ab
+          M="$D/main.cpp"
+          FAIL=0
+          note() { echo "::error::$1"; FAIL=1; }
+
+          # ---- REQUIRED: the ApplicationId, at both entry points ----------
+          grep -qF '0x1000000ULL' "$D/nv.h" || note "the NeuralScreen ApplicationId 0x1000000ULL is not in nv.h"
+          grep -qF 'NS_APPLICATION_ID = 0x1000000ULL' "$D/nv.h" || note "the app id is not a named constant"
+          grep -qF 'p_init(pcab::NS_APPLICATION_ID,' "$M" || \
+            note "the core Init is not passed the NeuralScreen ApplicationId"
+          grep -qF 'p_sinit(pcab::NS_APPLICATION_ID,' "$M" || \
+            note "the snippet Init_Ext is not passed the NeuralScreen ApplicationId"
+
+          # ---- REQUIRED: the private parameter block ----------------------
+          grep -qF 'NVSDK_NGX_D3D12_AllocateParameters' "$M" || note "AllocateParameters is not resolved"
+          grep -qF 'p_alloc(&params)' "$M" || note "AllocateParameters is not called"
+          grep -qF 'params->Reset();' "$M" || note "params->Reset() is not called"
+
+          # ---- REQUIRED: the exact 640x360 creation contract -------------
+          for S in CreationNodeMask VisibilityNodeMask \
+                   'DLSSNR.Width' 'DLSSNR.Height' \
+                   'DLSSNR.InputWidth' 'DLSSNR.InputHeight' \
+                   'DLSSNR.OutputWidth' 'DLSSNR.OutputHeight' \
+                   'DLSSNR.Output.Width' 'DLSSNR.Output.Height' \
+                   'DLSSNR.Upscaling' 'DLSSNR.Scale' 'DLSSNR.ScalingRatio' \
+                   'DLSSNR.Hint.Render.Preset' \
+                   'NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags'; do
+            grep -qF -- "$S" "$M" || note "the creation contract is missing $S"
+          done
+          # The generic pair is NOT part of NeuralScreen's contract, so setting
+          # it would make this lane differ from the thing it reproduces.
+          H=$(grep -nF -- 'NVSDK_NGX_Parameter_Width' "$M" || true)
+          [ -z "$H" ] || { echo "$H"; note "a generic NVSDK_NGX_Parameter_Width is set; NeuralScreen does not set it"; }
+
+          # ---- REQUIRED: the FeatureCommonInfo shape ---------------------
+          grep -qF 'LoggingCallback = &ngx_log_discard;' "$M" || note "no discard logging callback"
+          grep -qF 'MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_OFF;' "$M" || note "MinimumLoggingLevel is not OFF"
+          grep -qF 'DisableOtherLoggingSinks = true;' "$M" || note "DisableOtherLoggingSinks is not true"
+
+          # ---- REQUIRED: the V2 version expression, not the old literal ---
+          grep -qF 'sizeof(NV_GPU_ARCH_INFO) | (2u << 16)' "$D/nv.h" || \
+            note "the NV_GPU_ARCH_INFO V2 stamp is not sizeof(struct) | (2u << 16)"
+          grep -qF 'sizeof(NV_GPU_ARCH_INFO) | (1u << 16)' "$D/nv.h" || \
+            note "the NeuralScreen V1 fallback stamp is missing"
+          H=$(grep -rnF '2000u' "$D" || true)
+          [ -z "$H" ] || { echo "$H"; note "the superseded version literal is back"; }
+
+          # ---- REQUIRED: the order, asserted by line position -------------
+          line_of() { grep -nF -- "$2" "$1" | head -n1 | cut -d: -f1; }
+          L_DEV=$(line_of "$M"    'D3D12CreateDevice(ad_4070')
+          L_NVAPI=$(line_of "$M"  'pcab::nv_load_and_initialize()')
+          L_CORE=$(line_of "$M"   'pcab::ngx_load_core()')
+          L_INIT=$(line_of "$M"   'lane.core_init = (unsigned)p_init(pcab::NS_APPLICATION_ID,')
+          L_ALLOC=$(line_of "$M"  'lane.alloc = (unsigned)p_alloc(&params)')
+          L_CACHE=$(line_of "$M"  'pcab::arch_cache_real()')
+          L_PATCH=$(line_of "$M"  'pcab::arch_patch_install()')
+          L_SNIP=$(line_of "$M"   'pcab::ngx_load_snippet(nr_dll)')
+          L_SINIT=$(line_of "$M"  'lane.snip_init = (unsigned)p_sinit(pcab::NS_APPLICATION_ID,')
+          L_RESET=$(line_of "$M"  'apply_reference_contract(lane.params)')
+          L_CREATE=$(line_of "$M" 'p_create(lane.list, NVSDK_NGX_Feature_Reserved18')
+          for V in L_DEV L_NVAPI L_CORE L_INIT L_ALLOC L_CACHE L_PATCH L_SNIP L_SINIT L_RESET L_CREATE; do
+            eval "v=\$$V"
+            [ -n "$v" ] || note "the required step $V was not found in main.cpp"
+          done
+          order_ok() { [ -n "$1" ] && [ -n "$2" ] && [ "$1" -lt "$2" ]; }
+          order_ok "$L_DEV" "$L_NVAPI"     || note "the RTX 4070 device is not created before NvAPI_Initialize"
+          order_ok "$L_NVAPI" "$L_CORE"    || note "NvAPI_Initialize is not before the NGX core load"
+          order_ok "$L_CORE" "$L_INIT"     || note "the NGX core is not loaded before core Init"
+          order_ok "$L_INIT" "$L_ALLOC"    || note "core Init is not before AllocateParameters"
+          order_ok "$L_ALLOC" "$L_CACHE"   || note "the architecture cache is not after AllocateParameters"
+          order_ok "$L_CACHE" "$L_PATCH"   || note "the real architectures are not cached before the hook"
+          order_ok "$L_PATCH" "$L_SNIP"    || note "the architecture patch is not installed before the snippet load"
+          order_ok "$L_SNIP" "$L_SINIT"    || note "the snippet is not loaded before snippet Init_Ext"
+          order_ok "$L_SINIT" "$L_RESET"   || note "Reset is not after snippet Init_Ext"
+          order_ok "$L_RESET" "$L_CREATE"  || note "CreateFeature is not after the creation contract"
+          # The one the stale revision got wrong, asserted on its own so a
+          # failure names exactly which rule broke.
+          order_ok "$L_INIT" "$L_PATCH"    || note "THE ARCHITECTURE PATCH IS INSTALLED BEFORE CORE INIT"
+          echo "order: device=$L_DEV nvapi=$L_NVAPI core=$L_CORE init=$L_INIT alloc=$L_ALLOC cache=$L_CACHE patch=$L_PATCH snippet=$L_SNIP sinit=$L_SINIT reset=$L_RESET create=$L_CREATE"
+
+          # ---- REJECTED: the superseded constructs ------------------------
+          for S in 'p_init(0ULL' 'p_sinit(0ULL' 'GetCapabilityParameters'; do
+            H=$(grep -rnF -- "$S" "$D" || true)
+            [ -z "$H" ] || { echo "$H"; note "the superseded construct '$S' is present"; }
+          done
+
+          # ---- REQUIRED: the eight SINGLE validity conditions -------------
+          for S in 'lane.core_init == 0x00000001u' 'lane.alloc == 0x00000001u' \
+                   'lane.snip_init == 0x00000001u' 'obs.real_descriptor_status == 0' \
+                   'obs.real_cumodule_status == 0' 'obs.first_blob_size == 3944768ULL' \
+                   'lane.feature == 0x00000001u' 'lane.handle != nullptr'; do
+            grep -qF -- "$S" "$M" || note "the SINGLE validity gate is missing $S"
+          done
+
+          # ---- REQUIRED: the dual-arm boundaries -------------------------
+          grep -qF 'valid=NO reason=SECOND_DEVICE_STILL_REFERENCED' "$M" || \
+            note "dual-released does not fail when the device is still referenced"
+          H=$(grep -nF 'CreateCommittedResource' "$M" || true)
+          [ -z "$H" ] || { echo "$H"; note "dual-active creates a committed resource; it must hold device+queue+heap only"; }
+          H=$(grep -nF 'CreateConstantBufferView' "$M" || true)
+          [ -z "$H" ] || { echo "$H"; note "dual-active writes a CBV; it must hold device+queue+heap only"; }
+
+          [ "$FAIL" -eq 0 ] || exit 1
+          echo "reference contract verified: app id, private block, order, V2 stamp, per-GPU spoof target and the eight SINGLE conditions are all present, and every superseded construct is absent."
+
+      # ---------------------------------------------------------------------
       # 7. Dependencies, pinned. Same SHAs as every other workflow in this repo.
       # ---------------------------------------------------------------------
       - name: Fetch NVIDIA NGX headers at pinned SHA
@@ -519,7 +670,10 @@ jobs:
           # emits, so a compile-out shows up here.
           for S in PROCESSCONTEXT-AB PCAB-RESULT GetCudaIndependentDescriptorObject \
                    CreateCuModule NVSDK_NGX_Feature_Reserved18 nvngx.dll \
-                   'context-%s.log' 'dual-released'; do
+                   'context-%s.log' 'dual-released' \
+                   NVSDK_NGX_D3D12_AllocateParameters CreationNodeMask VisibilityNodeMask \
+                   'DLSSNR.InputWidth' 'DLSSNR.OutputWidth' 'DLSSNR.ScalingRatio' \
+                   'DLSSNR.Hint.Render.Preset' 'SECOND_DEVICE_STILL_REFERENCED'; do
             if ! grep -qa -- "$S" "$EXE"; then
               echo "::error::'$S' is not present in $EXE - the diagnostic was compiled out"
               exit 1
