@@ -49,9 +49,11 @@ NOTHING IS DEPLOYED
     The game's add-on is untouched by this node, and Cyberpunk is never launched.
 """
 
+import ctypes
 import os
 import shutil
 import subprocess
+import threading
 import time
 
 import experiments
@@ -61,6 +63,73 @@ from github_actions import sha256_file
 
 class ProcessContextError(Exception):
     pass
+
+
+#: holder-ti: PROCESS A of the split-process experiment. A fifth MODE, not a
+#: fifth arm - it never runs the NR lane and is not read by --mode table.
+HOLDER_MODE = "holder-ti"
+HOLDER_READY = "HOLDER_READY"
+HOLDER_FAILED = "HOLDER_FAILED"
+
+#: The holder runs under its own prefixed copy so it cannot collide with the
+#: copy the launcher makes for PROCESS B while both are alive.
+HOLDER_EXE_NAME = "nvngx.dll_pcab_holder.exe"
+
+
+# ---------------------------------------------------------------------------
+# The named stop event
+# ---------------------------------------------------------------------------
+# The holder waits on a NAMED EVENT that the parent owns. It is created here,
+# before the holder starts, so there is exactly one owner and a stale event from
+# an earlier run cannot be inherited by a later one.
+#
+# If the event cannot be created at all the holder still stops: closing its
+# stdin is the second signal, and it is the one that matters if this process
+# dies. That is why a failure here is logged and not raised.
+
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True) if os.name == "nt" else None
+if _kernel32 is not None:
+    _kernel32.CreateEventW.restype = ctypes.c_void_p
+    _kernel32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_wchar_p]
+    _kernel32.OpenEventW.restype = ctypes.c_void_p
+    _kernel32.OpenEventW.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_wchar_p]
+    _kernel32.SetEvent.restype = ctypes.c_int
+    _kernel32.SetEvent.argtypes = [ctypes.c_void_p]
+    _kernel32.CloseHandle.restype = ctypes.c_int
+    _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+_EVENTS = {}
+
+
+def holder_event_create(name):
+    if _kernel32 is None:
+        return None
+    handle = _kernel32.CreateEventW(None, 1, 0, name)   # manual reset, initially clear
+    if not handle:
+        return None
+    _EVENTS[name] = handle
+    return handle
+
+
+def holder_event_signal(name):
+    if _kernel32 is None or not name:
+        return False
+    handle = _EVENTS.get(name)
+    if not handle:
+        handle = _kernel32.OpenEventW(0x0002, 0, name)   # EVENT_MODIFY_STATE
+        if not handle:
+            return False
+        _EVENTS[name] = handle
+    return bool(_kernel32.SetEvent(handle))
+
+
+def holder_event_close(name):
+    if _kernel32 is None or not name:
+        return
+    handle = _EVENTS.pop(name, None)
+    if handle:
+        _kernel32.CloseHandle(handle)
 
 
 #: The artifact's own launcher. AutoLab calls THIS rather than re-implementing
@@ -86,6 +155,10 @@ class ProcessContextRunner(object):
         # caller and again in stage().
         self.ns_nr_dll = (cfg["paths"].get("neuralscreen_nr_dll") or "").replace("/", os.sep)
         self.required_nr_sha = cfg["required_nr_dll_sha256"].lower()
+        # How long to wait for the holder to establish its state, and how long to
+        # wait for it to stop at each graded step.
+        self.holder_ready_timeout = int(cfg["timeouts"].get("holder_ready_seconds", 60))
+        self.holder_stop_timeout = int(cfg["timeouts"].get("holder_stop_seconds", 15))
 
     # -------------------------------------------------------------- staging
     def stage(self, artifact_meta, staging_dir):
@@ -289,6 +362,233 @@ class ProcessContextRunner(object):
         ]
         return result
 
+    # ------------------------------------------------------- split-process
+    def _make_holder_copy(self, staged):
+        """A prefixed copy of the exe for the holder to run under.
+
+        The holder never loads the snippet, so the caller gate does not apply to
+        it - but it is run under a name carrying the prefix anyway so its log is
+        not cluttered by a warning about a gate that cannot affect it, and under a
+        name of its own so it cannot collide with the copy the launcher makes for
+        PROCESS B while both are alive.
+        """
+        src = staged["exe"]
+        dest = os.path.join(staged["dir"], HOLDER_EXE_NAME)
+        shutil.copy2(src, dest)
+        return dest
+
+    def start_holder(self, staged, event_name, on_line=None):
+        """PROCESS A: launch holder-ti, wait for HOLDER_READY, prove it is alive.
+
+        The holder is started with stdin as a PIPE we own, so that closing that
+        pipe is a stop signal the holder honours even if everything else fails -
+        and so that a holder can never outlive this process.
+        """
+        exe = self._make_holder_copy(staged)
+        cmd = [exe, "--mode", HOLDER_MODE, "--holder-event", event_name,
+               "--holder-seconds", "0"]         # 0 = no cap; the parent is the control
+        self.log("experiment SPLITPROCESS_ISOLATION: PROCESS A - launching holder-ti")
+        self.log("experiment SPLITPROCESS_ISOLATION:   %s" % " ".join(cmd))
+        proc = subprocess.Popen(cmd, cwd=staged["dir"], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, errors="replace", bufsize=1)
+        holder = {"process": proc, "exe": exe, "event_name": event_name,
+                  "ready": False, "failed": False, "lines": [], "returncode": None,
+                  "stop_reason": None}
+
+        # Drain stdout on a thread: the holder may outlive this read loop, and a
+        # full pipe would block it.
+        def _drain():
+            try:
+                for line in proc.stdout:
+                    line = line.rstrip("\r\n")
+                    if not line:
+                        continue
+                    holder["lines"].append(line)
+                    if on_line:
+                        on_line(line)
+                    if line.strip() == HOLDER_READY:
+                        holder["ready"] = True
+                    if line.strip() == HOLDER_FAILED:
+                        holder["failed"] = True
+            except Exception:                     # noqa: BLE001 - the pipe closed
+                pass
+
+        thread = threading.Thread(target=_drain, daemon=True)
+        thread.start()
+        holder["thread"] = thread
+
+        deadline = time.time() + self.holder_ready_timeout
+        while time.time() < deadline:
+            if holder["ready"]:
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.1)
+
+        alive = proc.poll() is None
+        holder["alive_after_ready"] = alive
+        if holder["ready"] and alive:
+            self.log("experiment SPLITPROCESS_ISOLATION: HOLDER_READY seen, and the holder "
+                     "process is ALIVE (pid %s)" % proc.pid)
+            return holder
+        code = proc.poll()
+        self.log("experiment SPLITPROCESS_ISOLATION: the holder did NOT reach HOLDER_READY "
+                 "(ready=%s, alive=%s, exit=%s)"
+                 % (holder["ready"], alive, code))
+        self.stop_holder(holder)
+        return holder
+
+    def stop_holder(self, holder):
+        """Stop PROCESS A, graded: named event, then stdin close, then terminate."""
+        proc = holder.get("process")
+        if proc is None:
+            return holder
+        if proc.poll() is not None:
+            holder["returncode"] = proc.returncode
+            return holder
+
+        # 1. THE NAMED EVENT. This is the clean stop and the documented first
+        #    choice; the holder opened it for exactly this.
+        signalled = holder_event_signal(holder.get("event_name"))
+        self.log("experiment SPLITPROCESS_ISOLATION: stopping the holder - named event %s"
+                 % ("signalled" if signalled else "could NOT be signalled"))
+
+        deadline = time.time() + self.holder_stop_timeout
+        while time.time() < deadline and proc.poll() is None:
+            time.sleep(0.1)
+
+        # 2. STDIN. Closing the pipe is what the holder treats as "the parent is
+        #    gone", so this works even if the event failed.
+        if proc.poll() is None and proc.stdin is not None:
+            self.log("experiment SPLITPROCESS_ISOLATION: the holder is still alive; closing "
+                     "its stdin")
+            try:
+                proc.stdin.close()
+            except Exception:                     # noqa: BLE001
+                pass
+            deadline = time.time() + self.holder_stop_timeout
+            while time.time() < deadline and proc.poll() is None:
+                time.sleep(0.1)
+
+        # 3. LAST RESORT. Never leave a process holding GPU state.
+        if proc.poll() is None:
+            self.log("experiment SPLITPROCESS_ISOLATION: the holder is STILL alive; "
+                     "terminating it")
+            proc.terminate()
+            try:
+                proc.wait(timeout=self.holder_stop_timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+        holder["returncode"] = proc.returncode
+        holder["stopped"] = True
+        self.log("experiment SPLITPROCESS_ISOLATION: holder exited %s" % proc.returncode)
+        return holder
+
+    def run_split(self, artifact_meta, run_dir, reporter=None):
+        """PROCESS A holds Ti SUPER state; PROCESS B is the existing SINGLE arm.
+
+        PROCESS B is the SAME executable, the SAME launcher invocation and the
+        SAME single arm as the PROCESSCONTEXT node uses. Nothing about it is
+        forked, re-implemented or parameterised differently: if it differs at all
+        from the reference run, the comparison this node exists to make is void.
+        """
+        staging = os.path.join(run_dir, "splitprocess")
+        staged = self.stage(artifact_meta, staging)
+        started = time.time()
+        reference_arm = experiments.PROCESSCONTEXT_REFERENCE_ARM
+        event_name = "Local\\MGPU_PCAB_HOLDER_STOP_%lu" % os.getpid()
+
+        # The event is created and owned HERE, before the holder starts, so there
+        # is exactly one owner and a stale event from an earlier run cannot be
+        # inherited.
+        holder_event_create(event_name)
+
+        holder = None
+        outputs = {}
+        arms = {}
+        table = None
+        try:
+            # ---- 1 + 2 + 3. PROCESS A, and prove it is alive --------------
+            holder = self.start_holder(staged, event_name)
+
+            if holder["ready"] and holder.get("alive_after_ready"):
+                # ---- 4. PROCESS B: the existing SINGLE arm, unchanged -----
+                self.log("experiment SPLITPROCESS_ISOLATION: PROCESS B - the existing SINGLE "
+                         "arm, launched separately and unchanged")
+                outputs[reference_arm] = self.run_launcher(staged, [reference_arm])
+            else:
+                self.log("experiment SPLITPROCESS_ISOLATION: the holder did not establish "
+                         "its state, so PROCESS B is NOT launched - there is nothing to "
+                         "isolate and a run without the variable would answer nothing")
+        finally:
+            # ---- 6. terminate the holder cleanly, on EVERY path -----------
+            if holder is not None:
+                self.stop_holder(holder)
+            holder_event_close(event_name)
+
+        # ---- 5. parse PROCESS B's existing PCAB-RESULT -------------------
+        parse_arm_logs(staged["dir"], arms=[reference_arm], out=arms)
+
+        result = build_result(arms, artifact_meta, outputs, table,
+                              round(time.time() - started, 2))
+        result["kind"] = "splitprocess"
+        result["experiment"] = "SPLITPROCESS_ISOLATION"
+        single = arms.get(reference_arm, {})
+        result["holder_established"] = bool(holder and holder["ready"]
+                                           and holder.get("alive_after_ready"))
+        result["observations"]["holder"] = {
+            "exe": holder["exe"] if holder else None,
+            "event_name": event_name,
+            "ready": bool(holder and holder["ready"]),
+            "failed_line": bool(holder and holder["failed"]),
+            "alive_after_ready": bool(holder and holder.get("alive_after_ready")),
+            "returncode": holder["returncode"] if holder else None,
+            "lines": list(holder["lines"]) if holder else [],
+        }
+        result["observations"]["process_b"] = (
+            "the existing SINGLE arm, the same executable and the same %s invocation the "
+            "PROCESSCONTEXT node uses, in its own process" % LAUNCHER_NAME)
+        result["observations"]["process_b_summary"] = single
+        result["observations"]["staging_dir"] = staging
+        result["observations"]["steps"] = [
+            "launch holder-ti as PROCESS A",
+            "wait for exactly HOLDER_READY",
+            "verify the holder process is still alive",
+            ("launch the existing SINGLE arm as PROCESS B" if result["holder_established"]
+             else "PROCESS B NOT launched: the holder did not establish its state"),
+            "parse PROCESS B's existing PCAB-RESULT",
+            "terminate the holder cleanly",
+            "archive holder.log and context-single.log",
+        ]
+        return result
+
+    # -------------------------------------------------------------- archiving
+    def archive_split_logs(self, result, reporter):
+        """Archive holder.log and context-single.log."""
+        staged_dir = result["observations"]["staging_dir"]
+        archived = {}
+        holder_log = os.path.join(staged_dir, "context-%s.log" % HOLDER_MODE)
+        if reporter is not None and os.path.isfile(holder_log):
+            try:
+                archived["holder"] = reporter.archive(holder_log, "holder.log")
+            except Exception as exc:              # noqa: BLE001
+                self.log("experiment SPLITPROCESS_ISOLATION: could not archive the holder "
+                         "log (%s)" % exc)
+        single_log = os.path.join(staged_dir, "context-%s.log"
+                                  % experiments.PROCESSCONTEXT_REFERENCE_ARM)
+        dest = self._archive_arm_log(reporter, single_log,
+                                     experiments.PROCESSCONTEXT_REFERENCE_ARM)
+        if dest:
+            archived["single"] = dest
+        result["observations"]["logs_archived"] = archived
+        if archived:
+            self.log("experiment SPLITPROCESS_ISOLATION: archived %s"
+                     % ", ".join(sorted(os.path.basename(v) for v in archived.values())))
+        return archived
+
     # -------------------------------------------------------------- archiving
     def _archive_arm_log(self, reporter, path, arm):
         if reporter is None or not os.path.isfile(path):
@@ -417,17 +717,12 @@ def build_result(arms, artifact_meta, outputs, table, seconds):
                "create_feature": None},
         "verdict": "",
         "next": "",
-        "arms": {
-            a: {
-                "valid": arms.get(a, {}).get("valid"),
-                "reference_ok": arms.get(a, {}).get("reference_ok"),
-                "reason": arms.get(a, {}).get("reason"),
-                "control": arms.get(a, {}).get("control"),
-                "log_present": arms.get(a, {}).get("log_present"),
-            } for a in experiments.PROCESSCONTEXT_ARMS
-        },
+        # THE FULL arm summaries, not just the gate verdicts. Every consumer -
+        # the table rows, the evidence lines and the SAME-PROCESS vs SPLIT-PROCESS
+        # comparison - reads statuses from here, and a stripped-down copy made
+        # them all report NOT_OBSERVED while the gate itself was satisfied.
+        "arms": {a: dict(arms.get(a, {})) for a in experiments.PROCESSCONTEXT_ARMS},
         "observations": {
-            "arms": arms,
             "artifact": artifact_meta,
             "arm_processes": outputs,
             "table_returncode": (table or {}).get("returncode"),

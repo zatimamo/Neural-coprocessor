@@ -163,10 +163,15 @@ GRAPH = {
                             "so no other arm of this diagnostic is readable",
                  "when": [{"field": "arms.single.reference_ok", "op": "is_not_true"}]},
 
-                # SINGLE ok, the held device alone breaks it.
+                # SINGLE ok, the held device alone breaks it. Both this and the
+                # active-state verdict below route to the SAME validation node:
+                # in either case a second adapter's D3D12 state exists inside the
+                # process that runs the RTX 4070 lane, and the question that
+                # follows is the same one - does it still break the lane when the
+                # state is in a DIFFERENT process?
                 {"id": "SECOND_LIVE_D3D12_DEVICE_SUFFICIENT",
                  "verdict": "SECOND_LIVE_D3D12_DEVICE_SUFFICIENT",
-                 "next": None, "stop": True,
+                 "next": "SPLITPROCESS_ISOLATION", "stop": False,
                  "because": "a second live D3D12 device is present and the lane fails; "
                             "no second queue, heap or NGX use was required",
                  "when": [{"field": "arms.single.reference_ok", "op": "is_true"},
@@ -175,7 +180,7 @@ GRAPH = {
                 # The device alone is not enough; live command/descriptor state is.
                 {"id": "ACTIVE_SECOND_DEVICE_STATE_SUFFICIENT",
                  "verdict": "ACTIVE_SECOND_DEVICE_STATE_SUFFICIENT",
-                 "next": None, "stop": True,
+                 "next": "SPLITPROCESS_ISOLATION", "stop": False,
                  "because": "the second device alone is tolerated and an active second "
                             "DIRECT queue with a live descriptor heap is not",
                  "when": [{"field": "arms.single.reference_ok", "op": "is_true"},
@@ -215,6 +220,63 @@ GRAPH = {
                 "next": None, "stop": True,
                 "because": "the arms did not produce one of the five predefined "
                            "combinations, so no predefined verdict applies",
+            },
+        },
+
+        # ------------------------------------------------------------------
+        # THE ARCHITECTURE VALIDATION NODE.
+        #
+        # PROCESSCONTEXT established that active second-adapter state in the SAME
+        # process breaks the RTX 4070 lane. This asks the only question that
+        # follows from it, and asks it with the SAME SINGLE implementation:
+        #
+        #   PROCESS A   holder-ti: Ti SUPER device + DIRECT queue + heap, alive
+        #   PROCESS B   the existing SINGLE arm, unchanged, launched separately
+        #
+        # If B succeeds, process isolation is the validated fix direction and the
+        # diagnostic graph is complete for this line of investigation.
+        "SPLITPROCESS_ISOLATION": {
+            "experiment": "SPLITPROCESS_ISOLATION",
+            "implemented": True,
+            "workflow": "PROCESSCONTEXT",
+            "summary_rows": ["SPLIT/HOLDER", "SPLIT/SINGLE"],
+            "terminal": True,
+            "decisions": [
+                # The holder could not establish the state it exists to hold, so
+                # nothing was isolated and the run says nothing.
+                {"id": "INVALID_HOLDER",
+                 "verdict": "INVALID_HOLDER",
+                 "next": None, "stop": True,
+                 "because": "the holder process did not establish active Ti SUPER D3D12 "
+                            "state, so no process-to-process comparison exists",
+                 "when": [{"field": "holder_established", "op": "is_not_true"}]},
+
+                # THE RESULT THE ARCHITECTURE PREDICTS.
+                {"id": "PROCESS_ISOLATION_VALIDATED",
+                 "verdict": "PROCESS_ISOLATION_VALIDATED",
+                 "next": None, "stop": True,
+                 "because": "the SINGLE arm reproduced the full eight-condition reference "
+                            "in a process of its own while active Ti SUPER D3D12 state was "
+                            "alive in another process",
+                 "when": [{"field": "holder_established", "op": "is_true"},
+                          {"field": "arms.single.reference_ok", "op": "is_true"}]},
+
+                # The same failure as the same-process dual-active arm.
+                {"id": "PROCESS_ISOLATION_NOT_SUFFICIENT",
+                 "verdict": "PROCESS_ISOLATION_NOT_SUFFICIENT",
+                 "next": None, "stop": True,
+                 "because": "the SINGLE arm failed with the same statuses while the Ti SUPER "
+                            "state was held in a different process, so moving the lane into "
+                            "its own process is not sufficient",
+                 "when": [{"field": "holder_established", "op": "is_true"},
+                          {"field": "arms.single.reference_ok", "op": "is_false"}]},
+            ],
+            "fallback": {
+                "id": "UNEXPECTED_MIXED_STATE",
+                "verdict": "UNEXPECTED_MIXED_STATE",
+                "next": None, "stop": True,
+                "because": "the split-process run did not produce one of the three "
+                           "predefined outcomes",
             },
         },
 

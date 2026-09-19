@@ -73,6 +73,11 @@ timeouts:
   # PROCESSCONTEXT runs four arms, each loading a ~166 MB DLL and creating
   # devices. Generous, because a slow load is not a result.
   processcontext_seconds: 420
+  # SPLITPROCESS_ISOLATION: how long to wait for holder-ti to print
+  # HOLDER_READY, and how long to wait for it to stop at each graded step of the
+  # shutdown (named event, then stdin close, then terminate).
+  holder_ready_seconds: 60
+  holder_stop_seconds: 15
   # The game run. Fixed at 90 s by the experiment definition.
   game_run_seconds: 90
   # After CloseMainWindow, how long to wait before forcing termination.

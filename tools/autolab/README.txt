@@ -114,6 +114,47 @@ four-arm sequence, and gives it an explicit arm list - which is how SINGLE can
 stop the other three before they are started. SINGLE therefore runs exactly
 once, and no game is launched for this node.
 
+SPLITPROCESS_ISOLATION, THE ARCHITECTURE-VALIDATION NODE
+
+Reached automatically when PROCESSCONTEXT returns SECOND_LIVE_D3D12_DEVICE_SUFFICIENT
+or ACTIVE_SECOND_DEVICE_STATE_SUFFICIENT - in either case a second adapter's
+D3D12 state exists inside the process that runs the RTX 4070 lane, and the
+question that follows is the same.
+
+    PROCESS A   --mode holder-ti: Ti SUPER device + DIRECT queue + a small
+                CBV/SRV/UAV heap, in a process of its own. It prints
+                HOLDER_READY once the state is established, then waits for a
+                stop signal. No NGX, no NVAPI, no RTX 4070 device, no
+                swapchain, no submissions. It RETURNS before the lane begins,
+                so there is no code path from the holder into the lane.
+    PROCESS B   the EXISTING SINGLE arm, unchanged, through the same launcher.
+                Nothing about it is forked or parameterised differently.
+
+Sequence: launch PROCESS A, wait for exactly HOLDER_READY, verify the holder is
+still alive, launch PROCESS B, parse its PCAB-RESULT, terminate the holder
+cleanly, archive holder.log and context-single.log. The holder is stopped in a
+finally block, graded: the named stop event, then closing its stdin, then
+terminate. Closing stdin is what keeps a holder from outliving AutoLab.
+
+Verdicts, all terminal:
+
+    INVALID_HOLDER                  the holder did not establish its state, so
+                                    PROCESS B was NOT launched
+    PROCESS_ISOLATION_VALIDATED     PROCESS B satisfied the full eight-condition
+                                    reference gate with the Ti SUPER state alive
+                                    elsewhere -> the diagnostic graph is complete
+                                    for this line of investigation
+    PROCESS_ISOLATION_NOT_SUFFICIENT PROCESS B failed the same way
+
+The summary carries the comparison explicitly:
+
+    SAME PROCESS / dual-active:  Descriptor -1   CuModule -1   Reserved18 BAD00002
+    SPLIT PROCESS:               Descriptor  0   CuModule  0   Reserved18 Success
+
+Built only from what the two nodes recorded: a missing arm or an unestablished
+holder is reported as MISSING/NOT_APPLICABLE, never filled in with the value the
+architecture predicts.
+
 The original add-on is backed up and its hash verified BEFORE anything is
 written, and restored from a finally block - so normal completion, Ctrl+C, a
 Python exception, a timeout and an invalid result all restore. Restoration also

@@ -137,6 +137,13 @@ class Reporter(object):
     # -------------------------------------------------------------- summary
     def write_summary(self, rows, classification, evidence, run_meta):
         """rows: list of dicts {experiment, valid, result, note}"""
+        # The EXPERIMENT column is sized to its content. A fixed width silently
+        # ran a long name into the VALID column, which reads as a missing value
+        # rather than as a long name.
+        width = W_EXPERIMENT
+        for row in rows:
+            width = max(width, len(row.get("experiment") or "") + 2)
+
         out = []
         out.append("=" * 78)
         out.append("MGPU-AutoLab - run summary")
@@ -148,13 +155,13 @@ class Reporter(object):
         out.append("branch           : %s" % run_meta.get("branch", ""))
         out.append("dry run          : %s" % ("YES" if run_meta.get("dry_run") else "NO"))
         out.append("")
-        out.append("%-*s%-*s%s" % (W_EXPERIMENT, "EXPERIMENT", W_VALID, "VALID", "RESULT"))
+        out.append("%-*s%-*s%s" % (width, "EXPERIMENT", W_VALID, "VALID", "RESULT"))
         out.append("-" * 78)
         for row in rows:
-            out.append("%-*s%-*s%s" % (W_EXPERIMENT, row["experiment"], W_VALID,
+            out.append("%-*s%-*s%s" % (width, row["experiment"], W_VALID,
                                        _cell(row.get("valid")), row["result"]))
             if row.get("note"):
-                out.append("%-*s%s" % (W_EXPERIMENT, "", row["note"]))
+                out.append("%-*s%s" % (width, "", row["note"]))
         out.append("")
         out.append("-" * 78)
         out.append("FINAL CLASSIFICATION:")

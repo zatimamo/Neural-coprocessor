@@ -413,7 +413,7 @@ def run_processcontext_node(name, spec, cfg, console, reporter, gh, deploy, run_
         reporter.hash("processcontext.%s.log" % arm, deployment.sha256_file(path),
                       path=path)
 
-    single = result["observations"]["arms"].get(
+    single = result["arms"].get(
         experiments.PROCESSCONTEXT_REFERENCE_ARM, {})
     console("P1 Init = %s" % _ngx_name(single.get("core_init")))
     console("Descriptor = %s" % _dec(single.get("descriptor_status")))
@@ -512,7 +512,51 @@ def run_game_node(name, spec, cfg, console, reporter, gh, deploy, cp, run_dir,
     return result, meta
 
 
+def run_splitprocess_node(name, spec, cfg, console, reporter, gh, deploy, cp, run_dir,
+                          use_cache=True):
+    """PROCESS A holds Ti SUPER state; PROCESS B is the existing SINGLE arm.
+
+    No game is involved and the add-on is not touched. The artifact is the SAME
+    processcontext-ab artifact the PROCESSCONTEXT node uses, and PROCESS B is the
+    same SINGLE arm through the same launcher - so the only thing that differs
+    from the reference run is which process holds the second adapter's state.
+    """
+    console("experiment %s" % name)
+    wf = experiments.WORKFLOWS[spec["workflow"]]
+    meta = gh.build(name, wf["workflow"], wf["artifact"],
+                    "_pcab/processcontext_ab.exe", reuse_cache=use_cache)
+    reporter.event("build", experiment=name, run_id=meta.get("run_id"),
+                   commit=meta.get("commit"), artifact=meta.get("artifact_name"),
+                   from_cache=bool(meta.get("from_cache")),
+                   addon_sha256=meta.get("addon_sha256"))
+    reporter.hash("artifact.processcontext_ab.exe", meta["addon_sha256"],
+                  path=meta["addon_path"])
+
+    def _holder_line(line):
+        console("holder| %s" % line)
+
+    runner = processcontext.ProcessContextRunner(cfg, console, gh)
+    result = runner.run_split(meta, run_dir, reporter=reporter)
+    runner.archive_split_logs(result, reporter)
+
+    # The two lines the comparison is made of.
+    obs = result["observations"]
+    holder = obs["holder"]
+    console("HOLDER_READY = %s" % ("yes" if holder["ready"] else "no"))
+    console("holder alive after READY = %s" % holder["alive_after_ready"])
+    console("holder exit = %s" % holder["returncode"])
+    single = result["arms"].get(experiments.PROCESSCONTEXT_REFERENCE_ARM, {})
+    console("Descriptor = %s" % _dec(single.get("descriptor_status")))
+    console("CuModule = %s" % _dec(single.get("cumodule_status")))
+    console("Reserved18 = %s" % _ngx_name(single.get("feature")))
+    console("PROCESS B reference_ok = %s" % single.get("reference_ok"))
+    return result, meta
+
+
 def run_node(name, spec, cfg, console, reporter, gh, deploy, cp, run_dir, use_cache=True):
+    if spec["workflow"] == "PROCESSCONTEXT" and name == "SPLITPROCESS_ISOLATION":
+        return run_splitprocess_node(name, spec, cfg, console, reporter, gh, deploy, cp,
+                                     run_dir, use_cache)
     if spec["workflow"] == "PROCESSCONTEXT":
         return run_processcontext_node(name, spec, cfg, console, reporter, gh, deploy,
                                        run_dir, use_cache)
@@ -530,10 +574,26 @@ def build_rows(results, imported):
         rows.append({"experiment": imp["experiment"], "valid": imp["valid"],
                      "result": imp["verdict"], "note": imp.get("reason")})
     for res in results:
-        # A standalone-diagnostic result carries the four arms; a game result
-        # carries p1/p4. Switching on the shape rather than on the name keeps
-        # this correct when a result is renamed (the dry run does exactly that).
-        if "arms" in res:
+        kind = res.get("kind") or ("splitprocess" if _is_split_result(res)
+                                   else "procescontext")
+        if kind == "splitprocess":
+            # The holder is the arm this node adds; its "valid" is whether it
+            # established the state it exists to hold.
+            rows.append({"experiment": "SPLIT/HOLDER",
+                         "valid": res.get("holder_established"),
+                         "result": ("HOLDER_READY" if res.get("holder_established")
+                                    else "HOLDER_NOT_ESTABLISHED")})
+            single = res.get("arms", {}).get(
+                experiments.PROCESSCONTEXT_REFERENCE_ARM, {})
+            if single.get("reference_ok") is True:
+                text = report.RESULT_REFERENCE_OK
+            elif single.get("reference_ok") is False:
+                text = report.RESULT_REFERENCE_FAILED
+            else:
+                text = report.RESULT_NOT_RUN
+            rows.append({"experiment": "SPLIT/SINGLE", "valid": single.get("valid"),
+                         "result": text})
+        elif "arms" in res:
             for arm in experiments.PROCESSCONTEXT_ARMS:
                 a = res.get("arms", {}).get(arm, {})
                 if a.get("reference_ok") is True:
@@ -549,13 +609,103 @@ def build_rows(results, imported):
     return rows
 
 
+def _is_split_result(res):
+    """Split-process results are recognised by their SHAPE, not their name.
+
+    The dry run renames its results so the table says which fixture each row came
+    from; matching on the name would make the comparison vanish there and only
+    there, which is exactly where it needs exercising.
+    """
+    return res.get("holder_established") is not None and "arms" in res
+
+
+def _is_procescontext_result(res):
+    return "arms" in res and not _is_split_result(res)
+
+
+def build_comparison(results):
+    """SAME PROCESS / dual-active against SPLIT PROCESS, the whole point.
+
+    Generated only from what the two nodes actually recorded. A missing dual
+    active arm, or a split run whose holder never established its state, is
+    reported as MISSING/NOT_APPLICABLE rather than filled in with the value the
+    architecture predicts.
+
+    A live run produces exactly one of each. When more than one is present - the
+    dry run, which walks every branch - the PROCESSCONTEXT result that actually
+    shows the same-process failure is preferred, because that is the one the
+    comparison is about.
+    """
+    pc_candidates = [r for r in results if _is_procescontext_result(r)]
+    split_candidates = [r for r in results if _is_split_result(r)]
+    if not pc_candidates and not split_candidates:
+        return []
+
+    pc = None
+    for cand in pc_candidates:
+        if cand.get("arms", {}).get("dual-active", {}).get("reference_ok") is False:
+            pc = cand
+            break
+    if pc is None and pc_candidates:
+        pc = pc_candidates[0]
+
+    split = None
+    for cand in split_candidates:
+        if cand.get("holder_established"):
+            split = cand
+            break
+    if split is None and split_candidates:
+        split = split_candidates[0]
+
+    def cell(value, fmt):
+        return "NOT_OBSERVED" if value is None else fmt(value)
+
+    lines = []
+    lines.append("SAME PROCESS / dual-active, from PROCESSCONTEXT:")
+    if pc is None:
+        lines.append("    the PROCESSCONTEXT result is not in this run - SAME PROCESS row MISSING")
+    else:
+        a = pc.get("arms", {}).get("dual-active", {})
+        lines.append("    Descriptor  %s" % cell(a.get("descriptor_status"), _dec))
+        lines.append("    CuModule    %s" % cell(a.get("cumodule_status"), _dec))
+        lines.append("    Reserved18  %s" % cell(a.get("feature"), _ngx_name))
+        lines.append("    reference_ok %s (valid=%s)"
+                     % (a.get("reference_ok"), a.get("valid")))
+
+    lines.append("SPLIT PROCESS / SINGLE in its own process, from SPLITPROCESS_ISOLATION:")
+    if split is None:
+        lines.append("    the SPLITPROCESS_ISOLATION result is not in this run - SPLIT row MISSING")
+    elif not split.get("holder_established"):
+        lines.append("    the holder did not establish its state, so PROCESS B was not "
+                     "launched - NOT APPLICABLE")
+    else:
+        s = split.get("arms", {}).get(experiments.PROCESSCONTEXT_REFERENCE_ARM, {})
+        lines.append("    Descriptor  %s" % cell(s.get("descriptor_status"), _dec))
+        lines.append("    CuModule    %s" % cell(s.get("cumodule_status"), _dec))
+        lines.append("    Reserved18  %s" % cell(s.get("feature"), _ngx_name))
+        lines.append("    reference_ok %s (valid=%s)"
+                     % (s.get("reference_ok"), s.get("valid")))
+    return lines
+
+
 def build_evidence(results, hashes):
     lines = []
     for res in results:
         lines.append("%s: valid=%s - %s" % (res["experiment"], res["valid"],
                                             res.get("reason", "")))
-        if "arms" in res:
-            arms = (res.get("observations") or {}).get("arms") or {}
+        if res.get("kind") == "splitprocess" or _is_split_result(res):
+            h = (res.get("observations") or {}).get("holder") or {}
+            lines.append("  holder-ti (PROCESS A) ready=%s alive_after_ready=%s exit=%s "
+                         "event=%s" % (h.get("ready"), h.get("alive_after_ready"),
+                                       h.get("returncode"), h.get("event_name")))
+            s = res.get("arms", {}).get(experiments.PROCESSCONTEXT_REFERENCE_ARM, {})
+            lines.append("  PROCESS B SINGLE  descriptor=%-13s cumodule=%-13s blob=%-9s "
+                         "Reserved18=%-22s handle=%-12s reference_ok=%s"
+                         % (_dec(s.get("descriptor_status")), _dec(s.get("cumodule_status")),
+                            _dec(s.get("blob_size")), _ngx_name(s.get("feature")),
+                            _hexptr(s.get("feature_handle")), s.get("reference_ok")))
+        elif "arms" in res:
+            arms = res.get("arms") or {}
             for arm in experiments.PROCESSCONTEXT_ARMS:
                 a = arms.get(arm, {})
                 lines.append(
@@ -576,6 +726,11 @@ def build_evidence(results, hashes):
                        _ngx_name(flat.get("%s_create_feature" % phase))))
     for rec in hashes:
         lines.append("hash %s  %s" % (rec["sha256"], rec["label"]))
+    comparison = build_comparison(results)
+    if comparison:
+        lines.append("")
+        lines.append("SAME PROCESS vs SPLIT PROCESS:")
+        lines.extend("    " + c for c in comparison)
     return lines
 
 
@@ -616,13 +771,31 @@ PARSER_TESTS = [
 ]
 
 #: Graph scenarios: fixture directory -> the verdict the graph must reach.
+#: Both multi-adapter verdicts now ROUTE to the architecture-validation node
+#: rather than stopping, because in either case a second adapter's D3D12 state
+#: exists inside the process that runs the RTX 4070 lane.
 GRAPH_SCENARIOS = [
     ("pcab_all_ok", "MULTI_DEVICE_EXONERATED", "STREAMLINE_CONTEXT_REQUIRED"),
-    ("pcab_held_fail", "SECOND_LIVE_D3D12_DEVICE_SUFFICIENT", None),
-    ("pcab_active_fail", "ACTIVE_SECOND_DEVICE_STATE_SUFFICIENT", None),
+    ("pcab_held_fail", "SECOND_LIVE_D3D12_DEVICE_SUFFICIENT", "SPLITPROCESS_ISOLATION"),
+    ("pcab_active_fail", "ACTIVE_SECOND_DEVICE_STATE_SUFFICIENT", "SPLITPROCESS_ISOLATION"),
     ("pcab_released_fail", "PROCESS_GLOBAL_STATE_PERSISTS_AFTER_DEVICE_RELEASE", None),
     ("pcab_single_fail", "PROCESSCONTEXT_REFERENCE_INVALID", None),
     ("pcab_unexpected", "UNEXPECTED_MIXED_STATE", None),
+]
+
+#: SPLITPROCESS_ISOLATION cases. PROCESS B is the existing SINGLE arm, so the
+#: fixture that decides the outcome is an ordinary single-arm log; what varies is
+#: whether the holder established its state.
+SPLIT_CASES = [
+    {"fixture": "pcab_all_ok", "holder_ok": True,
+     "launched": ["single"], "archived": 2,
+     "verdict": "PROCESS_ISOLATION_VALIDATED"},
+    {"fixture": "pcab_single_fail", "holder_ok": True,
+     "launched": ["single"], "archived": 2,
+     "verdict": "PROCESS_ISOLATION_NOT_SUFFICIENT"},
+    {"fixture": "pcab_all_ok", "holder_ok": False,
+     "launched": [], "archived": 1,
+     "verdict": "INVALID_HOLDER"},
 ]
 
 
@@ -716,7 +889,7 @@ FAILFAST_CASES = [
      "launched": ["single", "dual-held", "dual-active", "dual-released"],
      "archived": 4,
      "verdict": "SECOND_LIVE_D3D12_DEVICE_SUFFICIENT",
-     "next": None},
+     "next": "SPLITPROCESS_ISOLATION"},
 ]
 
 
@@ -755,6 +928,42 @@ class _StubRunner(processcontext.ProcessContextRunner):
 
     def run_table(self, staged):
         return {"returncode": 4, "stdout": "(stub table)"}
+
+
+class _StubSplitRunner(_StubRunner):
+    """The split-process node with its two side-effecting seams replaced.
+
+    `start_holder` and `stop_holder` are the only places run_split() touches a
+    process, so overriding exactly those exercises the REAL sequencing -
+    including "when the holder does not establish its state, PROCESS B is never
+    launched" - without starting anything.
+    """
+
+    def __init__(self, cfg, log, fixture_dir, holder_ok=True):
+        _StubRunner.__init__(self, cfg, log, fixture_dir)
+        self.holder_ok = holder_ok
+        self.holder_started = False
+        self.holder_stopped = False
+
+    def start_holder(self, staged, event_name, on_line=None):
+        self.holder_started = True
+        # The holder writes its own per-mode log; produce one so the archive path
+        # is exercised rather than skipped.
+        held = os.path.join(staged["dir"], "context-%s.log" % processcontext.HOLDER_MODE)
+        with open(held, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("[holder] PROCESS A - active Ti SUPER D3D12 state (stub)\n")
+            fh.write("HOLDER_READY\n" if self.holder_ok else "HOLDER_FAILED\n")
+        return {"process": None, "exe": os.path.join(staged["dir"], processcontext.HOLDER_EXE_NAME),
+                "event_name": event_name, "ready": self.holder_ok,
+                "failed": not self.holder_ok,
+                "lines": ["HOLDER_READY"] if self.holder_ok else ["HOLDER_FAILED"],
+                "returncode": None, "alive_after_ready": self.holder_ok, "stopped": False}
+
+    def stop_holder(self, holder):
+        self.holder_stopped = True
+        holder["returncode"] = 0
+        holder["stopped"] = True
+        return holder
 
 
 def _stub_config():
@@ -948,6 +1157,58 @@ def run_parser_tests(console):
                     % (case["fixture"], len(runner.launcher_calls),
                        ",".join(runner.launched), len(archived), decision.verdict))
 
+    # ---- SPLITPROCESS_ISOLATION: PROCESS B is never launched without a holder
+    node = experiments.node("SPLITPROCESS_ISOLATION")
+    for case in SPLIT_CASES:
+        fixture_dir = os.path.join(FIXTURES, case["fixture"])
+        run_dir = tempfile.mkdtemp(prefix="autolab-split-")
+        reporter = None
+        try:
+            reporter = report.Reporter(run_dir, console)
+            runner = _StubSplitRunner(_stub_config(), console, fixture_dir,
+                                      holder_ok=case["holder_ok"])
+            result = runner.run_split({"artifact_dir": "(stub)"}, run_dir,
+                                      reporter=reporter)
+            runner.archive_split_logs(result, reporter)
+        except Exception as exc:                      # noqa: BLE001
+            failures.append("split/%s holder_ok=%s: raised %s: %s"
+                            % (case["fixture"], case["holder_ok"],
+                               type(exc).__name__, exc))
+            shutil.rmtree(run_dir, ignore_errors=True)
+            continue
+        decision = experiments.decide(node, result)
+        bad = []
+        if runner.launched != case["launched"]:
+            bad.append("PROCESS B launched as %r, expected %r"
+                       % (runner.launched, case["launched"]))
+        if not runner.holder_started:
+            bad.append("the holder was never started")
+        if not runner.holder_stopped:
+            bad.append("the holder was never stopped")
+        if decision.verdict != case["verdict"]:
+            bad.append("verdict %s, expected %s" % (decision.verdict, case["verdict"]))
+        if decision.next is not None or not decision.stop:
+            bad.append("the split verdict must be terminal (next=%r stop=%r)"
+                       % (decision.next, decision.stop))
+        archived = (result["observations"].get("logs_archived") or {})
+        if len(archived) != case["archived"]:
+            bad.append("archived %r, expected %d file(s)"
+                       % (sorted(os.path.basename(p) for p in archived.values()),
+                          case["archived"]))
+        if case["holder_ok"] and "holder.log" not in [os.path.basename(p)
+                                                      for p in archived.values()]:
+            bad.append("holder.log was not archived")
+        shutil.rmtree(run_dir, ignore_errors=True)
+        if bad:
+            failures.append("split/%s holder_ok=%s:\n      %s"
+                            % (case["fixture"], case["holder_ok"], "\n      ".join(bad)))
+        else:
+            passed += 1
+            console("  PASS split/%s holder_ok=%s -> PROCESS B launched %s, archived %d -> %s"
+                    % (case["fixture"], case["holder_ok"],
+                       ",".join(runner.launched) or "(nothing)", len(archived),
+                       decision.verdict))
+
     # The graph, over fixture logs, through the real parsing path.
     node = experiments.node("PROCESSCONTEXT")
     for fixture, want_verdict, want_next in GRAPH_SCENARIOS:
@@ -1056,6 +1317,47 @@ def dry_run(cfg, console, reporter):
                  "valid": game["valid"], "result": "FIXTURE_ONLY"})
     reporter.event("dry_run_scenario", scenario="APPID_NS-game-path",
                    valid=game["valid"], reason=game["reason"])
+
+    # The split-process node, from the same fixtures. This is the node that
+    # produces the SAME PROCESS vs SPLIT PROCESS comparison in the summary, so
+    # the dry run exercises it too.
+    split_node = experiments.node("SPLITPROCESS_ISOLATION")
+    for case in SPLIT_CASES:
+        tag = "%s-holder-%s" % (case["fixture"], "ok" if case["holder_ok"] else "failed")
+        console("experiment DRYRUN/SPLIT-%s" % tag)
+        log_dir = os.path.join(FIXTURES, case["fixture"])
+        run_dir = tempfile.mkdtemp(prefix="autolab-drysplit-")
+        try:
+            runner = _StubSplitRunner(_stub_config(), console, log_dir,
+                                      holder_ok=case["holder_ok"])
+            split = runner.run_split({"artifact_dir": "(stub)"}, run_dir)
+            runner.archive_split_logs(split, reporter)
+        except Exception as exc:                      # noqa: BLE001
+            console("  the split dry run raised %s: %s" % (type(exc).__name__, exc))
+            shutil.rmtree(run_dir, ignore_errors=True)
+            continue
+        decision = experiments.decide(split_node, split)
+        shutil.rmtree(run_dir, ignore_errors=True)
+        split["experiment"] = "DRYRUN/SPLIT-" + tag
+        split["verdict"] = decision.verdict
+        split["next"] = decision.next
+        results.append(split)
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+        h = split["observations"]["holder"]
+        s = split["arms"].get(experiments.PROCESSCONTEXT_REFERENCE_ARM, {})
+        console("HOLDER_READY = %s" % ("yes" if h["ready"] else "no"))
+        console("Descriptor = %s" % _dec(s.get("descriptor_status")))
+        console("CuModule = %s" % _dec(s.get("cumodule_status")))
+        console("Reserved18 = %s" % _ngx_name(s.get("feature")))
+        console("verdict %s" % decision.verdict)
+        console("next %s" % (decision.next or "STOP"))
+        reporter.event("dry_run_scenario", scenario="split-" + tag,
+                       verdict=decision.verdict, next=decision.next,
+                       holder_ready=h["ready"],
+                       process_b_launched=bool(s.get("log_present")))
+        rows.append({"experiment": "DRYRUN/SPLIT-" + tag.upper(),
+                     "valid": split["holder_established"], "result": decision.verdict})
 
     classification = {
         "verdict": "DRY_RUN",

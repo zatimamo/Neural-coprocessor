@@ -667,6 +667,26 @@ jobs:
           H=$(grep -nF 'CreateConstantBufferView' "$M" || true)
           [ -z "$H" ] || { echo "$H"; note "dual-active writes a CBV; it must hold device+queue+heap only"; }
 
+          # ---- REQUIRED: holder-ti, and its boundaries -------------------
+          # The holder keeps ACTIVE Ti SUPER state alive in its own process. It
+          # must have NONE of the lane: no NGX core, no NVAPI, no patch, no RTX
+          # 4070 device, no swapchain, no submissions.
+          grep -qF 'HOLDER_MODE = "holder-ti"' "$M" || note "the holder-ti mode name is missing"
+          grep -qF 'run_holder_ti(ad_ti, d_ti, holder_event, holder_seconds)' "$M" || \
+            note "the holder is not driven from the Ti SUPER adapter selected by device id"
+          grep -qF 'HOLDER_READY' "$M" || note "the holder never prints HOLDER_READY"
+          grep -qF 'HOLDER_FAILED' "$M" || note "the holder has no failure line for a state it could not establish"
+          grep -qF "OpenEventW(SYNCHRONIZE, FALSE, event_name)" "$M" || \
+            note "the holder does not wait on a named stop event"
+          grep -qF 'holder_stdin_open()' "$M" || \
+            note "the holder does not watch stdin for a stop command or the parent going away"
+          # It RETURNS before the lane. Asserted by position, because that is
+          # what makes "no NGX in the holder" structural rather than a promise.
+          L_HOLDER=$(line_of "$M" 'if (is_holder)')
+          L_CORE2=$(line_of "$M" 'pcab::ngx_load_core()')
+          order_ok "$L_HOLDER" "$L_CORE2" || note "THE HOLDER CAN REACH THE LANE - its branch is not before the NGX core load"
+          echo "holder: branch=$L_HOLDER before the lane at $L_CORE2"
+
           [ "$FAIL" -eq 0 ] || exit 1
           echo "reference contract verified: app id, private block, order, V2 stamp, per-GPU spoof target and the eight SINGLE conditions are all present, and every superseded construct is absent."
 
