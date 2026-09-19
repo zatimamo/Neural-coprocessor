@@ -28,6 +28,9 @@
 #include "nr_json.h"
 #include "nr_pipe.h"
 #include "nr_proto.h"
+// InputSlot and its names live here. The four inputs are a SLOT concept, not a
+// protocol one: the protocol carries the number, nr_slots.h gives it a name.
+#include "nr_slots.h"
 
 #include <windows.h>
 

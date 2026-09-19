@@ -90,6 +90,7 @@ add_executable(nr_ipc_probe
   nr_ipc_probe.cpp
   nr_proto.cpp
   nr_pipe.cpp
+  nr_slots.cpp
   nr_json.cpp)
 
 # --------------------------------------------------------- the transport bench
