@@ -389,7 +389,26 @@ jobs:
           grep -n "NR-WORKER" _cfg_nr.txt
 
       - name: Build (nr-worker)
-        run: cmake --build build-nr --config Release
+        shell: bash
+        run: |
+          # A build failure whose reason is only in the log is a bad gate: the
+          # compiler's own error lines are turned into ANNOTATIONS here, so the
+          # failure can be read from the check run and not just from a log that
+          # needs repository admin rights to download.
+          set +e
+          cmake --build build-nr --config Release 2>&1 | tee build-nr.log
+          RC=${PIPESTATUS[0]}
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::the nr-worker build failed (exit $RC)"
+            grep -nE 'error C[0-9]+|error LNK[0-9]+|fatal error|error MSB[0-9]+' build-nr.log \
+              | head -n 40 | while IFS= read -r L; do
+                  echo "::error::$L"
+                done
+            echo "--- last 60 lines ---"
+            tail -n 60 build-nr.log
+            exit 1
+          fi
+          echo "build ok"
 
       - name: Verify the four binaries
         shell: bash
