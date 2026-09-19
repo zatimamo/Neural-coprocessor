@@ -140,4 +140,20 @@ Two things in that line are worth knowing before reading a log:
 
 The per-arm log also names the two calls' callers (module+offset) and prints the
 stack above nvapi_QueryInterface, so the observation is equivalent to MGPU's
-CUDADIAG rather than a summary of it.
+CUDADIAG rather than a summary of it. Each private call carries:
+
+    match=yes            the device argument IS the device the lane created
+    match=no             it is NOT that device - the call reached the wrong one
+    match=NOT_COMPARED   no device was published, so NO comparison was made
+    match=NA-probe       a NULL-argument capability probe has no device to compare
+
+match=NOT_COMPARED is not the same as match=no, and is never reported as one: a
+null device is only a negative match when there is something to match it
+against. A real call that reads match=no, or match=NOT_COMPARED, is a finding in
+its own right - it says the CUDA-interop layer was asked about a device other
+than the one the lane is running on.
+
+When a handle is not read, the log says exactly which of these it was: the status
+was not NVAPI_OK, the params pointer was null, the callee declared an input size
+that does not cover structSizeOut, or structSizeOut does not cover the handle.
+Those are different facts about the call and are not collapsed into one message.
