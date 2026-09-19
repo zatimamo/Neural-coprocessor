@@ -936,7 +936,6 @@ namespace nr
             im->game.fence->SetEventOnCompletion(1ull, im->game.fence_event);
             WaitForSingleObject(im->game.fence_event, 30000);
             upload->Release();
-            im->game.fence_value = 1ull;
         }
 
         // ---- the frame loop -------------------------------------------------
@@ -1022,7 +1021,6 @@ namespace nr
                 res.note = "the game command list could not be submitted";
                 return false;
             }
-            im->game.fence_value = game_ready[f];
 
             // WORKER: waits for this frame's ingress value, then shared -> local
             // COLOR, then local COLOR -> shared OUTPUT. It writes its result into
@@ -1058,7 +1056,6 @@ namespace nr
                 res.note = "the worker command list could not be submitted";
                 return false;
             }
-            im->worker.fence_value = worker_done[f];
 
             // The game's copy back for THIS frame is only safe once the worker's
             // value for this frame is reached. That is a real dependency and it is
