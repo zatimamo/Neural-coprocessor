@@ -44,6 +44,7 @@
 #include "create_contract.hpp"  // CREATECONTRACT: the creation-time parameter A/B
 #include "nvapi_init.hpp"       // NVAPIINIT: the explicit-NVAPI-initialization A/B
 #include "cuda_diag.hpp"        // CUDADIAG: the two NVAPI CUDA-interop calls DLSS-NR makes
+#include "reshade_native.hpp"   // RESHADENATIVE: the P1.0c NGX lane on the unwrapped device
 
 // R111. DXGI_STATUS_OCCLUDED comes from dxgi.h by way of <dxgi1_4.h> above.
 // Guarded because it is a SUCCESS code and a build where it went missing
@@ -293,6 +294,18 @@ bool create_device(const adapter::selection_result &sel)
     // is the only moment where the answer is still free. If sl.interposer
     // wrapped it, every call we make from here re-enters Streamline.
     mgpu::slprobe::report(dev, nullptr);
+
+    // RESHADENATIVE. ReShade's D3D12CreateDevice hook returns a PROXY device,
+    // and that proxy's CPU descriptor handles are synthetic - the heap index
+    // lives in bit 28 - while the private NVAPI descriptor conversion wants a
+    // real driver descriptor address and answers NVAPI_ERROR for anything else.
+    //
+    // This attempts the unwrap once, here, while the device is live and nothing
+    // has been built on it. It never substitutes a half-unwrapped device: on any
+    // failure it logs why and the lane keeps using the ReShade proxy, which is
+    // the pre-existing behaviour. See src/reshade_native.hpp for why the scope
+    // is the P1.0c lane and not the P4.1 stream lane.
+    mgpu::reshadenative::init(dev, luid);
 
     return true;
 }
@@ -2641,6 +2654,40 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         return false;
     }
 
+    // ---- RESHADENATIVE: run THIS LANE on the unwrapped original device ----
+    //
+    // `dev` and `queue` in this function serve the NGX lane and nothing else -
+    // no texture, no buffer and no transport object is created here, and no
+    // copy is recorded (verified: the only uses of `dev` below are the NGX
+    // Init/Init_Ext/snippet-Init calls, the private allocator/list/fence, and
+    // two log lines; the only uses of `queue` are the single ExecuteCommandLists
+    // and its Signal). Reassigning them is therefore the WHOLE change, and it
+    // mixes nothing: the list, the allocator, the fence, the queue and the
+    // device handed to NGX all become native together.
+    //
+    // When the unwrap did not happen these two calls return their argument
+    // unchanged, so this is byte-for-byte the pre-existing behaviour and the
+    // log says so.
+    {
+        ID3D12Device *const proxy_dev = dev;
+        ID3D12CommandQueue *const proxy_queue = queue;
+        dev = mgpu::reshadenative::ngx_device(dev);
+        queue = mgpu::reshadenative::ngx_queue(queue);
+        if (dev != proxy_dev || queue != proxy_queue)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P1.0c] RESHADENATIVE lane: device %p -> %p, queue %p -> %p "
+                     "(the NGX init list will be recorded and executed on the native pair)",
+                     (void *)proxy_dev, (void *)dev, (void *)proxy_queue, (void *)queue);
+            mgpu::diag::info(line);
+        }
+        else
+        {
+            mgpu::diag::info("[MGPU][P1.0c] RESHADENATIVE lane not active - the probe runs on the "
+                             "ReShade proxy device and queue, as before");
+        }
+    }
+
     // ---- 1. the modules ----
     //
     // P1.0 expected _nvngx.dll to be unreachable without a third-party
@@ -2764,6 +2811,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         mgpu::archtest::log_mode();
         mgpu::contract::log_variant();
         mgpu::cudadiag::log_variant();
+        mgpu::reshadenative::log_variant();
         mgpu::adapter::selection_result asel;
         mgpu::adapter::get_selection(asel);
         if (asel.valid)

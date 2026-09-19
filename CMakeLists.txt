@@ -85,6 +85,12 @@ add_library(mgpu_bridge SHARED
     #   MGPU_CUDA_DIAG defined   -> the two target interface ids are substituted
     #                               with observational pass-through wrappers.
     src/cuda_diag.cpp
+    # RESHADENATIVE: the P1.0c NGX lane on the unwrapped original device. One
+    # question - is ReShade's D3D12 descriptor virtualization what makes the
+    # private NVAPI CUDA-interop lane return NVAPI_ERROR? Self-contained like
+    # the six above: no ReShade header, no link library, and the one GUID it
+    # carries is written out because ReShade's IID_UnwrappedObject is internal.
+    src/reshade_native.cpp
 )
 
 target_include_directories(mgpu_bridge PRIVATE
@@ -348,6 +354,46 @@ if(MGPU_CUDA_DIAG)
     message(STATUS "MGPU: CUDADIAG = ON (pass-through instrumentation of the two CUDA-interop ids)")
 else()
     message(STATUS "MGPU: CUDADIAG = OFF (cuda_diag.cpp compiles to no-ops)")
+endif()
+
+# ---------------------------------------------------------------------------
+# RESHADENATIVE. The P1.0c NGX lane on the unwrapped original device.
+#
+#   MGPU_RESHADE_NATIVE absent  ->  reshade_native.cpp logs variant=off and
+#                                   every entry point returns its argument
+#                                   unchanged. The P1.0c probe runs on the
+#                                   ReShade proxy device exactly as before, so
+#                                   the build is the pre-existing behaviour.
+#   MGPU_RESHADE_NATIVE defined ->  after the GPU 1 device is created, the
+#                                   proxy is asked for IID_UnwrappedObject; the
+#                                   unwrap is validated (non-null, different
+#                                   from the proxy, same LUID as T2 selected)
+#                                   and, only then, the P1.0c NGX lane - device,
+#                                   private allocator, private list, private
+#                                   fence and the queue that drains it - is
+#                                   built on that original device.
+#
+# SCOPE, and it is deliberate: the P1.0c lane ONLY. It creates no textures, no
+# buffers and no transport, so a native lane there mixes nothing. The P4.1
+# stream lane is NOT converted: one command list and queue (s.nl/s.nq) carry the
+# transport copies, the NGX Evaluate calls AND the CreateFeature arm, and the
+# device passed to stream_nr_create creates every NR texture the feature touches.
+# Running that lane on the native device would either mix proxy resources with a
+# native list - which this experiment forbids - or move the transport with it.
+# That separation is a design decision that has not been made yet.
+#
+# There is ONE artifact and no compare job. The CI job builds it with
+# MGPU_ARCH_COMPAT=ON, MGPU_CONTRACT_EXPANDED=ON, MGPU_NVAPI_EXPLICIT_INIT=OFF
+# and MGPU_CUDA_DIAG=ON so nothing else moves.
+# ---------------------------------------------------------------------------
+option(MGPU_RESHADE_NATIVE
+       "RESHADENATIVE: run the P1.0c NGX lane on the unwrapped original D3D12 device"
+       OFF)
+if(MGPU_RESHADE_NATIVE)
+    target_compile_definitions(mgpu_bridge PRIVATE MGPU_RESHADE_NATIVE=1)
+    message(STATUS "MGPU: RESHADENATIVE = ON (P1.0c NGX lane on the unwrapped device)")
+else()
+    message(STATUS "MGPU: RESHADENATIVE = OFF (P1.0c lane unchanged, proxy device)")
 endif()
 
 option(MGPU_BUILD_TESTS "Build CPU-only adapter policy tests" OFF)

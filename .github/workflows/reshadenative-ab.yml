@@ -1,0 +1,393 @@
+# ============================================================================
+# RESHADENATIVE - the P1.0c NGX lane on the unwrapped original D3D12 device
+# ============================================================================
+# ONE build, ONE artifact, no compare job.
+#
+# THE HYPOTHESIS
+#   ReShade's D3D12CreateDevice hook returns a PROXY device whose CPU
+#   descriptor handles are synthetic: the heap index lives in bit 28.
+#   The measured failing values are exactly that shape -
+#       0x30000004   3 << 28 | 4
+#       0x40000004   4 << 28 | 4
+#       0x40000024   4 << 28 | 0x24
+#   while a real driver CPU descriptor address is a pointer, e.g.
+#   0x1A4BAD70000 (the working NeuralScreen value).
+#
+#   DLSSNR resolves the private NVAPI entry directly (0x0DDAC234), so ReShade's
+#   convert_to_original_cpu_descriptor_handle() forwarding path is bypassed and
+#   NVIDIA is handed the synthetic handle. It answers NVAPI_ERROR.
+#
+# WHAT THIS BUILD CHANGES
+#   After the GPU 1 device is created, the proxy is asked for
+#   IID_UnwrappedObject. The unwrap is validated (non-null, different from the
+#   proxy, same LUID as T2 selected) and only then is the P1.0c NGX lane built
+#   on the original device: the device handed to NGX Init/Init_Ext/snippet Init,
+#   plus a private native allocator, list, fence and the DIRECT queue that
+#   drains them.
+#
+# WHAT IT DOES NOT CHANGE - all asserted at configure time
+#   MGPU_ARCH_COMPAT=ON          architecture spoofing untouched
+#   MGPU_CONTRACT_EXPANDED=ON    CreateFeature parameter contract untouched
+#   MGPU_NVAPI_EXPLICIT_INIT=OFF explicit NvAPI_Initialize still NOT called
+#   MGPU_CUDA_DIAG=ON            the diagnostic still observes only; it never
+#                                modifies an argument or a return value
+#   app id, data path, API version, parameters, runtime DLL, caller identity,
+#   driver state, NR DLL - all untouched.
+#
+# THE P4.1 STREAM LANE IS NOT CONVERTED, AND THAT IS A FINDING RATHER THAN AN
+# OMISSION. One command list and queue (s.nl/s.nq) carry the transport copies,
+# the NGX Evaluate calls AND the CreateFeature arm, and the device passed to
+# stream_nr_create creates every NR texture and buffer the feature touches.
+# Points measured in this revision:
+#     s.nl->CopyTextureRegion   17450, 17488, 17518, 17558, 18046
+#     s.nr_eval(s.nl, ...)      17885
+#     s.sr_eval(s.nl, ...)      17982
+#     CreateFeature arm         11785  (s.nq->ExecuteCommandLists)
+#     make_tex(ndev, ...) x8    11504..11582
+#     make_buf(ndev, ...) x2    11524, 11539
+# Running that lane on the native device would either mix proxy resources with
+# a native command list - forbidden - or move the transport with it, which this
+# experiment explicitly does not do. The P1.0c lane is fully separable: it
+# creates no textures, no buffers and no transport at all.
+#
+# INTERPRETATION, FIXED IN ADVANCE
+#   Valid run requires P1.0c Init = Success and P4.1 Init = Success (see the
+#   run-time validity gate below). Then:
+#
+#   desc.ptr no longer follows the bit-28 shape AND status = 0 (NVAPI_OK)
+#       -> the descriptor virtualization is the P1.0c blocker. Record it, then
+#          look at the P4.1 lane and the Evaluate path as separate work.
+#   proxy pointer != native pointer, logs present, desc.ptr STILL bit-28 shaped
+#       -> the unwrap did not reach the lane that matters, or something else
+#          re-wraps the handle. Report and stop; no further hypothesis.
+#   desc.ptr is a native address but status is still -1
+#       -> the descriptor representation is NOT the blocker. Report and stop.
+#   "the unwrap did NOT happen"
+#       -> this ReShade build does not expose IID_UnwrappedObject, the LUID did
+#          not match, or the native queue could not be created. The run is the
+#          pre-existing behaviour and proves nothing about the hypothesis.
+#   If either Init is FAIL_OutOfDate the NGX portion of that run is VOID.
+#
+# THE DIAGNOSTIC IS OBSERVATIONAL. CUDADIAG never modifies a private NVAPI
+# argument or return value; it reports what it saw.
+# ============================================================================
+
+name: reshadenative-ab
+
+on:
+  workflow_dispatch:
+  push:
+    # Same dedicated branch as the other experiments. Not main.
+    branches: [archtest-ab]
+    paths:
+      - 'src/reshade_native.cpp'
+      - 'src/reshade_native.hpp'
+      - 'src/gpu1_context.cpp'
+      - 'CMakeLists.txt'
+      - '.github/workflows/reshadenative-ab.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RESHADE_SHA: 18deaa52de0c425a78b329e9cb3c497281cd00ec
+  NGX_SHA: a291cc7d2cc642a51566f3dfd5376f635cd1b284
+  MINHOOK_SHA: c3fcafdc10146beb5919319d0683e44e3c30d537
+
+jobs:
+  build:
+    runs-on: windows-latest
+    name: mgpu_reshade_native
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Containment check
+        shell: bash
+        run: |
+          PATTERN='GetClockCalibration'
+          FOUND=0
+          for DIR in src assets; do
+            [ -d "$DIR" ] || continue
+            if grep -rnE "$PATTERN" "$DIR"; then FOUND=1; fi
+          done
+          if [ "$FOUND" -ne 0 ]; then
+            echo "::error::Out-of-scope symbol: GetClockCalibration is still guarded (P2.2)"
+            exit 1
+          fi
+
+      # The one vendor GUID this experiment carries. It is written out because
+      # ReShade's IID_UnwrappedObject is internal to d3d12_impl_device.cpp and
+      # is not in the public headers this repo fetches.
+      - name: Verify the unwrap is present and correctly formed
+        shell: bash
+        run: |
+          test -f src/reshade_native.cpp
+          test -f src/reshade_native.hpp
+          grep -q '0x7F2C9A11, 0x3B4E, 0x4D6A' src/reshade_native.cpp || {
+            echo "::error::the IID_UnwrappedObject GUID is missing or mis-transcribed"
+            grep -n 'IID_ReShadeUnwrappedObject' src/reshade_native.cpp || true; exit 1; }
+          grep -q 'IID_ReShadeUnwrappedObject' src/reshade_native.hpp \
+            || grep -q 'IID_ReShadeUnwrappedObject' src/reshade_native.cpp || {
+            echo "::error::IID_ReShadeUnwrappedObject not referenced"; exit 1; }
+
+          # Every validation the contract requires must be present.
+          for NEEDLE in 'native == nullptr' 'native == reshade_proxy_device' \
+                        'native LUID MISMATCH' 'CreateCommandQueue on ngx_native_device failed'; do
+            grep -q "$NEEDLE" src/reshade_native.cpp || {
+              echo "::error::missing unwrap validation: $NEEDLE"; exit 1; }
+          done
+
+          # The experiment must not touch anything it promised to leave alone.
+          if grep -nE 'WriteProcessMemory|VirtualProtect|MH_CreateHook|nvapi_QueryInterface' \
+               src/reshade_native.cpp; then
+            echo "::error::reshade_native.cpp is doing something outside its scope"
+            exit 1
+          fi
+          echo "RESHADENATIVE scope verified: unwrap + native lane only."
+
+      # The P1.0c substitution must be the ONLY place the lane is redirected.
+      - name: Verify the lane substitution is singular and contained
+        shell: bash
+        run: |
+          N=$(grep -c 'reshadenative::ngx_device' src/gpu1_context.cpp)
+          [ "$N" -eq 1 ] || { echo "::error::expected exactly 1 ngx_device() call site, found $N"; exit 1; }
+          M=$(grep -c 'reshadenative::ngx_queue' src/gpu1_context.cpp)
+          [ "$M" -eq 1 ] || { echo "::error::expected exactly 1 ngx_queue() call site, found $M"; exit 1; }
+          K=$(grep -c 'reshadenative::init(' src/gpu1_context.cpp)
+          [ "$K" -eq 1 ] || { echo "::error::expected exactly 1 reshadenative::init() call, found $K"; exit 1; }
+          # The P4.1 stream lane must be untouched by this experiment. Checked
+          # by line position rather than by pattern, so a mention in a comment
+          # near the include cannot pass for a reach into the stream.
+          BAD=$(grep -n 'reshadenative' src/gpu1_context.cpp | awk -F: '$1 >= 11000 {print}' || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::RESHADENATIVE reached the P4.1 stream lane (line 11000+)"
+            echo "$BAD"; exit 1
+          fi
+          echo "lane substitution verified: P1.0c only, nothing at line 11000+."
+
+      - name: Fetch ReShade headers at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/reshade.tar.gz \
+            "https://codeload.github.com/crosire/reshade/tar.gz/${RESHADE_SHA}"
+          tar -xzf _dl/reshade.tar.gz -C _dl "reshade-${RESHADE_SHA}/include"
+          rm -rf ext/reshade
+          mv "_dl/reshade-${RESHADE_SHA}/include" ext/reshade
+          test -f ext/reshade/reshade.hpp
+          grep -q 'define RESHADE_API_VERSION 20' ext/reshade/reshade.hpp
+
+      - name: Fetch NVIDIA NGX headers at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/ngx.tar.gz \
+            "https://codeload.github.com/NVIDIA/DLSS/tar.gz/${NGX_SHA}"
+          tar -xzf _dl/ngx.tar.gz -C _dl --wildcards "*/include"
+          rm -rf ext/ngx
+          mv _dl/*/include ext/ngx
+          test -f ext/ngx/nvsdk_ngx.h
+          grep -rq 'NVSDK_NGX_Feature_Reserved18' ext/ngx || {
+            echo "::error::Pin drift - no NVSDK_NGX_Feature_Reserved18"; exit 1; }
+
+      - name: Fetch and build MinHook at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/minhook.tar.gz \
+            "https://codeload.github.com/TsudaKageyu/minhook/tar.gz/${MINHOOK_SHA}"
+          tar -xzf _dl/minhook.tar.gz -C _dl
+          rm -rf ext/minhook
+          mv _dl/minhook-* ext/minhook
+          test -f ext/minhook/include/MinHook.h
+          cmake -S ext/minhook -B ext/minhook/build -A x64 \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+          cmake --build ext/minhook/build --config Release
+          LIB=$(find ext/minhook/build -type f \( -iname 'minhook.x64.lib' -o -iname '*minhook*.lib' \) | head -n1)
+          if [ -z "$LIB" ]; then
+            echo "::error::no MinHook static library found"
+            find ext/minhook/build -type f | sort | head -50 || true
+            exit 1
+          fi
+          echo "discovered MinHook library: $LIB"
+          mkdir -p ext/minhook/lib
+          cp "$LIB" ext/minhook/lib/MinHook.lib
+
+      # All five flags are asserted. Nothing but MGPU_RESHADE_NATIVE moves.
+      - name: Configure (reshadenative)
+        shell: bash
+        run: |
+          cmake -B build -A x64 \
+            -DMGPU_ARCH_COMPAT=ON \
+            -DMGPU_CONTRACT_EXPANDED=ON \
+            -DMGPU_NVAPI_EXPLICIT_INIT=OFF \
+            -DMGPU_CUDA_DIAG=ON \
+            -DMGPU_RESHADE_NATIVE=ON \
+            -DMGPU_MINHOOK_DIR="${{ github.workspace }}/ext/minhook" 2>&1 | tee _cfg.txt
+
+          grep -qi "ARCHTEST variant = COMPAT" _cfg.txt || {
+            echo "::error::frozen variable drifted: MGPU_ARCH_COMPAT must be ON"
+            grep -ni 'ARCHTEST variant' _cfg.txt || true; exit 1; }
+          grep -qi "CREATECONTRACT variant = CONTRACT_EXPANDED" _cfg.txt || {
+            echo "::error::frozen variable drifted: MGPU_CONTRACT_EXPANDED must be ON"
+            grep -ni 'CREATECONTRACT variant' _cfg.txt || true; exit 1; }
+          grep -qi "NVAPIINIT variant = NVAPI_CONTROL" _cfg.txt || {
+            echo "::error::frozen variable drifted: MGPU_NVAPI_EXPLICIT_INIT must be OFF"
+            grep -ni 'NVAPIINIT variant' _cfg.txt || true; exit 1; }
+          grep -qi "CUDADIAG = ON" _cfg.txt || {
+            echo "::error::CUDADIAG must be ON - it is the instrument for this experiment"
+            grep -ni 'CUDADIAG' _cfg.txt || true; exit 1; }
+          grep -qi "RESHADENATIVE = ON" _cfg.txt || {
+            echo "::error::MGPU_RESHADE_NATIVE did not take - this build would prove nothing"
+            grep -ni 'RESHADENATIVE' _cfg.txt || true; exit 1; }
+          grep -q "MinHook library linked from" _cfg.txt || {
+            echo "::error::configured WITHOUT MinHook - the arch hook would fail closed"; exit 1; }
+
+          echo "--- all variant lines ---"
+          grep -niE 'variant = |CUDADIAG|RESHADENATIVE' _cfg.txt || true
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Verify artifact name
+        shell: bash
+        run: |
+          if find build -name 'mgpu_bridge.addon64.dll' -type f | grep -q .; then
+            echo "::error::SUFFIX appended to .dll instead of replacing it"; exit 1
+          fi
+          ADDON=$(find build -name 'mgpu_bridge.addon64' -type f | head -n1)
+          if [ -z "$ADDON" ]; then
+            echo "::error::mgpu_bridge.addon64 not produced"
+            find build -maxdepth 3 -type f || true; exit 1
+          fi
+          echo "ADDON_PATH=$ADDON" >> "$GITHUB_ENV"
+          echo "Output verified: $ADDON"
+
+      - name: Verify the instrumentation is in the binary
+        shell: bash
+        run: |
+          for S in RESHADENATIVE reshade_proxy_device ngx_native_device CUDADIAG; do
+            if ! grep -qa "$S" "$ADDON_PATH"; then
+              echo "::error::'$S' is not present in $ADDON_PATH - it was compiled out"
+              exit 1
+            fi
+          done
+          echo "instrumentation strings present in the artifact."
+
+      - name: Verify shipped presets are empty
+        shell: bash
+        run: |
+          FAIL=0
+          grep -nE '^\s*Techniques\s*=\s*\S' assets/gpu1.ini && FAIL=1
+          grep -n 'DEBUG' assets/gpu1.ini && FAIL=1
+          [ "$FAIL" -eq 0 ] || { echo "::error::shipped preset is not clean"; exit 1; }
+
+      - name: Verify shipped config
+        shell: bash
+        run: |
+          grep -qE '^\s*Frames\s*=\s*0\s*$' assets/mgpu.ini || {
+            echo "::error::assets/mgpu.ini does not set Frames=0"; exit 1; }
+          grep -qE '^\s*Depth\s*=\s*1\s*$' assets/mgpu.ini || {
+            echo "::error::assets/mgpu.ini does not set Depth=1"; exit 1; }
+          grep -qE '^\s*MVec\s*=\s*3\s*$' assets/mgpu.ini || {
+            echo "::error::assets/mgpu.ini does not set MVec=3"; exit 1; }
+
+      # The rename lives here and ONLY here, exactly as build.yml does it.
+      - name: Stage deploy set (reshadenative)
+        shell: bash
+        run: |
+          mkdir -p _deploy
+          cp "$ADDON_PATH" _deploy/nvngx.dll_mgpu_bridge.addon64
+          cp assets/gpu1.ini      _deploy/
+          cp assets/mgpu.ini      _deploy/
+          cp assets/ReShade2.ini  _deploy/
+          cp assets/README.txt    _deploy/
+          cp LICENSE              _deploy/
+          mkdir -p _deploy/reshade-shaders/Shaders
+          cp assets/reshade-shaders/Shaders/mgpu_depth_tap.fx _deploy/reshade-shaders/Shaders/
+          find _deploy -type f | sort
+          test -f _deploy/nvngx.dll_mgpu_bridge.addon64
+          case "$(ls _deploy)" in
+            *nvngx.dll_*) ;;
+            *) echo "::error::lost the nvngx.dll_ caller-gate prefix"; exit 1 ;;
+          esac
+          COUNT=$(find _deploy -type f | wc -l)
+          [ "$COUNT" -eq 7 ] || {
+            echo "::error::_deploy holds $COUNT files, expected 7"
+            find _deploy -type f | sort; exit 1; }
+
+      - name: Record the variant marker and hashes
+        shell: bash
+        run: |
+          {
+            echo "variant            = reshade_native"
+            echo
+            echo "This build runs the P1.0c NGX lane on the UNWRAPPED original D3D12"
+            echo "device and preserves every other experiment setting:"
+            echo "    MGPU_ARCH_COMPAT=ON          (architecture spoofing untouched)"
+            echo "    MGPU_CONTRACT_EXPANDED=ON    (parameter contract untouched)"
+            echo "    MGPU_NVAPI_EXPLICIT_INIT=OFF (still no explicit NvAPI_Initialize)"
+            echo "    MGPU_CUDA_DIAG=ON            (observational only)"
+            echo "    MGPU_RESHADE_NATIVE=ON       (the only change)"
+            echo
+            echo "The P4.1 stream lane is NOT converted. One command list and queue"
+            echo "carry transport, NGX Evaluate and the CreateFeature arm together,"
+            echo "and the device passed to stream_nr_create creates every NR texture."
+            echo "Converting it would mix proxy resources with a native list or move"
+            echo "the transport. The P1.0c lane is fully separable and is the lane"
+            echo "that measured desc.ptr=0x30000004, status=-1."
+            echo
+            echo "HISTORICAL BASELINE OBSERVATIONS (recorded by earlier runs; these"
+            echo "are observations, not a counterfactual binary identity claim):"
+            echo "    baseline P1.0c Init        = Success"
+            echo "    baseline P4.1  Init        = Success"
+            echo "    baseline CreateFeature     = 0xBAD00002 at 1280x720 and 3840x2160"
+            echo
+            echo "commit             = ${GITHUB_SHA}"
+            echo "run                = ${GITHUB_RUN_ID}"
+            echo "built              = $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "NOT AN A/B. One build, one artifact, no compare job. Whether THIS run"
+            echo "is a valid basis is decided at run time: P1.0c Init AND P4.1 Init must"
+            echo "both be Success; either FAIL_OutOfDate voids the NGX portion."
+          } > RESHADENATIVE_VARIANT.txt
+          cat RESHADENATIVE_VARIANT.txt
+
+          {
+            echo "RESHADENATIVE artifact hashes - reshade_native"
+            echo
+            echo "Deploy set (7 files):"
+            ( cd _deploy && find . -type f | sort | while read f; do
+                printf '%s  %s\n' "$(sha256sum "$f" | awk '{print $1}')" "$f"
+              done )
+            echo
+            echo "Add-on alone:"
+            printf '%s  %s\n' \
+              "$(sha256sum _deploy/nvngx.dll_mgpu_bridge.addon64 | awk '{print $1}')" \
+              "nvngx.dll_mgpu_bridge.addon64"
+          } > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Assert the deploy set is still exactly seven files
+        shell: bash
+        run: |
+          COUNT=$(find _deploy -type f | wc -l)
+          if [ "$COUNT" -ne 7 ]; then
+            echo "::error::_deploy holds $COUNT files immediately before upload, expected 7"
+            find _deploy -type f | sort; exit 1
+          fi
+          find _deploy -type f | sort
+          echo "deploy set is exactly 7 files; metadata stays outside it."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mgpu_reshade_native
+          path: |
+            _deploy/
+            SHA256SUMS.txt
+            RESHADENATIVE_VARIANT.txt
+          if-no-files-found: error
