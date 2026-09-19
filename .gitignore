@@ -28,3 +28,17 @@ cache/
 __pycache__/
 *.pyc
 
+# NR-WORKER: the worker's own build, its CI scratch, and the byproducts of
+# running a workflow's gate steps locally - which is how the gates are checked
+# before they are pushed (run_pcab_gates.py at the rig's root writes
+# _cfg*.txt and the extracted contract files beside the sources).
+build-nr/
+_nr/
+_cfg_nr.txt
+_frozen_contract.txt
+_worker_contract.txt
+NR_WORKER_VARIANT.txt
+nr-selftest.json
+nr-ipc-probe.json
+transport-benchmark.json
+

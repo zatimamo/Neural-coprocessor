@@ -1,0 +1,591 @@
+# ============================================================================
+# nr-worker - the out-of-process neural lane
+# ============================================================================
+# THIS BUILDS THE WORKER AND ITS TOOLS. It does not build the MGPU add-on, it
+# does not deploy, and it never launches Cyberpunk.
+#
+# WHAT IT CAN AND CANNOT PROVE
+#   GitHub's Windows runners have NO NVIDIA adapter. So the two things that
+#   matter most on real hardware - the Reserved18 proof and the two-GPU transport
+#   round trip - cannot run here, and this workflow does not pretend otherwise.
+#   It says which of its gates are GPU-free, and RUN-NR-WORKER.cmd is what
+#   produces the two results that need the real machine.
+#
+#   What CAN run here, and does, on every build:
+#     * all four targets compile;
+#     * the REUSED proven layer is byte-identical to the frozen blobs, and the
+#       worker's lane still applies the SAME creation contract, key for key and
+#       value for value, in the same order;
+#     * the ARCHITECTURE RULE: the game-side sources contain no reference to the
+#       worker or to its initialization, so the new lane cannot be linked back
+#       into the add-on by accident;
+#     * nr_selftest: protocol v1, a REAL named-pipe handshake, the frame-slot
+#       pipeline and every refusal it is supposed to make, the JSON writer;
+#     * nr_ipc_probe against the REAL mgpu_nr_worker.exe across a real process
+#       boundary, with --protocol-only so no GPU is involved;
+#     * the worker refuses to run without the runtime it is told to expect, and
+#       refuses BEFORE it touches a device, an NGX module or NVAPI;
+#     * the benchmark's adapter selection refuses to invent an adapter on a
+#       machine that has none, with a distinct exit code.
+# ============================================================================
+
+name: nr-worker
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [archtest-ab]
+    paths:
+      - 'tools/nr_worker/**'
+      # The worker compiles these files, so a change to them is a change here.
+      - 'tools/processcontext_ab/nv.cpp'
+      - 'tools/processcontext_ab/nv.h'
+      - 'tools/processcontext_ab/observe.cpp'
+      - 'tools/processcontext_ab/observe.hpp'
+      - '.github/workflows/nr-worker.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NGX_SHA: a291cc7d2cc642a51566f3dfd5376f635cd1b284
+  MINHOOK_SHA: c3fcafdc10146beb5919319d0683e44e3c30d537
+
+jobs:
+  build:
+    runs-on: windows-latest
+    name: nr-worker
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ---------------------------------------------------------------------
+      # 1. THE PROVEN LAYER IS UNTOUCHED. nv.cpp, nv.h, observe.cpp and
+      #    observe.hpp are compiled verbatim into the worker, so this checks the
+      #    same blob ids the processcontext-ab workflow freezes.
+      # ---------------------------------------------------------------------
+      - name: The reused proven layer is byte-identical
+        shell: bash
+        run: |
+          FAIL=0
+          CHECKED=0
+          while read -r WANT PATHNAME; do
+            [ -n "$PATHNAME" ] || continue
+            GOT=$(git hash-object -- "$PATHNAME" 2>/dev/null || echo MISSING)
+            CHECKED=$((CHECKED + 1))
+            if [ "$GOT" != "$WANT" ]; then
+              echo "::error::$PATHNAME hashes to $GOT, expected the frozen blob $WANT"
+              FAIL=1
+            else
+              echo "$PATHNAME: OK ($GOT)"
+            fi
+          done <<'EOF'
+          23ba2bcf7129c1412e4ec9a7637fd8b5fea4e736 tools/processcontext_ab/nv.cpp
+          5fb039e843bd3abef689e8722eaa4541a094d265 tools/processcontext_ab/nv.h
+          b292b5da088f8fb777d9e259fe5cb5b5b56da1eb tools/processcontext_ab/observe.cpp
+          d6b99ab0b126e4805811df24e2998d839d831856 tools/processcontext_ab/observe.hpp
+          EOF
+          [ "$CHECKED" -eq 4 ] || { echo "::error::checked $CHECKED file(s), expected 4"; exit 1; }
+          [ "$FAIL" -eq 0 ] || exit 1
+          echo "the worker compiles the frozen proven layer: NVAPI, arch patch, logging, hashing and the private-call observer."
+
+      # ---------------------------------------------------------------------
+      # 2. THE LANE APPLIES THE SAME CONTRACT. Not "the same keys" as a prose
+      #    claim: the params->Set sequence is extracted from BOTH files and
+      #    compared line for line, and the only normalisation allowed is the
+      #    constant NAME (NR_CTRL_W -> CTRL_W), whose VALUES are then checked
+      #    separately so the normalisation cannot hide a changed geometry.
+      # ---------------------------------------------------------------------
+      - name: The worker's creation contract equals the frozen one
+        shell: bash
+        run: |
+          FROZEN=tools/processcontext_ab/main.cpp
+          WORKER=tools/nr_worker/nr_lane.cpp
+          test -f "$FROZEN" || { echo "::error::missing $FROZEN"; exit 1; }
+          test -f "$WORKER" || { echo "::error::missing $WORKER"; exit 1; }
+
+          # The function body is found by BRACE DEPTH, not by an indentation
+          # pattern: the frozen lane's copy sits four spaces in and the worker's
+          # eight, and a pattern that fits one silently extracts nothing from the
+          # other - which is exactly what happened first time round, and reported
+          # "0 keys" instead of failing loudly.
+          extract() {
+            awk '
+              /void apply_reference_contract/ { in_fn = 1 }
+              in_fn {
+                line = $0
+                print line
+                o = gsub(/\{/, "{", line)
+                c = gsub(/\}/, "}", line)
+                depth += o - c
+                if (o > 0) started = 1
+                if (started && depth <= 0) exit
+              }
+            ' "$1" \
+              | grep -o 'params->Set([^;]*' \
+              | tr -d ' \t' \
+              | sed 's/NR_CTRL_/CTRL_/g'
+          }
+          extract "$FROZEN" > _frozen_contract.txt
+          extract "$WORKER" > _worker_contract.txt
+          N=$(wc -l < _frozen_contract.txt)
+          M=$(wc -l < _worker_contract.txt)
+          [ "$N" -ge 12 ] || { echo "::error::only $N params->Set calls found in the frozen lane"; exit 1; }
+          [ "$N" -eq "$M" ] || {
+            echo "::error::the worker applies $M keys, the frozen lane applies $N"; exit 1; }
+          if ! diff -u _frozen_contract.txt _worker_contract.txt; then
+            echo "::error::the worker's creation contract differs from the frozen lane's"
+            exit 1
+          fi
+          echo "--- the contract, $N keys, identical in both files ---"
+          cat _worker_contract.txt
+
+          # The geometry the two constant names stand for. The worker's constants
+          # live in its header, the frozen lane's in its main.cpp.
+          grep -qE 'const unsigned CTRL_W = 640u;'  "$FROZEN" || { echo "::error::frozen CTRL_W is not 640"; exit 1; }
+          grep -qE 'const unsigned CTRL_H = 360u;'  "$FROZEN" || { echo "::error::frozen CTRL_H is not 360"; exit 1; }
+          HEAD=tools/nr_worker/nr_lane.h
+          grep -qE 'const unsigned NR_CTRL_W = 640u;' "$HEAD" || { echo "::error::worker NR_CTRL_W is not 640"; exit 1; }
+          grep -qE 'const unsigned NR_CTRL_H = 360u;' "$HEAD" || { echo "::error::worker NR_CTRL_H is not 360"; exit 1; }
+          grep -qE 'const unsigned NR_DEVICE_RTX_4070 = 0x2786u;' "$HEAD" || {
+            echo "::error::the worker does not name the RTX 4070 as 10DE:2786"; exit 1; }
+          grep -qE 'const unsigned long long NR_EXPECTED_BLOB = 3944768ull;' "$HEAD" || {
+            echo "::error::the worker does not pin the proven blob size"; exit 1; }
+
+          # REJECTED in the worker's contract, exactly as in the frozen one.
+          for S in 'params->Set("Width"' 'params->Set("Height"' 'DLSSNR.Output.Scale'; do
+            H=$(grep -nF -- "$S" "$WORKER" || true)
+            [ -z "$H" ] || { echo "$H"; echo "::error::'$S' is in the worker's contract"; exit 1; }
+          done
+          echo "contract verified: same keys, same values, same order; no generic Width/Height."
+
+      # ---------------------------------------------------------------------
+      # 3. THE STEP ORDER, AND THE APP ID. The order is part of the
+      #    reproduction, not an implementation detail: an explicit
+      #    NvAPI_Initialize before core Init, or the arch patch before it, is a
+      #    different experiment that would still produce numbers.
+      # ---------------------------------------------------------------------
+      - name: The worker's lane keeps the proven order and app id
+        shell: bash
+        run: |
+          W=tools/nr_worker/nr_lane.cpp
+          # COMMENT LINES ARE SKIPPED: the file documents the order it must keep,
+          # and a gate that reads its own documentation as evidence proves nothing.
+          line_of() { grep -nF -- "$2" "$1" | grep -vE '^[0-9]+:[[:space:]]*//' | head -n1 | cut -d: -f1; }
+          FAIL=0
+          order_ok() {
+            A=$(line_of "$1" "$2"); B=$(line_of "$1" "$3")
+            if [ -z "$A" ] || [ -z "$B" ]; then
+              echo "::error::a step is missing: '$2'=$A '$3'=$B"; FAIL=1; return
+            fi
+            if [ "$A" -ge "$B" ]; then
+              echo "::error::out of order: '$2' at line $A must come before '$3' at $B"; FAIL=1
+            fi
+          }
+          order_ok "$W" 'D3D12CreateDevice(adapter'                 'pcab::ngx_load_core()'
+          order_ok "$W" 'pcab::ngx_load_core()'                     'p_init(pcab::NS_APPLICATION_ID'
+          order_ok "$W" 'p_init(pcab::NS_APPLICATION_ID'            'p_alloc(&params)'
+          order_ok "$W" 'p_alloc(&params)'                          'pcab::nv_load_and_initialize()'
+          order_ok "$W" 'pcab::nv_load_and_initialize()'            'pcab::nv_set_arch_target('
+          order_ok "$W" 'pcab::nv_set_arch_target('                 'pcab::arch_cache_real()'
+          order_ok "$W" 'pcab::arch_cache_real()'                   'arch_patch_install()'
+          order_ok "$W" 'arch_patch_install()'                      'observe_install('
+          order_ok "$W" 'observe_install('                          'pcab::ngx_load_snippet('
+          order_ok "$W" 'pcab::ngx_load_snippet('                   'p_sinit(pcab::NS_APPLICATION_ID'
+          order_ok "$W" 'p_sinit(pcab::NS_APPLICATION_ID'           'apply_reference_contract(g_lane.params);'
+          order_ok "$W" 'apply_reference_contract(g_lane.params);'  'p_create(g_lane.list'
+          [ "$FAIL" -eq 0 ] || exit 1
+
+          # The app id is the proven constant at BOTH Init points, and no literal
+          # app id and no zero appear anywhere in the lane.
+          N=$(grep -c 'NS_APPLICATION_ID' "$W")
+          [ "$N" -ge 4 ] || { echo "::error::NS_APPLICATION_ID appears $N times, expected at least 4"; exit 1; }
+          for S in '0x1000000' 'Init_Ext(0,' 'Init(0,'; do
+            H=$(grep -nF -- "$S" "$W" || true)
+            [ -z "$H" ] || { echo "$H"; echo "::error::a literal app id is in the worker lane"; exit 1; }
+          done
+          # The version stamp is the proven V2 form, asserted on the frozen header
+          # the worker compiles (the constant itself lives there).
+          grep -q 'NV_GPU_ARCH_INFO_VER_2 = sizeof(NV_GPU_ARCH_INFO) | (2u << 16)' \
+            tools/processcontext_ab/nv.h || {
+            echo "::error::the V2 version stamp is not the proven one"; exit 1; }
+          echo "order verified: device, core, Init, AllocateParameters, NVAPI, arch cache, patch, observer, snippet, Init_Ext, contract, CreateFeature."
+
+      # ---------------------------------------------------------------------
+      # 4. THE ARCHITECTURE RULE. The RTX 4070 neural device must never exist
+      #    inside Cyberpunk.exe, so the game side must not reference the worker
+      #    or its initialization at all. This is checked on the SOURCE, in the
+      #    direction that matters: the add-on reaching for the worker.
+      # ---------------------------------------------------------------------
+      - name: The game side cannot link the worker back in
+        shell: bash
+        run: |
+          test -d src || { echo "::error::no src/ - the add-on sources are missing"; exit 1; }
+
+          # Any reference at all, from the add-on's own tree or its build files.
+          H=$(grep -rnE 'nr_lane|nr_worker|nr_transport|mgpu_nr_worker|MGPU_NR_|tools/nr_worker' \
+                src CMakeLists.txt assets 2>/dev/null || true)
+          [ -z "$H" ] || {
+            echo "$H"
+            echo "::error::the game side references the worker. The worker owns neural "
+            echo "::error::initialization; the game owns capture and transport only."
+            exit 1
+          }
+
+          # The worker's target must not be added to the add-on's build either.
+          H=$(grep -nE 'add_subdirectory[[:space:]]*\(.*nr_worker|tools/nr_worker' CMakeLists.txt 2>/dev/null || true)
+          [ -z "$H" ] || { echo "$H"; echo "::error::the add-on's CMakeLists pulls in the worker"; exit 1; }
+
+          # And the positive half: exactly one place defines the worker target.
+          DEF=$(grep -rln --exclude-dir=.git 'add_executable(mgpu_nr_worker' tools | sort -u | tr '\n' ' ')
+          [ "$DEF" = "tools/nr_worker/CMakeLists.txt " ] || {
+            echo "::error::the worker target is defined in [$DEF], expected only tools/nr_worker/CMakeLists.txt"
+            exit 1
+          }
+
+          # The worker's lane must not be reachable from the add-on through an
+          # include path that climbs out of src/.
+          H=$(grep -rnE '#include[[:space:]]*["<][.][.]/' src 2>/dev/null | grep -i nr || true)
+          [ -z "$H" ] || { echo "$H"; echo "::error::src/ includes the worker's headers"; exit 1; }
+          echo "architecture rule verified: no path from the game side to the worker's initialization."
+
+      # ---------------------------------------------------------------------
+      # 5. THE TRANSPORT DOES NOT CAPTURE AND DOES NOT USE THE CPU FOR PIXELS.
+      # ---------------------------------------------------------------------
+      - name: The transport is GPU-only
+        shell: bash
+        run: |
+          D=tools/nr_worker
+          for S in 'IDXGIOutputDuplication' 'GraphicsCapture' 'BitBlt' 'GetDC(' 'CreateDesktopDup' \
+                   'WriteToSubresource' 'ReadFromSubresource' 'StretchRect'; do
+            H=$(grep -rn -- "$S" $D || true)
+            [ -z "$H" ] || { echo "$H"; echo "::error::'$S' is in the transport: this is a capture path"; exit 1; }
+          done
+
+          # The cross-adapter flags the documentation requires, all present.
+          grep -q 'D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER' $D/nr_transport.cpp || {
+            echo "::error::no D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER"; exit 1; }
+          grep -q 'D3D12_HEAP_FLAG_SHARED' $D/nr_transport.cpp || {
+            echo "::error::no D3D12_HEAP_FLAG_SHARED"; exit 1; }
+          grep -q 'D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER' $D/nr_transport.cpp || {
+            echo "::error::no D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER"; exit 1; }
+          grep -q 'CreateHeap' $D/nr_transport.cpp || {
+            echo "::error::the shared heap is not created with CreateHeap"; exit 1; }
+          grep -q 'CreatePlacedResource' $D/nr_transport.cpp || {
+            echo "::error::the shared surface is not a placed resource"; exit 1; }
+          grep -q 'CreateSharedHandle' $D/nr_transport.cpp || {
+            echo "::error::no CreateSharedHandle"; exit 1; }
+          grep -q 'OpenSharedHandleByName' $D/nr_transport.cpp || {
+            echo "::error::no OpenSharedHandleByName, so a second process could not open the surface"; exit 1; }
+          grep -q 'D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER' $D/nr_transport.cpp || {
+            echo "::error::no cross-adapter fence"; exit 1; }
+          grep -q 'D3D12_COMMAND_LIST_TYPE_DIRECT' $D/nr_transport.cpp || {
+            echo "::error::no DIRECT queue"; exit 1; }
+          grep -q 'D3D12_HEAP_TYPE_DEFAULT' $D/nr_transport.cpp || {
+            echo "::error::the cross-adapter heap is not D3D12_HEAP_TYPE_DEFAULT"; exit 1; }
+
+          # The benchmark loads no NGX and no NVAPI: "NR is not involved in this
+          # test" has to be true of the binary, not only of the prose. Comments are
+          # stripped first, because the prose in these files says what it does NOT
+          # use and a gate must not read that as a dependency.
+          TMPD=$(mktemp -d)
+          for F in nr_bench.cpp nr_transport.cpp nr_transport.h; do
+            sed 's|//.*$||' "tools/nr_worker/$F" > "$TMPD/$F"
+          done
+          sed 's/#.*$//' tools/nr_worker/CMakeLists.txt > "$TMPD/CMakeLists.txt"
+          RC=0
+          for S in 'NVSDK_NGX' 'nvapi' 'NvAPI' 'DLSSNR' 'Reserved18'; do
+            H=$(grep -n -- "$S" "$TMPD/nr_bench.cpp" "$TMPD/nr_transport.cpp" \
+                  "$TMPD/nr_transport.h" || true)
+            if [ -n "$H" ]; then
+              echo "$H"; echo "::error::'$S' is in the transport benchmark"; RC=1
+            fi
+          done
+          # What the BENCHMARK links is d3d12, dxgi and bcrypt - read off the
+          # target itself. A blanket grep over the project could not make that
+          # statement: the WORKER legitimately needs MinHook (nv.cpp detours
+          # nvapi_QueryInterface and NvAPI_GPU_GetArchInfo), so naming it in this
+          # file is correct and only the benchmark's own link line is the claim.
+          LIBS=$(awk '/target_link_libraries\(nr_transport_bench PRIVATE/,/\)/' \
+                   tools/nr_worker/CMakeLists.txt \
+                 | tr -d '()' | tr ' \t' '\n\n' | grep -E '^[A-Za-z0-9_]+$' \
+                 | grep -vE 'target_link_libraries|nr_transport_bench|^PRIVATE$' \
+                 | sort | tr '\n' ' ')
+          [ "$LIBS" = "bcrypt d3d12 dxgi " ] || {
+            echo "::error::the benchmark links [$LIBS], expected [bcrypt d3d12 dxgi ]"; RC=1; }
+          rm -rf "$TMPD"
+          [ "$RC" -eq 0 ] || exit 1
+          echo "transport verified: cross-adapter heap + placed resources + named handles + cross-adapter fence, GPU-only, no capture, and no neural runtime in its code or its link line."
+
+      # ---------------------------------------------------------------------
+      # 6. THE PROTOCOL IS FIXED SIZE, AND SAYS SO AT COMPILE TIME.
+      # ---------------------------------------------------------------------
+      - name: The control protocol is a fixed binary contract
+        shell: bash
+        run: |
+          P=tools/nr_worker/nr_proto.h
+          for S in 'PROTO_MAGIC' 'PROTO_VERSION = 1u' 'std::uint32_t size;' 'std::uint32_t frame_id;' \
+                   'HELLO = 1' 'WORKER_READY = 2' 'CONFIG = 3' 'FRAME_SUBMIT = 4' \
+                   'FRAME_COMPLETE = 5' 'SHUTDOWN = 6' 'ERROR = 7'; do
+            grep -qF -- "$S" "$P" || { echo "::error::'$S' is missing from the protocol"; exit 1; }
+          done
+          N=$(grep -c 'static_assert' "$P")
+          [ "$N" -ge 10 ] || { echo "::error::only $N static_asserts pin the layout"; exit 1; }
+          grep -qF '\\\\.\\pipe\\MGPU_NR_%lu' tools/nr_worker/nr_proto.cpp || {
+            echo "::error::the pipe name is not \\\\.\\pipe\\MGPU_NR_<pid>"; exit 1; }
+          echo "protocol verified: $N compile-time layout assertions, seven message kinds, one pipe name shape."
+
+      # ---------------------------------------------------------------------
+      # 7. Dependencies, pinned. Same SHAs as every other workflow here.
+      # ---------------------------------------------------------------------
+      - name: Fetch NVIDIA NGX headers at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/ngx.tar.gz \
+            "https://codeload.github.com/NVIDIA/DLSS/tar.gz/${NGX_SHA}"
+          tar -xzf _dl/ngx.tar.gz -C _dl --wildcards "*/include"
+          rm -rf ext/ngx
+          mv _dl/*/include ext/ngx
+          test -f ext/ngx/nvsdk_ngx.h
+
+      - name: Fetch and build MinHook at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/minhook.tar.gz \
+            "https://codeload.github.com/TsudaKageyu/minhook/tar.gz/${MINHOOK_SHA}"
+          tar -xzf _dl/minhook.tar.gz -C _dl
+          rm -rf ext/minhook
+          mv _dl/minhook-* ext/minhook
+          cmake -S ext/minhook -B ext/minhook/build -A x64 \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+          cmake --build ext/minhook/build --config Release
+          LIB=$(find ext/minhook/build -type f \( -iname 'minhook.x64.lib' -o -iname '*minhook*.lib' \) | head -n1)
+          [ -n "$LIB" ] || { echo "::error::no MinHook static library found"; exit 1; }
+          mkdir -p ext/minhook/lib
+          cp "$LIB" ext/minhook/lib/MinHook.lib
+
+      # ---------------------------------------------------------------------
+      # 8. Configure and build.
+      # ---------------------------------------------------------------------
+      - name: Configure (nr-worker)
+        shell: bash
+        run: |
+          cmake -S tools/nr_worker -B build-nr -A x64 \
+            -DPCAB_NGX_DIR="${{ github.workspace }}/ext/ngx" \
+            -DPCAB_MINHOOK_DIR="${{ github.workspace }}/ext/minhook" 2>&1 | tee _cfg_nr.txt
+          grep -q "NR-WORKER: proven layer from" _cfg_nr.txt || {
+            echo "::error::configured without the proven layer"; exit 1; }
+          grep -q "NR-WORKER: NGX headers from" _cfg_nr.txt || {
+            echo "::error::configured without the NGX headers"; exit 1; }
+          grep -q "NR-WORKER: output" _cfg_nr.txt || {
+            echo "::error::the output path was not announced"; exit 1; }
+          grep -n "NR-WORKER" _cfg_nr.txt
+
+      - name: Build (nr-worker)
+        run: cmake --build build-nr --config Release
+
+      - name: Verify the four binaries
+        shell: bash
+        run: |
+          for B in mgpu_nr_worker nr_selftest nr_ipc_probe nr_transport_bench; do
+            F=$(find build-nr -name "$B.exe" -type f | head -n1)
+            [ -n "$F" ] || { echo "::error::$B.exe was not produced"; exit 1; }
+            echo "$B: $F"
+          done
+          WORKER=$(find build-nr -name 'mgpu_nr_worker.exe' -type f | head -n1)
+          BENCH=$(find build-nr -name 'nr_transport_bench.exe' -type f | head -n1)
+          SELF=$(find build-nr -name 'nr_selftest.exe' -type f | head -n1)
+          PROBE=$(find build-nr -name 'nr_ipc_probe.exe' -type f | head -n1)
+          echo "WORKER=$WORKER" >> "$GITHUB_ENV"
+          echo "BENCH=$BENCH"   >> "$GITHUB_ENV"
+          echo "SELF=$SELF"     >> "$GITHUB_ENV"
+          echo "PROBE=$PROBE"   >> "$GITHUB_ENV"
+
+          # The worker carries the lane's instrumentation and the protocol.
+          for S in 'WORKER_READY' 'WORKER_FAILED' 'NR-WORKER-RESULT' 'MGPU_NR_' \
+                   'NVSDK_NGX_D3D12_Init_Ext' 'NvAPI_Initialize' 'Reserved18' 'nvsdk_ngx'; do
+            grep -qa -- "$S" "$WORKER" || {
+              echo "::error::'$S' is not in the worker - the lane was compiled out"; exit 1; }
+          done
+          # And the benchmark carries NONE of them: NR is not involved in it.
+          for S in 'NVSDK_NGX' 'nvngx_dlssnr' 'NvAPI_Initialize' 'Reserved18' 'NvApi_Initialize'; do
+            if grep -qa -- "$S" "$BENCH"; then
+              echo "::error::'$S' is in the transport benchmark - NR is supposed to be absent"
+              exit 1
+            fi
+          done
+          echo "binaries verified: the lane is in the worker and absent from the benchmark."
+
+      # ---------------------------------------------------------------------
+      # 9. GPU-FREE BEHAVIOURAL TESTS. These run for real, on every build.
+      # ---------------------------------------------------------------------
+      - name: "Self-test (GPU-free: protocol, pipes, slots, JSON)"
+        shell: bash
+        run: |
+          mkdir -p _nr && cd _nr
+          ../"$SELF" --json nr-selftest.json
+          RC=$?
+          echo "--- report ---"
+          cat nr-selftest.json
+          [ "$RC" -eq 0 ] || { echo "::error::nr_selftest exited $RC"; exit 1; }
+          grep -q '"ok":true' nr-selftest.json || { echo "::error::the self-test report is not ok"; exit 1; }
+          grep -q '"requires_gpu":false' nr-selftest.json || {
+            echo "::error::the self-test does not state that it needs no GPU"; exit 1; }
+          echo "self-test ok: the GPU-free claim is in the report."
+
+      - name: The worker refuses what it must refuse (no GPU needed)
+        shell: bash
+        run: |
+          cd _nr
+          set +e
+          # (a) no --mode at all
+          ../"$WORKER" > noargs.txt 2>&1
+          RC=$?
+          [ "$RC" -eq 1 ] || { echo "::error::no arguments exited $RC, expected 1"; exit 1; }
+          grep -q 'choose --prove or --serve' noargs.txt || {
+            echo "::error::the usage does not say what to choose"; exit 1; }
+          echo "(a) no arguments refused, exit $RC"
+
+          # (b) an unknown argument
+          ../"$WORKER" --prove --frobnicate > badarg.txt 2>&1
+          RC=$?
+          [ "$RC" -eq 1 ] || { echo "::error::an unknown argument exited $RC, expected 1"; exit 1; }
+          echo "(b) unknown argument refused, exit $RC"
+
+          # (c) THE HASH GATE. A file that is not the runtime the worker insists on
+          #     must be refused BEFORE a device, an NGX module or NVAPI is touched.
+          printf 'not the neural runtime' > wrong.dll
+          ../"$WORKER" --prove --nr-dll wrong.dll > gate.txt 2>&1
+          RC=$?
+          cat gate.txt
+          [ "$RC" -eq 1 ] || { echo "::error::a wrong NR DLL exited $RC, expected 1"; exit 1; }
+          grep -q 'MISMATCH' gate.txt || { echo "::error::a wrong NR DLL was not reported as a mismatch"; exit 1; }
+          grep -q 'ABORTING before the load' gate.txt || { echo "::error::the gate did not abort before the load"; exit 1; }
+          grep -q 'NR_DLL_SHA256_MISMATCH' gate.txt || { echo "::error::the gate did not name the reason"; exit 1; }
+          for S in 'D3D12CreateDevice' 'NvAPI_Initialize' 'CreateFeature' 'NGX'; do
+            if grep -q -- "$S" gate.txt; then
+              echo "::error::the hash gate let '$S' happen before refusing the DLL"; exit 1
+            fi
+          done
+          echo "(c) hash gate ok, exit $RC - refused before any device, module or call"
+
+          # (d) the data path must contain the DLL it will be handed.
+          mkdir -p refdir otherdir
+          printf 'not the neural runtime' > refdir/nvngx_dlssnr.dll
+          ../"$WORKER" --prove --nr-dll refdir/nvngx_dlssnr.dll --nr-dll-sha256 deadbeef > deriv.txt 2>&1
+          RC=$?
+          [ "$RC" -eq 1 ] || { echo "::error::expected exit 1, got $RC"; exit 1; }
+          grep -q 'derived data path' deriv.txt || { echo "::error::the derived data path is not logged"; exit 1; }
+          grep -q 'inside the data path it will be given - OK' deriv.txt || {
+            echo "::error::the containment check did not pass"; exit 1; }
+          echo "(d) the data path is derived from --nr-dll, and the DLL must be inside it, exit $RC"
+
+      - name: The worker serves the protocol and the probe talks to it
+        shell: bash
+        run: |
+          cd _nr
+          # THE REAL WORKER, the REAL probe, a real process boundary - and no GPU
+          # involved, because --protocol-only never touches D3D12, NVAPI or NGX.
+          ../"$WORKER" --serve --protocol-only --accept-seconds 30 \
+            --pipe '\\.\pipe\MGPU_NR_CI' --log-name nr-worker-ci &
+          WPID=$!
+          sleep 3
+          ../"$PROBE" --pipe '\\.\pipe\MGPU_NR_CI' --frames 4 --expect-protocol-only \
+            --json nr-ipc-probe.json
+          RC=$?
+          echo "--- probe report ---"
+          cat nr-ipc-probe.json
+          wait $WPID
+          WRC=$?
+          echo "worker exit $WRC, probe exit $RC"
+          [ "$RC" -eq 0 ] || { echo "::error::nr_ipc_probe exited $RC"; exit 1; }
+          [ "$WRC" -eq 0 ] || { echo "::error::the worker exited $WRC"; exit 1; }
+          grep -q '"ok":true' nr-ipc-probe.json || { echo "::error::the probe report is not ok"; exit 1; }
+          grep -q 'WORKER_READY' context-nr-worker-ci.log || {
+            echo "::error::the worker never printed WORKER_READY"; exit 1; }
+          grep -q 'reserved18=-1' context-nr-worker-ci.log || {
+            echo "::error::the protocol-only worker did not say it has no session"; exit 1; }
+          echo "handshake ok: the real worker and the real probe agreed, over a real named pipe."
+
+      - name: The benchmark refuses to invent an adapter
+        shell: bash
+        run: |
+          cd _nr
+          set +e
+          ../"$BENCH" --list-adapters > adapters.txt 2>&1
+          RC=$?
+          cat adapters.txt
+          # No NVIDIA adapter on a GitHub runner, so the correct answer is the
+          # distinct "this rig is not the rig" code - never a fabricated adapter.
+          [ "$RC" -eq 3 ] || { echo "::error::--list-adapters exited $RC, expected 3 (no 10DE:2705 + 10DE:2786)"; exit 1; }
+          grep -q 'NR-BENCH-ADAPTERS' adapters.txt || { echo "::error::the adapter line is missing"; exit 1; }
+          grep -q 'ti_super=0' adapters.txt || { echo "::error::an adapter was invented"; exit 1; }
+          echo "adapter selection ok: exit $RC, and it named what it did not find."
+
+      # ---------------------------------------------------------------------
+      # 10. The artifact: four binaries, the runner and the README.
+      # ---------------------------------------------------------------------
+      - name: Stage and hash the artifact
+        shell: bash
+        run: |
+          mkdir -p _nrworker
+          cp "$WORKER" _nrworker/mgpu_nr_worker.exe
+          cp "$SELF"   _nrworker/nr_selftest.exe
+          cp "$PROBE"  _nrworker/nr_ipc_probe.exe
+          cp "$BENCH"  _nrworker/nr_transport_bench.exe
+          cp tools/nr_worker/RUN-NR-WORKER.cmd _nrworker/
+          cp tools/nr_worker/README.txt       _nrworker/
+
+          ( cd _nrworker && sha256sum mgpu_nr_worker.exe nr_selftest.exe nr_ipc_probe.exe \
+              nr_transport_bench.exe RUN-NR-WORKER.cmd README.txt ) > _nrworker/SHA256SUMS.txt
+          cat _nrworker/SHA256SUMS.txt
+
+          COUNT=$(find _nrworker -type f | wc -l)
+          [ "$COUNT" -eq 7 ] || { echo "::error::the artifact holds $COUNT files, expected 7"; find _nrworker -type f | sort; exit 1; }
+
+          {
+            echo "variant   = nr-worker"
+            echo
+            echo "The out-of-process neural lane. SPLITPROCESS_ISOLATION proved that"
+            echo "the RTX 4070 lane fails inside a process that also holds active"
+            echo "Ti SUPER D3D12 state (descriptor -1, CuModule -1, Reserved18"
+            echo "0xBAD00002) and succeeds when that state is in another process."
+            echo "This worker is that other process: it owns the RTX 4070 device,"
+            echo "the NGX core, the architecture patch, the DLSSNR runtime and the"
+            echo "Reserved18 session. Cyberpunk.exe never creates them."
+            echo
+            echo "mgpu_nr_worker.exe      the lane, the Reserved18 proof, and the v1"
+            echo "                        control protocol on \\\\.\\pipe\\MGPU_NR_<pid>"
+            echo "nr_selftest.exe         GPU-free tests, including a real named-pipe"
+            echo "                        handshake"
+            echo "nr_ipc_probe.exe        the client half of the protocol"
+            echo "nr_transport_bench.exe  the two-GPU cross-adapter round trip. It"
+            echo "                        loads no NGX and no NVAPI, on purpose."
+            echo
+            echo "commit    = ${GITHUB_SHA}"
+            echo "run       = ${GITHUB_RUN_ID}"
+            echo "built     = $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "pins:"
+            echo "  NVIDIA/DLSS        ${NGX_SHA}"
+            echo "  TsudaKageyu/minhook ${MINHOOK_SHA}"
+            echo
+            echo "Run it on the real machine with RUN-NR-WORKER.cmd. It never launches"
+            echo "Cyberpunk and it deploys nothing."
+          } > NR_WORKER_VARIANT.txt
+          cat NR_WORKER_VARIANT.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nr-worker
+          path: |
+            _nrworker/
+            NR_WORKER_VARIANT.txt
+          if-no-files-found: error
