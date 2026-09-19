@@ -44,8 +44,26 @@ namespace pcab
     const unsigned NVAPI_ID_GET_CUDA_DESCRIPTOR = 0x0DDAC234u;
     const unsigned NVAPI_ID_CREATE_CU_MODULE    = 0xAD1A677Du;
 
-    // NV_GPU_ARCH_INFO_VER_2 = 2 * 1000 + 0  (MAKE_NVAPI_VERSION)
-    const unsigned NV_GPU_ARCH_INFO_VER_2 = 2000u;
+    // NV_GPU_ARCH_INFO_VER_2 == MAKE_NVAPI_VERSION(NV_GPU_ARCH_INFO_V2, 2),
+    // which expands to `sizeof(struct) | (version << 16)`:
+    //
+    //     sizeof(NV_GPU_ARCH_INFO) = 4 * NvU32 = 16
+    //     16 | (2 << 16)          = 0x00020010
+    //
+    // A version stamp written as two times one thousand used to be here, and it
+    // was WRONG. MAKE_NVAPI_VERSION packs the STRUCT SIZE in the LOW 16 bits
+    // and the version number in the high 16, so that value declared version 0
+    // with a size of two thousand bytes. A driver that validates the version
+    // field rejects it, and the whole architecture patch then silently never
+    // applies - which is the worst possible failure for this experiment, because
+    // the run still produces numbers.
+    //
+    // NV_GPU_ARCH_INFO_V1 has the SAME four fields (version, architecture,
+    // implementation, revision), so it is also 16 bytes and carries the same
+    // layout - only the version stamp differs. That is what makes
+    // NeuralScreen's V1 fallback safe to implement with one struct.
+    const unsigned NV_GPU_ARCH_INFO_VER_2 = sizeof(NV_GPU_ARCH_INFO) | (2u << 16);
+    const unsigned NV_GPU_ARCH_INFO_VER_1 = sizeof(NV_GPU_ARCH_INFO) | (1u << 16);
 
     struct NV_GPU_ARCH_INFO
     {
@@ -55,6 +73,11 @@ namespace pcab
         unsigned revision;
     };
     static_assert(sizeof(NV_GPU_ARCH_INFO) == 16, "NV_GPU_ARCH_INFO is four NvU32");
+
+    // The NGX ApplicationId NeuralScreen v1.15.0 passes to BOTH the core
+    // NVSDK_NGX_D3D12_Init and the snippet NVSDK_NGX_D3D12_Init_Ext on its
+    // working Reserved18 path. NEVER 0.
+    const unsigned long long NS_APPLICATION_ID = 0x1000000ULL;
 
     // The value NeuralScreen spoofs to: the architecture the DLSSNR 310.8.0
     // runtime accepts ("spoofed to the DLL's accepted value"; VERSION.txt of the
@@ -73,13 +96,30 @@ namespace pcab
     bool nv_load_and_initialize();
     void *nv_query(unsigned id);
 
-    // The NeuralScreen-compatible architecture patch: the resolved
-    // NvAPI_GPU_GetArchInfo entry is detoured so every query reports the value
-    // the DLSSNR runtime accepts. NVIDIA's own code still serves the call - only
-    // the returned architecture is rewritten - and the patch is installed only
-    // when the real value is not already accepted.
+    // The NeuralScreen-compatible architecture patch, in the order the
+    // reference implementation uses:
+    //
+    //   1. nv_set_arch_target(vendor, device)
+    //                    name the ONE adapter whose architecture is spoofed
+    //   2. arch_cache_real()
+    //                    query NvAPI_GPU_GetArchInfo for EVERY NVIDIA GPU with
+    //                    the hook NOT yet installed, and cache each real result
+    //                    against its own physical-GPU handle
+    //   3. arch_patch_install()
+    //                    detour the entry. Unknown handles and every GPU that
+    //                    is not the target get their OWN cached real result;
+    //                    only the target is rewritten to the value the DLSSNR
+    //                    310.8.0 runtime accepts.
+    //
+    // It must be installed AFTER core NVSDK_NGX_D3D12_Init and AFTER
+    // NVSDK_NGX_D3D12_AllocateParameters, and BEFORE the snippet is loaded.
+    void nv_set_arch_target(unsigned vendor_id, unsigned device_id);
+    bool arch_cache_real();
     bool arch_patch_install();
     void arch_patch_remove();
+
+    // The real architecture of the target adapter, or of the first cached GPU
+    // when no target was named. 0 when nothing was cached.
     unsigned arch_real_value();
 
     // ------------------------------------------------------------- modules
@@ -107,6 +147,11 @@ namespace pcab
         NVSDK_NGX_Version InSDKVersion,
         const NVSDK_NGX_Parameter *InParameters);
     typedef NVSDK_NGX_Result (NVSDK_CONV *pf_get_cap_params)(
+        NVSDK_NGX_Parameter **OutParameters);
+    // The block this diagnostic Resets and fills. NOT the capability block: that
+    // one belongs to the core and is shared with every other consumer in the
+    // process, which is exactly the wrong thing to overwrite with a contract.
+    typedef NVSDK_NGX_Result (NVSDK_CONV *pf_alloc_params)(
         NVSDK_NGX_Parameter **OutParameters);
     typedef NVSDK_NGX_Result (NVSDK_CONV *pf_populate_params)(
         NVSDK_NGX_Parameter *InParameters);

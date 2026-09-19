@@ -537,9 +537,9 @@ class ProcessContextArmParser(object):
         # recorded because they say whether the lane ran at all; they are not the
         # reference gate, which is about the two private calls.
         self.core_init = NOT_OBSERVED
-        self.caps = NOT_OBSERVED
+        self.alloc = NOT_OBSERVED
         self.snip_init = NOT_OBSERVED
-        self.populate = NOT_OBSERVED
+        self.feature_handle = NOT_OBSERVED
         self.result_desc_status = NOT_OBSERVED
         self.result_cu_status = NOT_OBSERVED
         self.descriptor_calls = []
@@ -574,12 +574,20 @@ class ProcessContextArmParser(object):
                     self.feature = _hex_to_int(v)
                 elif k == "core_init":
                     self.core_init = _hex_to_int(v)
+                elif k == "alloc":
+                    self.alloc = _hex_to_int(v)
                 elif k == "caps":
-                    self.caps = _hex_to_int(v)
+                    # the field name this line used before the parameter block
+                    # came from AllocateParameters; still accepted
+                    self.alloc = _hex_to_int(v)
                 elif k == "snip_init":
                     self.snip_init = _hex_to_int(v)
                 elif k == "populate":
-                    self.populate = _hex_to_int(v)
+                    pass          # retired key, ignored on purpose
+                elif k == "blob":
+                    self.blob_size = _dec_to_int(v)
+                elif k == "handle":
+                    self.feature_handle = _hex_to_int(v)
                 elif k == "desc_status":
                     self.result_desc_status = NOT_OBSERVED if v == "NA" else _dec_to_int(v)
                 elif k == "cu_status":
@@ -669,6 +677,11 @@ class ProcessContextArmParser(object):
         m = _RE_P1_FEATURE.search(line)
         if m:
             self.feature = _hex_to_int(m.group("result"))
+            # The CreateFeature HANDLE, which the reference gate requires to be
+            # non-zero. It is a different value from the descriptor handle the
+            # CUDA-interop call returns, and confusing the two would let a run
+            # with no feature object at all pass the gate.
+            self.feature_handle = _hex_to_int(m.group("h"))
             return
 
     def first_real(self, calls):
@@ -722,10 +735,10 @@ class ProcessContextArmParser(object):
             "control": self.control,
             "reason": self.reason,
             "feature": self.feature,
+            "feature_handle": self.feature_handle,
             "core_init": self.core_init,
-            "caps": self.caps,
+            "alloc": self.alloc,
             "snip_init": self.snip_init,
-            "populate": self.populate,
             "descriptor_status": NOT_OBSERVED if d is None else d.status,
             "descriptor_handle": NOT_OBSERVED if d is None else d.handle,
             "cumodule_status": NOT_OBSERVED if c is None else c.status,

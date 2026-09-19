@@ -32,31 +32,105 @@ namespace
     HMODULE g_snippet = nullptr;
 
     // ---- architecture patch state ----
+    //
+    // ONE cached entry per physical GPU, filled BEFORE the hook exists. The
+    // hook serves each GPU its own real result and rewrites exactly one of them.
     using pfn_get_arch = int(__cdecl *)(void *, NV_GPU_ARCH_INFO *);
+    using pfn_enum = int(__cdecl *)(void **, unsigned *);
+    using pfn_pci = int(__cdecl *)(void *, unsigned *, unsigned *, unsigned *, unsigned *);
+
+    const unsigned MAX_ARCH_GPUS = 64;
+
+    struct ArchEntry
+    {
+        void           *gpu;          // NvPhysicalGpuHandle, as an opaque value
+        unsigned        raw_pci;      // NVAPI pDeviceId: (device << 16) | vendor
+        bool            have_real;
+        NV_GPU_ARCH_INFO real;
+        bool            spoof;        // the ONE eligible NeuralScreen target
+        unsigned        queried_ver;  // which version stamp the real query used
+    };
+
+    ArchEntry g_arch[MAX_ARCH_GPUS];
+    unsigned  g_arch_count = 0;
+    unsigned  g_arch_target_raw = 0;
+    bool      g_arch_target_set = false;
+    unsigned  g_arch_rewrites = 0;
+    unsigned  g_arch_passthrough = 0;
+    unsigned  g_arch_unknown = 0;
+    unsigned  g_arch_too_small = 0;
+
     pfn_get_arch g_arch_original = nullptr;   // the real entry, via MinHook
-    unsigned g_arch_real = 0;
     bool g_arch_active = false;
-    unsigned g_arch_rewrites = 0;
 
     FILE *g_log = nullptr;
     char  g_log_path[MAX_PATH]{};
 
-    int __cdecl arch_detour(void *hPhysicalGpu, NV_GPU_ARCH_INFO *pInfo)
+    ArchEntry *find_arch(void *gpu)
     {
-        const int r = g_arch_original(hPhysicalGpu, pInfo);
-        if (r == 0 && pInfo != nullptr)
+        for (unsigned i = 0; i < g_arch_count; ++i)
+            if (g_arch[i].gpu == gpu) return &g_arch[i];
+        return nullptr;
+    }
+
+    // How many bytes the CALLER's structure actually is. MAKE_NVAPI_VERSION
+    // packs the size into the low 16 bits, so this is exactly the caller's
+    // declared size and nothing may be written outside it.
+    unsigned declared_size(const NV_GPU_ARCH_INFO *p)
+    {
+        return p->version & 0xFFFFu;
+    }
+
+    int __cdecl arch_detour(void *gpu, NV_GPU_ARCH_INFO *pInfo)
+    {
+        if (g_arch_original == nullptr) return -1;
+        // NVIDIA's own code still serves the call, so every real error code and
+        // every side effect is preserved. Only the returned VALUES are then
+        // replaced, and only for the caller's declared structure.
+        const int r = g_arch_original(gpu, pInfo);
+        if (r != 0 || pInfo == nullptr) return r;
+
+        ArchEntry *e = find_arch(gpu);
+        if (e == nullptr)
         {
-            g_arch_real = pInfo->architecture;
-            // Rewrite ONLY when the runtime would reject the real value. Same
-            // behaviour as NeuralScreen: "architecture 0x%X is supported anyway
-            // - no spoof needed".
-            if (pInfo->architecture != SPOOF_ARCHITECTURE)
+            // A handle cached before the hook was installed is the only kind
+            // this patch knows how to speak for. An unknown one gets the
+            // genuine answer, untouched.
+            ++g_arch_unknown;
+            return r;
+        }
+
+        if (!e->spoof)
+        {
+            // EVERY OTHER GPU GETS ITS OWN CACHED REAL RESULT.
+            // Not the target's, and not a shared value: this is the whole point
+            // of caching per handle before the hook went in.
+            if (e->have_real && declared_size(pInfo) >= sizeof(NV_GPU_ARCH_INFO))
             {
-                pInfo->architecture   = SPOOF_ARCHITECTURE;
-                pInfo->implementation = SPOOF_IMPLEMENTATION;
-                pInfo->revision       = SPOOF_REVISION;
-                ++g_arch_rewrites;
+                pInfo->architecture   = e->real.architecture;
+                pInfo->implementation = e->real.implementation;
+                pInfo->revision       = e->real.revision;
             }
+            ++g_arch_passthrough;
+            return r;
+        }
+
+        // The single eligible target. Rewrite ONLY when the runtime would
+        // reject the real value - NeuralScreen's behaviour.
+        if (declared_size(pInfo) < sizeof(NV_GPU_ARCH_INFO))
+        {
+            ++g_arch_too_small;
+            logf("[arch] a caller declared only %u bytes for the architecture structure; "
+                 "the spoof needs %u, so NOTHING is rewritten for that caller",
+                 declared_size(pInfo), (unsigned)sizeof(NV_GPU_ARCH_INFO));
+            return r;
+        }
+        if (pInfo->architecture != SPOOF_ARCHITECTURE)
+        {
+            pInfo->architecture   = SPOOF_ARCHITECTURE;
+            pInfo->implementation = SPOOF_IMPLEMENTATION;
+            pInfo->revision       = SPOOF_REVISION;
+            ++g_arch_rewrites;
         }
         return r;
     }
@@ -210,37 +284,142 @@ void *nv_query(unsigned id)
     return (g_query != nullptr) ? g_query(id) : nullptr;
 }
 
-unsigned arch_real_value() { return g_arch_real; }
+unsigned arch_real_value()
+{
+    if (g_arch_target_set)
+    {
+        ArchEntry *e = nullptr;
+        for (unsigned i = 0; i < g_arch_count; ++i)
+            if (g_arch[i].spoof) { e = &g_arch[i]; break; }
+        if (e != nullptr && e->have_real) return e->real.architecture;
+    }
+    for (unsigned i = 0; i < g_arch_count; ++i)
+        if (g_arch[i].have_real) return g_arch[i].real.architecture;
+    return 0;
+}
+
+void nv_set_arch_target(unsigned vendor_id, unsigned device_id)
+{
+    // NvAPI_GPU_GetPCIIdentifiers returns the RAW NVAPI pDeviceId, which packs
+    // the PCI device id in the HIGH 16 bits and the vendor id in the LOW 16 -
+    // not a DXGI DeviceId. MGPU's T2 mapping uses the same packing.
+    g_arch_target_raw = (device_id << 16) | (vendor_id & 0xFFFFu);
+    g_arch_target_set = true;
+    logf("[arch] spoof target: vendor=0x%04X device=0x%04X -> raw pDeviceId=0x%08X "
+         "(the ONLY adapter whose architecture will be rewritten)",
+         vendor_id & 0xFFFFu, device_id & 0xFFFFu, g_arch_target_raw);
+}
+
+bool arch_cache_real()
+{
+    if (g_arch_count > 0) return true;
+
+    void *enum_raw = nv_query(NVAPI_ID_ENUM_PHYSICAL_GPUS);
+    void *pci_raw  = nv_query(NVAPI_ID_GET_PCI_IDENTIFIERS);
+    void *arch_raw = nv_query(NVAPI_ID_GET_ARCH_INFO);
+    if (enum_raw == nullptr || arch_raw == nullptr)
+    {
+        logf("[arch] NVAPI enumeration/GetArchInfo entry points are unavailable - the "
+             "architecture patch cannot be applied. The runtime may refuse the feature "
+             "for an architecture reason that is NOT the hypothesis under test.");
+        return false;
+    }
+
+    void *gpus[MAX_ARCH_GPUS] = {0};
+    unsigned count = 0;
+    ((pfn_enum)enum_raw)(gpus, &count);
+    if (count > MAX_ARCH_GPUS) count = MAX_ARCH_GPUS;
+
+    pfn_get_arch real_arch = (pfn_get_arch)arch_raw;
+    g_arch_count = 0;
+
+    for (unsigned i = 0; i < count; ++i)
+    {
+        ArchEntry e{};
+        e.gpu = gpus[i];
+        e.raw_pci = 0;
+        e.have_real = false;
+        e.queried_ver = 0;
+
+        if (pci_raw != nullptr)
+        {
+            unsigned dev = 0, sub = 0, rev = 0, ext = 0;
+            if (((pfn_pci)pci_raw)(gpus[i], &dev, &sub, &rev, &ext) == 0) e.raw_pci = dev;
+        }
+
+        // V2 first - it is the version that carries implementation and
+        // revision. If the driver refuses it, NeuralScreen's V1 fallback is the
+        // same structure with a V1 stamp, so no layout changes.
+        e.real.version = NV_GPU_ARCH_INFO_VER_2;
+        int r = real_arch(gpus[i], &e.real);
+        if (r == 0)
+        {
+            e.queried_ver = 2;
+        }
+        else
+        {
+            e.real.version = NV_GPU_ARCH_INFO_VER_1;
+            r = real_arch(gpus[i], &e.real);
+            if (r == 0) e.queried_ver = 1;
+        }
+        e.have_real = (r == 0);
+
+        e.spoof = (g_arch_target_set && e.raw_pci != 0 && e.raw_pci == g_arch_target_raw);
+
+        logf("[arch] cached nvapi physical[%u] handle=%p vendor=0x%04X device=0x%04X "
+             "real=%s arch=0x%X impl=0x%X rev=0x%X (queried V%u) %s",
+             i, gpus[i], e.raw_pci & 0xFFFFu, (e.raw_pci >> 16) & 0xFFFFu,
+             e.have_real ? "OK" : "FAILED",
+             e.real.architecture, e.real.implementation, e.real.revision,
+             e.queried_ver,
+             e.spoof ? "-> SPOOF TARGET (this one is rewritten)"
+                     : "-> left at its own real value");
+
+        g_arch[g_arch_count++] = e;
+    }
+
+    if (g_arch_count == 0)
+    {
+        logf("[arch] NvAPI_EnumPhysicalGPUs returned no GPUs - nothing to cache and the "
+             "architecture patch will not be installed");
+        return false;
+    }
+    if (g_arch_target_set)
+    {
+        bool found = false;
+        for (unsigned i = 0; i < g_arch_count; ++i) if (g_arch[i].spoof) found = true;
+        if (!found)
+            logf("[arch] the spoof target raw pDeviceId=0x%08X is NOT among the %u "
+                 "enumerated NVIDIA GPUs - NO adapter will be rewritten. The DLSSNR "
+                 "310.8.0 runtime is expected to refuse the real architecture, so a "
+                 "failure downstream of this has a cause that is NOT the hypothesis "
+                 "under test.", g_arch_target_raw, g_arch_count);
+    }
+    else
+    {
+        logf("[arch] no spoof target was named - every GPU will report its own real "
+             "architecture and nothing will be rewritten");
+    }
+    return true;
+}
 
 bool arch_patch_install()
 {
     if (g_arch_active) return true;
+    if (g_arch_count == 0)
+    {
+        logf("[arch] arch_cache_real() has not run or cached nothing; the patch is NOT "
+             "installed. Caching happens BEFORE the hook, on purpose: a value read "
+             "through a hook that is already rewriting could be the rewritten one.");
+        return false;
+    }
 
     void *entry = nv_query(NVAPI_ID_GET_ARCH_INFO);
     if (entry == nullptr)
     {
-        logf("[arch] NvAPI_GPU_GetArchInfo (0x%08X) did not resolve - the runtime may refuse "
-             "the feature for an architecture reason that is NOT the hypothesis under test",
-             NVAPI_ID_GET_ARCH_INFO);
+        logf("[arch] NvAPI_GPU_GetArchInfo (0x%08X) did not resolve", NVAPI_ID_GET_ARCH_INFO);
         return false;
     }
-
-    // Ask the real function once, so the log names the value being replaced.
-    pfn_get_arch real = (pfn_get_arch)entry;
-    void *gpus[64]{};
-    unsigned count = 0;
-    void *enum_raw = nv_query(NVAPI_ID_ENUM_PHYSICAL_GPUS);
-    if (enum_raw != nullptr)
-    {
-        using pfn_enum = int(__cdecl *)(void **, unsigned *);
-        ((pfn_enum)enum_raw)(gpus, &count);
-    }
-    NV_GPU_ARCH_INFO info{};
-    info.version = NV_GPU_ARCH_INFO_VER_2;
-    if (count > 0 && real(gpus[0], &info) == 0)
-        g_arch_real = info.architecture;
-    logf("[arch] GPU count=%u, real architecture=0x%X (0x190 is Ada / RTX 40; the DLSSNR "
-         "310.8.0 runtime wants 0x%X)", count, g_arch_real, SPOOF_ARCHITECTURE);
 
     MH_STATUS st = MH_Initialize();
     if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED)
@@ -253,8 +432,8 @@ bool arch_patch_install()
     st = MH_CreateHook(entry, (LPVOID)&arch_detour, &original);
     if (st != MH_OK || original == nullptr)
     {
-        logf("[arch] MH_CreateHook(NvAPI_GPU_GetArchInfo) -> %d - the patch is NOT installed",
-             (int)st);
+        logf("[arch] MH_CreateHook(NvAPI_GPU_GetArchInfo) -> %d - the patch is NOT "
+             "installed", (int)st);
         return false;
     }
     g_arch_original = (pfn_get_arch)original;
@@ -269,9 +448,9 @@ bool arch_patch_install()
     }
 
     g_arch_active = true;
-    logf("[arch] patch installed: architecture 0x%X -> 0x%X / impl 0x%X / rev 0x%X "
-         "(NVIDIA's own code still serves the call; only the returned value is rewritten)",
-         g_arch_real, SPOOF_ARCHITECTURE, SPOOF_IMPLEMENTATION, SPOOF_REVISION);
+    logf("[arch] patch installed over %u cached GPU(s): the spoof target -> 0x%X / impl "
+         "0x%X / rev 0x%X, every other GPU -> its own cached real value",
+         g_arch_count, SPOOF_ARCHITECTURE, SPOOF_IMPLEMENTATION, SPOOF_REVISION);
     return true;
 }
 
@@ -281,7 +460,9 @@ void arch_patch_remove()
     void *entry = nv_query(NVAPI_ID_GET_ARCH_INFO);
     if (entry != nullptr) MH_DisableHook(entry);
     g_arch_active = false;
-    logf("[arch] patch removed (rewrites applied this run: %u)", g_arch_rewrites);
+    logf("[arch] patch removed (target rewrites: %u, other-GPU passthroughs: %u, unknown "
+         "handles: %u, too-small callers: %u)",
+         g_arch_rewrites, g_arch_passthrough, g_arch_unknown, g_arch_too_small);
 }
 
 // ------------------------------------------------------------------ modules

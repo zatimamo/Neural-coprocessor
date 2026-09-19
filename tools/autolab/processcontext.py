@@ -94,31 +94,31 @@ class ProcessContextRunner(object):
         return {"dir": staging_dir, "exe": gated, "nr_dll": nr_dst}
 
     # ------------------------------------------------------------------ run
+    def run_arm(self, staged, arm):
+        """Run ONE arm as its own fresh process."""
+        started = time.time()
+        cmd = [staged["exe"], "--mode", arm, "--nr-dll", staged["nr_dll"]]
+        self.log("experiment PROCESSCONTEXT/%s: running" % arm)
+        try:
+            proc = subprocess.run(cmd, cwd=staged["dir"], capture_output=True,
+                                  text=True, timeout=self.timeout, errors="replace")
+            out, err, rc = proc.stdout or "", proc.stderr or "", proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            out = (exc.stdout or b"").decode("utf-8", "replace") \
+                if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            err, rc = "TIMEOUT after %ss" % self.timeout, None
+        except OSError as exc:
+            out, err, rc = "", "could not start the arm: %s" % exc, None
+        self.log("experiment PROCESSCONTEXT/%s: exit %s in %.1fs"
+                 % (arm, rc, time.time() - started))
+        return {"returncode": rc, "stdout": out, "stderr": err,
+                "seconds": round(time.time() - started, 2)}
+
     def run_arms(self, staged):
-        """Run the four arms, each as a fresh process. Returns per-arm output."""
+        """Kept for the maintenance path: run all four, no early exit."""
         outputs = {}
         for arm in experiments.PROCESSCONTEXT_ARMS:
-            started = time.time()
-            cmd = [staged["exe"], "--mode", arm, "--nr-dll", staged["nr_dll"]]
-            self.log("experiment PROCESSCONTEXT/%s: running" % arm)
-            try:
-                proc = subprocess.run(cmd, cwd=staged["dir"], capture_output=True,
-                                      text=True, timeout=self.timeout,
-                                      errors="replace")
-                out = proc.stdout or ""
-                err = proc.stderr or ""
-                rc = proc.returncode
-            except subprocess.TimeoutExpired as exc:
-                out = (exc.stdout or b"").decode("utf-8", "replace") \
-                    if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-                err = "TIMEOUT after %ss" % self.timeout
-                rc = None
-            except OSError as exc:
-                out, err, rc = "", "could not start the arm: %s" % exc, None
-            outputs[arm] = {"returncode": rc, "stdout": out, "stderr": err,
-                            "seconds": round(time.time() - started, 2)}
-            self.log("experiment PROCESSCONTEXT/%s: exit %s in %.1fs"
-                     % (arm, rc, outputs[arm]["seconds"]))
+            outputs[arm] = self.run_arm(staged, arm)
         return outputs
 
     def run_table(self, staged):
@@ -141,15 +141,66 @@ class ProcessContextRunner(object):
 
     # ---------------------------------------------------------------- entry
     def run(self, artifact_meta, run_dir):
-        """Stage, run the four arms, parse, and return the result object."""
+        """SINGLE first, then - ONLY if it passes the reference gate - the rest.
+
+        THE REFERENCE IS A GATE, NOT A DATUM. It is the control, so if it does
+        not reproduce, nothing the other three arms could show would be
+        readable: a difference between arms cannot be attributed to the variable
+        when the baseline itself is broken. Running them anyway would burn three
+        GPU processes and a game-free window to produce numbers that must then
+        be thrown away.
+
+        So the sequence is: launch SINGLE, parse it, evaluate the gate, and
+        decide. The other three processes are never started when SINGLE fails.
+        """
         staging = os.path.join(run_dir, "processcontext")
         staged = self.stage(artifact_meta, staging)
         started = time.time()
-        outputs = self.run_arms(staged)
+        outputs = {}
+        arms = {}
+
+        reference_arm = experiments.PROCESSCONTEXT_REFERENCE_ARM
+
+        # ---- 1. SINGLE, alone ------------------------------------------
+        outputs[reference_arm] = self.run_arm(staged, reference_arm)
+        arms.update(parse_arm_logs(staged["dir"], arms=[reference_arm]))
+        single = arms.get(reference_arm, {})
+        reference_ok = single.get("reference_ok") is True
+
+        if not reference_ok:
+            failing = single.get("reference_gate_failing") or []
+            detail = "; ".join(
+                "%s %s%s (saw %r)" % (c.get("field"), c.get("op"),
+                                      "" if "value" not in c else " %r" % c["value"],
+                                      single.get(c.get("field")))
+                for c in failing) or "the arm produced no result to evaluate"
+            self.log("experiment PROCESSCONTEXT: SINGLE did NOT pass the reference gate")
+            self.log("experiment PROCESSCONTEXT: %s" % detail)
+            self.log("experiment PROCESSCONTEXT: STOP - dual-held, dual-active and "
+                     "dual-released were NOT launched")
+            result = build_result(arms, artifact_meta, outputs, None,
+                                  round(time.time() - started, 2))
+            result["reason"] = ("the SINGLE reference arm did not reproduce, so the other "
+                                "three arms were not launched: %s" % detail)
+            result["observations"]["stopped_after"] = reference_arm
+            result["observations"]["arms_not_launched"] = [
+                a for a in experiments.PROCESSCONTEXT_ARMS if a != reference_arm]
+            result["observations"]["staging_dir"] = staging
+            return result
+
+        self.log("experiment PROCESSCONTEXT: SINGLE passed the reference gate; "
+                 "launching the other three arms")
+
+        # ---- 2. the rest, one fresh process each ------------------------
+        rest = [a for a in experiments.PROCESSCONTEXT_ARMS if a != reference_arm]
+        for arm in rest:
+            outputs[arm] = self.run_arm(staged, arm)
+            arms.update(parse_arm_logs(staged["dir"], arms=[arm]))
+
         table = self.run_table(staged)
-        arms = self.parse_arms(staged, outputs)
-        seconds = round(time.time() - started, 2)
-        result = self.result_from_arms(arms, artifact_meta, outputs, table, seconds)
+        result = build_result(arms, artifact_meta, outputs, table,
+                              round(time.time() - started, 2))
+        result["observations"]["stopped_after"] = None
         result["observations"]["staging_dir"] = staging
         result["observations"]["table_stdout"] = (table or {}).get("stdout", "")
         return result
@@ -161,18 +212,18 @@ class ProcessContextRunner(object):
 # is the real path and not a copy of it.
 # ---------------------------------------------------------------------------
 
-def parse_arm_logs(log_dir):
-    """Parse `context-<mode>.log` for each arm in log_dir.
+def parse_arm_logs(log_dir, arms=None):
+    """Parse `context-<mode>.log` for the named arms (default: all four).
 
     A missing log means the arm did not run: valid=None, reference_ok=None. It
     is never reported as a failure, because an arm that never ran is not
     evidence about the variable it was supposed to introduce.
     """
-    arms = {}
-    for arm in experiments.PROCESSCONTEXT_ARMS:
+    out = {}
+    for arm in (arms or experiments.PROCESSCONTEXT_ARMS):
         path = os.path.join(log_dir, "context-%s.log" % arm)
         if not os.path.isfile(path):
-            arms[arm] = {
+            out[arm] = {
                 "mode": arm, "valid": None, "reference_ok": None,
                 "reason": "NO_LOG", "log_path": path, "log_present": False,
                 "note": "the arm produced no log file at all",
@@ -202,8 +253,8 @@ def parse_arm_logs(log_dir):
                  "why": "; ".join(conflicts)}]
         summary["reference_ok"] = ok
         summary["reference_gate_failing"] = failing
-        arms[arm] = summary
-    return arms
+        out[arm] = summary
+    return out
 
 
 def build_result(arms, artifact_meta, outputs, table, seconds):
@@ -263,6 +314,8 @@ def build_result(arms, artifact_meta, outputs, table, seconds):
             "seconds": seconds,
             "blob_size": single.get("blob_size"),
             "descriptor_handle": single.get("descriptor_handle"),
+            "feature_handle": single.get("feature_handle"),
+            "alloc": single.get("alloc"),
             "reference_gate": "experiments.PROCESSCONTEXT_REFERENCE_GATE",
         },
     }

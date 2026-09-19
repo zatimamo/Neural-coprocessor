@@ -68,10 +68,52 @@ namespace
     std::atomic<unsigned> g_desc_ok{0};
     std::atomic<unsigned> g_cu_ok{0};
 
-    std::atomic<int> g_desc_last_status{0};
-    std::atomic<int> g_cu_last_status{0};
-    std::atomic<int> g_probe_last_status{-12345};
-    std::atomic<unsigned long long> g_first_blob_size{0};
+    // ---- REAL and PROBE status storage, deliberately separate -------------
+    //
+    // A NULL-argument capability probe and a genuine call are DIFFERENT EVENTS
+    // and their statuses are kept in different variables. Nothing can move a
+    // probe's status into a real result, because there is no code path that
+    // writes one into the other.
+    //
+    // The previous revision kept a single "last status" per function and a
+    // probe count, then reported it as the real status whenever real calls
+    // outnumbered probes. A real call followed by a probe therefore reported
+    // the probe's -14 AS the real status. That is exactly the class of error
+    // this separation removes.
+    //
+    // Within each kind the FIRST observation wins, by compare-and-swap out of a
+    // sentinel, so "the first real status" and "the first real blob size" mean
+    // what they say even if the runtime calls again.
+    const int STATUS_UNSET = 0x7FFFFFFF;   // no NvApi_Status has this value
+
+    std::atomic<int> g_desc_real_status{STATUS_UNSET};
+    std::atomic<int> g_desc_probe_status{STATUS_UNSET};
+    std::atomic<int> g_cu_real_status{STATUS_UNSET};
+    std::atomic<int> g_cu_probe_status{STATUS_UNSET};
+    std::atomic<bool> g_resolver_null{false};
+
+    void record_real(std::atomic<int> &slot, int status)
+    {
+        int expected = STATUS_UNSET;
+        slot.compare_exchange_strong(expected, status);   // first real call wins
+    }
+
+    void record_probe(std::atomic<int> &slot, int status)
+    {
+        int expected = STATUS_UNSET;
+        slot.compare_exchange_strong(expected, status);   // first probe wins
+    }
+
+    int read_status(const std::atomic<int> &slot)
+    {
+        const int v = slot.load(std::memory_order_acquire);
+        return (v == STATUS_UNSET) ? -12345 : v;
+    }
+
+    bool observed(const std::atomic<int> &slot)
+    {
+        return slot.load(std::memory_order_acquire) != STATUS_UNSET;
+    }
 
     bool covered(size_t declared, size_t off, size_t len) { return (off + len) <= declared; }
 
@@ -171,8 +213,9 @@ namespace
         }
 
         const int status = real(pParams);          // ONCE, original argument
-        g_desc_last_status.store(status);
-        if (probe) g_probe_last_status.store(status);
+        // A real call can ONLY ever reach the real slot.
+        if (probe) record_probe(g_desc_probe_status, status);
+        else       record_real(g_desc_real_status, status);
 
         size_t out_after = 0;
         bool have_out = false;
@@ -231,8 +274,9 @@ namespace
         }
 
         const int status = real(pDevice, pBlob, size, phModule);
-        g_cu_last_status.store(status);
-        if (probe) g_probe_last_status.store(status);
+        // A real call can ONLY ever reach the real slot.
+        if (probe) record_probe(g_cu_probe_status, status);
+        else       record_real(g_cu_real_status, status);
 
         unsigned long long mod = 0;
         const char *note = nullptr;
@@ -289,6 +333,20 @@ namespace
 
         if (id == NVAPI_ID_GET_CUDA_DESCRIPTOR)
         {
+            if (answer == nullptr)
+            {
+                // OBSERVATIONAL MEANS OBSERVATIONAL. The genuine resolver
+                // answered "this interface is not here", and that answer is
+                // returned unchanged. Manufacturing a wrapper around a null
+                // pointer would invent a call that does not exist, turn a
+                // capability answer into a failure, and make the log describe
+                // an invocation that never happened.
+                g_resolver_null.store(true);
+                pcab::logf("[cuda] nvapi_QueryInterface(0x0DDAC234) returned nullptr - "
+                           "returning nullptr UNCHANGED. No wrapper is manufactured for "
+                           "an interface that is not present.");
+                return nullptr;
+            }
             void *expected = nullptr;
             if (g_real_desc.compare_exchange_strong(expected, answer,
                                                     std::memory_order_release,
@@ -309,6 +367,14 @@ namespace
 
         if (id == NVAPI_ID_CREATE_CU_MODULE)
         {
+            if (answer == nullptr)
+            {
+                g_resolver_null.store(true);
+                pcab::logf("[cuda] nvapi_QueryInterface(0xAD1A677D) returned nullptr - "
+                           "returning nullptr UNCHANGED. No wrapper is manufactured for "
+                           "an interface that is not present.");
+                return nullptr;
+            }
             void *expected = nullptr;
             if (g_real_cu.compare_exchange_strong(expected, answer,
                                                   std::memory_order_release,
@@ -410,14 +476,18 @@ ObserveSummary observe_summary()
     s.cumodule_probes = g_cu_probes.load();
     s.mismatch = g_mismatch.load();
     s.first_blob_size = g_first_blob_size.load();
+    s.resolver_returned_null = g_resolver_null.load();
 
-    // Only REAL calls produce a result; a probe's -14 is not one.
-    s.real_descriptor_status = (s.descriptor_calls > s.descriptor_probes)
-                             ? g_desc_last_status.load() : -12345;
-    s.real_cumodule_status   = (s.cumodule_calls > s.cumodule_probes)
-                             ? g_cu_last_status.load() : -12345;
-    s.probe_status = (s.descriptor_probes + s.cumodule_probes) > 0
-                   ? g_probe_last_status.load() : -12345;
+    // REAL results come from the real slots and PROBE results from the probe
+    // slots. There is no arithmetic that could move one into the other, which
+    // is the property the previous revision got wrong.
+    s.real_descriptor_status = read_status(g_desc_real_status);
+    s.real_cumodule_status = read_status(g_cu_real_status);
+    s.descriptor_probe_status = read_status(g_desc_probe_status);
+    s.cumodule_probe_status = read_status(g_cu_probe_status);
+    s.probe_status = (observed(g_desc_probe_status)) ? read_status(g_desc_probe_status)
+                   : (observed(g_cu_probe_status))   ? read_status(g_cu_probe_status)
+                                                     : -12345;
     return s;
 }
 }

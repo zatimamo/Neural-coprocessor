@@ -35,6 +35,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -637,6 +638,97 @@ NEGATIVE_CONTROLS = [
 ]
 
 
+#: NEGATIVE CONTROLS for the REFERENCE GATE.
+#:
+#: The gate has eight conditions. Six of them are new: the three Init/Allocate
+#: results and the feature handle. These controls mutate a PASSING fixture one
+#: field at a time and assert the gate stops passing, so each condition is shown
+#: to be load-bearing rather than decorative.
+REFERENCE_GATE_CONTROLS = [
+    {"name": "gate/core Init not Success fails the reference",
+     "base": "pcab_all_ok/context-single.log",
+     "replace": [("core_init=0x00000001", "core_init=0x00000000")]},
+    {"name": "gate/AllocateParameters not Success fails the reference",
+     "base": "pcab_all_ok/context-single.log",
+     "replace": [("alloc=0x00000001", "alloc=0x00000000")]},
+    {"name": "gate/snippet Init_Ext not Success fails the reference",
+     "base": "pcab_all_ok/context-single.log",
+     "replace": [("snip_init=0x00000001", "snip_init=0x00000000")]},
+    {"name": "gate/a ZERO feature handle fails the reference",
+     "base": "pcab_all_ok/context-single.log",
+     "replace": [("handle=0x1D4A2B0C000", "handle=0x0")]},
+    {"name": "gate/a wrong blob size fails the reference",
+     "base": "pcab_all_ok/context-single.log",
+     "replace": [("blob=3944768", "blob=3944767")]},
+    {"name": "gate/descriptor -1 fails the reference",
+     "base": "pcab_all_ok/context-single.log",
+     "replace": [("desc_status=0", "desc_status=-1")]},
+]
+
+#: THE FAIL-FAST CONTRACT (TASK 2), asserted on the exact set of processes
+#: launched. SINGLE is a gate: when it does not reproduce, the other three must
+#: never be started.
+FAILFAST_CASES = [
+    {"fixture": "pcab_all_ok",
+     "launched": ["single", "dual-held", "dual-active", "dual-released"],
+     "verdict": "MULTI_DEVICE_EXONERATED",
+     "next": "STREAMLINE_CONTEXT_REQUIRED"},
+    {"fixture": "pcab_single_fail",
+     "launched": ["single"],
+     "verdict": "PROCESSCONTEXT_REFERENCE_INVALID",
+     "next": None},
+    {"fixture": "pcab_held_fail",
+     "launched": ["single", "dual-held", "dual-active", "dual-released"],
+     "verdict": "SECOND_LIVE_D3D12_DEVICE_SUFFICIENT",
+     "next": None},
+]
+
+
+class _StubRunner(processcontext.ProcessContextRunner):
+    """A ProcessContextRunner with the two side-effecting seams replaced.
+
+    `stage()` and `run_arm()` are the ONLY places the real runner touches the
+    filesystem and starts a process. Overriding exactly those two lets the
+    fail-fast sequencing be tested for real - the launched-arm list below is
+    produced by the real run() - without a GPU, without the artifact and without
+    executing anything.
+    """
+
+    def __init__(self, cfg, log, fixture_dir):
+        processcontext.ProcessContextRunner.__init__(self, cfg, log, gh=None)
+        self.launched = []
+        self.fixture_dir = fixture_dir
+
+    def stage(self, artifact_meta, staging_dir):
+        os.makedirs(staging_dir, exist_ok=True)
+        return {"dir": staging_dir, "exe": "stub", "nr_dll": "stub"}
+
+    def run_arm(self, staged, arm):
+        self.launched.append(arm)
+        src = os.path.join(self.fixture_dir, "context-%s.log" % arm)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(staged["dir"], "context-%s.log" % arm))
+        return {"returncode": 0, "stdout": "", "stderr": "", "seconds": 0.0}
+
+    def run_table(self, staged):
+        return {"returncode": 4, "stdout": "(stub table)"}
+
+
+def _stub_config():
+    return {
+        "repository": "stub/stub", "branch": "stub",
+        "paths": {"cyberpunk_exe": "", "install_dir": "", "addon_name": "",
+                  "reshade_log": "", "nr_dll": ""},
+        "required_nr_dll_sha256": "0" * 64,
+        "safety": {"allow_game_launch": False},
+        "launch": {"exe": "", "args": [], "working_dir": ""},
+        "timeouts": {"processcontext_seconds": 1, "game_run_seconds": 1,
+                     "post_close_wait_seconds": 0, "gh_wait_seconds": 1,
+                     "gh_poll_seconds": 1},
+        "results_dir": "results", "cache_dir": "cache", "_cache_dir": "cache",
+    }
+
+
 def run_parser_tests(console):
     console("parser tests")
     failures = []
@@ -704,6 +796,90 @@ def run_parser_tests(console):
         else:
             passed += 1
             console("  PASS %s" % ctrl["name"])
+
+    # ---- the reference gate's eight conditions, each shown to matter ------
+    #
+    # Each control mutates a PASSING fixture and pushes it through the REAL gate
+    # path - processcontext.parse_arm_logs, which evaluates the eight conditions
+    # AND cross-checks the machine-readable line against the detailed [cuda]
+    # lines. Testing gate_passes() alone would miss the case where a mutated
+    # field is contradicted by the detailed line: the gate would pass on the
+    # detailed value while the conflict check rejected the arm.
+    for ctrl in REFERENCE_GATE_CONTROLS:
+        path = os.path.join(FIXTURES, ctrl["base"].replace("/", os.sep))
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError as exc:
+            failures.append("%s: fixture unreadable (%s)" % (ctrl["name"], exc))
+            continue
+        mutated = text
+        broke = False
+        for old, new in ctrl["replace"]:
+            if old not in mutated:
+                failures.append("%s: the fixture no longer contains %r - the control is "
+                                "no longer mutating anything" % (ctrl["name"], old))
+                broke = True
+                break
+            mutated = mutated.replace(old, new)
+        if broke:
+            continue
+        tmp = tempfile.mkdtemp(prefix="autolab-gate-")
+        try:
+            with open(os.path.join(tmp, "context-single.log"), "w",
+                      encoding="utf-8", newline="\n") as fh:
+                fh.write(mutated)
+            arms = processcontext.parse_arm_logs(tmp, arms=["single"])
+            summary = arms["single"]
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        if summary.get("reference_ok") is not False:
+            failures.append(
+                "%s: the reference gate STILL passed after mutating %r -> %r "
+                "(reference_ok=%r, conflicts=%r)"
+                % (ctrl["name"], ctrl["replace"][0][0], ctrl["replace"][0][1],
+                   summary.get("reference_ok"), summary.get("parse_conflicts")))
+        else:
+            passed += 1
+            console("  PASS %s" % ctrl["name"])
+
+    # ---- TASK 2: SINGLE is a gate, not a datum ---------------------------
+    # The real run() is exercised with only its two side-effecting seams
+    # replaced, and the assertion is on the EXACT list of arms launched.
+    node = experiments.node("PROCESSCONTEXT")
+    for case in FAILFAST_CASES:
+        fixture_dir = os.path.join(FIXTURES, case["fixture"])
+        run_dir = tempfile.mkdtemp(prefix="autolab-failfast-")
+        try:
+            runner = _StubRunner(_stub_config(), console, fixture_dir)
+            result = runner.run({"artifact_dir": "(stub)"}, run_dir)
+        except Exception as exc:                      # noqa: BLE001
+            failures.append("failfast/%s: raised %s: %s"
+                            % (case["fixture"], type(exc).__name__, exc))
+            shutil.rmtree(run_dir, ignore_errors=True)
+            continue
+        decision = experiments.decide(node, result)
+        bad = []
+        if runner.launched != case["launched"]:
+            bad.append("launched %r, expected %r" % (runner.launched, case["launched"]))
+        if decision.verdict != case["verdict"] or decision.next != case["next"]:
+            bad.append("verdict %s/%s, expected %s/%s"
+                       % (decision.verdict, decision.next, case["verdict"], case["next"]))
+        if case["fixture"] == "pcab_single_fail":
+            # The point of the whole task: the other three were NOT started.
+            if len(runner.launched) != 1:
+                bad.append("SINGLE failed the reference and %d arm(s) were still launched"
+                           % len(runner.launched))
+            if result["observations"].get("arms_not_launched") != \
+                    ["dual-held", "dual-active", "dual-released"]:
+                bad.append("arms_not_launched was not recorded")
+        shutil.rmtree(run_dir, ignore_errors=True)
+        if bad:
+            failures.append("failfast/%s:\n      %s" % (case["fixture"], "\n      ".join(bad)))
+        else:
+            passed += 1
+            console("  PASS failfast/%s -> launched %s -> %s"
+                    % (case["fixture"], ",".join(runner.launched), decision.verdict))
 
     # The graph, over fixture logs, through the real parsing path.
     node = experiments.node("PROCESSCONTEXT")

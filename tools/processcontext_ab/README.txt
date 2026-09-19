@@ -14,10 +14,49 @@ second-adapter state established before that lane starts:
     single          nothing else at all. The reference. MUST succeed.
     dual-held       RTX 4070 Ti SUPER device created and held.
                     No NGX, no swapchain, no queue, no heap on it.
-    dual-active     ... plus a DIRECT command queue and a small, live
-                    CBV/SRV/UAV descriptor heap held on that device.
-    dual-released   Ti SUPER device created, recorded, then RELEASED. Nothing
-                    from it is held when the lane runs.
+    dual-active     ... plus a DIRECT command queue and a tiny CBV/SRV/UAV
+                    descriptor heap held on that device. Nothing else: no
+                    committed resource, no CBV written, no submission, no
+                    fence, no NGX, no swapchain.
+    dual-released   Ti SUPER device created, recorded, then RELEASED. Release()
+                    must return 0; if anything still references the device the
+                    arm is INVALID with SECOND_DEVICE_STILL_REFERENCED, because
+                    then it never established the variable it exists to test.
+
+THE REFERENCE LANE, IN THE ORDER NeuralScreen USES
+
+    create the RTX 4070 D3D12 device
+    NvAPI_Initialize
+    load the NGX core
+    core NVSDK_NGX_D3D12_Init                 app id 0x1000000
+    NVSDK_NGX_D3D12_AllocateParameters        a PRIVATE block, then require
+                                              Success and a non-null pointer
+    cache the real GetArchInfo for EVERY GPU, then install the architecture
+    patch over exactly ONE target entry
+    load the exact nvngx_dlssnr.dll
+    snippet NVSDK_NGX_D3D12_Init_Ext          app id 0x1000000
+    params->Reset()
+    the 640x360 creation contract
+    CreateFeature(NVSDK_NGX_Feature_Reserved18)
+
+The architecture patch is installed AFTER core Init and AFTER
+AllocateParameters, never before. Every GPU that is not the target is served its
+OWN cached real architecture, read before the hook existed; only the target is
+rewritten to 0x1B0 / 0x3 / 0xA1.
+
+THE SINGLE REFERENCE GATE - all eight, or the reference is invalid
+
+    core Init            = Success
+    AllocateParameters   = Success
+    snippet Init_Ext     = Success
+    descriptor real status = 0
+    CuModule real status   = 0
+    first CuModule blob    = 3944768
+    Reserved18             = Success
+    feature handle         != 0
+
+AutoLab evaluates the same eight conditions itself from the arm's
+machine-readable line, so the two must agree.
 
 While the lane runs, the two private calls the DLSSNR runtime makes during
 CreateFeature are observed, pass-through only:
@@ -28,6 +67,9 @@ CreateFeature are observed, pass-through only:
 and so is the feature creation itself:
 
     NVSDK_NGX_D3D12_CreateFeature(NVSDK_NGX_Feature_Reserved18) at 640x360
+
+If the genuine resolver returns nullptr for either id, that nullptr is returned
+unchanged: no wrapper is manufactured for an interface that is not present.
 
 INTERPRETATION, FIXED IN ADVANCE
 
@@ -121,10 +163,19 @@ device and its LUID, every NVAPI id resolved through nvapi_QueryInterface with
 its caller and stack, the two private calls with their arguments and statuses,
 the NGX entry-point results, and finally one machine-readable line:
 
-    PCAB-RESULT mode=... valid=... control=... core_init=... caps=...
-                snip_init=... populate=... feature=...
+    PCAB-RESULT mode=... valid=... reason=... control=... core_init=...
+                alloc=... snip_init=... feature=...
                 desc_status=... desc_calls=... desc_probes=...
-                cu_status=... cu_calls=... cu_probes=...
+                cu_status=... cu_calls=... cu_probes=... blob=... handle=...
+
+Those fields are EXACTLY the eight the reference gate needs, so the gate can be
+evaluated from this one line. The diagnostic reaches its own verdict from the
+same eight fields, so the two must agree.
+
+valid=NO means the arm could not establish its variable at all (no adapter, NVAPI
+unavailable, the second device still referenced). valid=YES with control=FAIL
+means the arm RAN and did not reproduce - which is a result about the lane, and
+is what the decision graph reads.
 
 Two things in that line are worth knowing before reading a log:
 

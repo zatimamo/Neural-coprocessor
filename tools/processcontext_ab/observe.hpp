@@ -17,11 +17,19 @@ namespace pcab
         unsigned descriptor_probes;     // null-argument capability probes
         unsigned cumodule_probes;
         bool     mismatch;              // the resolver returned a second pointer
+        bool     resolver_returned_null; // the interface was absent; nullptr returned
 
-        int      real_descriptor_status;  // status of the REAL call, or -12345
-        int      real_cumodule_status;    // status of the REAL call, or -12345
-        int      probe_status;            // status seen for a probe, or -12345
-        unsigned long long first_blob_size;
+        // REAL results. -12345 means NOT OBSERVED. These slots are written ONLY
+        // by a genuine call, so a probe's status cannot appear here.
+        int      real_descriptor_status;
+        int      real_cumodule_status;
+
+        // PROBE results, kept separately for the same reason.
+        int      descriptor_probe_status;
+        int      cumodule_probe_status;
+        int      probe_status;          // whichever probe was seen first
+
+        unsigned long long first_blob_size;   // first REAL CreateCuModule blob size
     };
 
     // Ensures nvapi64.dll is resident, then detours nvapi_QueryInterface.

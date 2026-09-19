@@ -104,14 +104,32 @@ GAME_REQUIRED_FIELDS = [
 #: reference itself did not reproduce, so nothing can be attributed to the
 #: variable the other three arms introduce.
 #:
-#: Every condition must hold AND be observed. `is_not_zero` on the handle fails
-#: on an unobserved handle, because a handle that was not read is not a handle.
+#: Every condition must hold AND be observed. `is_not_zero` on the feature
+#: handle fails on an unobserved handle, because a handle that was not read is
+#: not a handle.
+#:
+#: These are the eight conditions the corrected PROCESSCONTEXT control lane
+#: implements, evaluated here INDEPENDENTLY from the arm's machine-readable
+#: result line. The diagnostic reaches its own verdict from the same eight
+#: fields, so agreement between the two is a check on both - one of them
+#: computing it wrongly shows up as a disagreement rather than as a result.
 PROCESSCONTEXT_REFERENCE_GATE = [
+    # core NVSDK_NGX_D3D12_Init            = Success
+    {"field": "core_init", "op": "eq", "value": 0x00000001},
+    # NVSDK_NGX_D3D12_AllocateParameters   = Success
+    {"field": "alloc", "op": "eq", "value": 0x00000001},
+    # snippet NVSDK_NGX_D3D12_Init_Ext     = Success
+    {"field": "snip_init", "op": "eq", "value": 0x00000001},
+    # GetCudaIndependentDescriptorObject   real status = 0
     {"field": "descriptor_status", "op": "eq", "value": 0},
+    # CreateCuModule                       real status = 0
     {"field": "cumodule_status", "op": "eq", "value": 0},
+    # first CuModule blob size             = 3944768
     {"field": "blob_size", "op": "eq", "value": 3944768},
+    # CreateFeature Reserved18             = Success
     {"field": "feature", "op": "eq", "value": 0x00000001},
-    {"field": "descriptor_handle", "op": "is_not_zero"},
+    # the feature handle                   != 0
+    {"field": "feature_handle", "op": "is_not_zero"},
 ]
 
 #: The four arms, in the order they are run. Each is a fresh process.
