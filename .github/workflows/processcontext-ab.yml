@@ -210,6 +210,31 @@ jobs:
           H=$(printf '%s\n' "$W" | grep -nE '\b(for|while)\s*\(|\bdo\s*\{' || true)
           [ -z "$H" ] || { echo "$H"; note "a genuine call sits inside a loop"; }
 
+          # ---- the device identity is compared, and never asserted ---------
+          # The requirement is observation equivalent to CUDADIAG, and the
+          # property CUDADIAG is most careful about here is that a null device is
+          # only a negative MATCH when there is something to match it against.
+          grep -qF 'match=NOT_COMPARED' "$F" || note "the no-comparison device state is missing"
+          grep -qE 'if \(!g_expected_known\.load\(std::memory_order_acquire\)\) return "match=NOT_COMPARED";' "$F" ||
+            note "the device comparison is not gated on a published identity"
+          NM=$(grep -nF 'match=no' "$F" | grep -vE ':[ \t]*(//|\*|/\*)' | grep -c . || true)
+          [ "$NM" -eq 1 ] || {
+            note "expected exactly 1 code 'match=no' in observe.cpp, found $NM"
+            grep -nF 'match=no' "$F" || true
+          }
+          grep -qF 'g_expected_known.store(true, std::memory_order_release)' "$F" ||
+            note "the expected-device flag is not published with release after its payload"
+          grep -qF 'observe_set_expected_device' tools/processcontext_ab/observe.hpp ||
+            note "observe_set_expected_device is not declared"
+          grep -qF 'pcab::observe_set_expected_device((void *)lane.dev);' tools/processcontext_ab/main.cpp ||
+            note "the lane device is never published to the observer"
+          # Published BEFORE the observer is installed AND before anything NGX.
+          PUB=$(grep -n 'pcab::observe_set_expected_device' tools/processcontext_ab/main.cpp | head -n1 | cut -d: -f1)
+          INSD=$(grep -n 'pcab::observe_install(mode)' tools/processcontext_ab/main.cpp | head -n1 | cut -d: -f1)
+          NVINI=$(grep -n 'pcab::nv_load_and_initialize()' tools/processcontext_ab/main.cpp | head -n1 | cut -d: -f1)
+          [ -n "$PUB" ] && [ -n "$INSD" ] && [ -n "$NVINI" ] && [ "$PUB" -lt "$INSD" ] && [ "$PUB" -lt "$NVINI" ] || {
+            echo "::error::the device identity is published after the observer or after NVAPI init (pub $PUB, install $INSD, nvapi $NVINI)"; exit 1; }
+
           # ---- the hook is on the resolver, and there is exactly one ------
           N=$(grep -cE 'MH_CreateHook\(entry, \(LPVOID\)&query_detour' "$F" || true)
           [ "$N" -eq 1 ] || { note "expected exactly 1 MH_CreateHook(&query_detour), found $N"; }

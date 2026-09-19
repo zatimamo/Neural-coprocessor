@@ -28,4 +28,13 @@ namespace pcab
     bool observe_install(const char *mode);
     void observe_remove();
     ObserveSummary observe_summary();
+
+    // The device the reference lane created, published BEFORE the lane makes any
+    // NGX call, so that each private call can be reported as having reached that
+    // device or not - the comparison CUDADIAG reports as match=yes/no.
+    //
+    // Until this is called, no comparison has happened, and the log says so
+    // (match=NOT_COMPARED) rather than asserting match=no: a null device is only
+    // a negative match when there is something to match it against.
+    void observe_set_expected_device(void *device);
 }

@@ -75,6 +75,19 @@ namespace
 
     bool covered(size_t declared, size_t off, size_t len) { return (off + len) <= declared; }
 
+    std::atomic<void *> g_expected_device{nullptr};
+    std::atomic<bool> g_expected_known{false};
+
+    // Three states, never two. With no published device no comparison has
+    // happened, and claiming match=no there would assert a result this run never
+    // had - the same trap CUDADIAG's gate forbids.
+    const char *device_match(void *device)
+    {
+        if (!g_expected_known.load(std::memory_order_acquire)) return "match=NOT_COMPARED";
+        return (device == g_expected_device.load(std::memory_order_acquire)) ? "match=yes"
+                                                                            : "match=no";
+    }
+
     // Always zero-padded. The observer work this diagnostic descends from had a
     // real bug where an id was compared against a zero-padded variant of itself,
     // so the comparison silently never matched; every id printed here goes
@@ -144,9 +157,10 @@ namespace
         }
 
         pcab::logf("[cuda] #%u GetCudaIndependentDescriptorObject 0x0DDAC234 %s pDevice=%p "
-                   "type=%d desc.ptr=0x%llX structSizeIn=%llu structSizeOut_before=%llu",
+                   "type=%d desc.ptr=0x%llX structSizeIn=%llu structSizeOut_before=%llu %s",
                    n, probe ? "CAPABILITY-PROBE" : "REAL", dev, type, desc_ptr,
-                   (unsigned long long)sz, (unsigned long long)out_before);
+                   (unsigned long long)sz, (unsigned long long)out_before,
+                   probe ? "match=NA-probe" : device_match(dev));
 
         pfn_get_desc real = (pfn_get_desc)g_real_desc.load(std::memory_order_acquire);
         if (real == nullptr)
@@ -168,7 +182,10 @@ namespace
         const char *handle_note = nullptr;
         if (status != 0)               handle_note = "NOT READ: NvApi_Status != NVAPI_OK";
         else if (p == nullptr)         handle_note = "NOT READ: pParams is null";
-        else if (!have_out || !covered(out_after, 40, 8))
+        else if (!have_out)            handle_note = "NOT READ: the callee's declared input size "
+                                                     "does not cover structSizeOut, so the declared "
+                                                     "output size is unreadable";
+        else if (!covered(out_after, 40, 8))
                                        handle_note = "NOT READ: structSizeOut does not cover it";
         else                           handle = (unsigned long long)p->handle;   // offset 40
 
@@ -201,8 +218,9 @@ namespace
         }
 
         pcab::logf("[cuda] #%u CreateCuModule 0xAD1A677D %s pDevice=%p pBlob=%p (pointer only; "
-                   "never dereferenced) size=%u phModule=%p",
-                   n, probe ? "CAPABILITY-PROBE" : "REAL", pDevice, pBlob, size, phModule);
+                   "never dereferenced) size=%u phModule=%p %s",
+                   n, probe ? "CAPABILITY-PROBE" : "REAL", pDevice, pBlob, size, phModule,
+                   probe ? "match=NA-probe" : device_match(pDevice));
 
         pfn_create_cu real = (pfn_create_cu)g_real_cu.load(std::memory_order_acquire);
         if (real == nullptr)
@@ -373,6 +391,14 @@ void observe_remove()
         void *entry = (void *)GetProcAddress(nvapi, "nvapi_QueryInterface");
         if (entry != nullptr) MH_DisableHook(entry);
     }
+}
+
+void observe_set_expected_device(void *device)
+{
+    g_expected_device.store(device, std::memory_order_release);
+    g_expected_known.store(true, std::memory_order_release);   // flag published AFTER its payload
+    logf("[cuda] expected device for the private-call observation = %p - every call from here is "
+         "reported as having reached it or not", device);
 }
 
 ObserveSummary observe_summary()

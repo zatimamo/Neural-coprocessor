@@ -769,6 +769,10 @@ int main(int argc, char **argv)
     pcab::logf("");
 
     // ---- NVAPI: the observer first, then the documented ordering ----------
+    // The lane's device is published to the observer BEFORE anything is resolved
+    // or called, so every private call is reported against it - the same
+    // identity comparison CUDADIAG reports as match=yes/no.
+    pcab::observe_set_expected_device((void *)lane.dev);
     const bool observed = pcab::observe_install(mode);
     pcab::logf("[nvapi] observation installed = %s", observed ? "yes" : "NO");
     pcab::logf("");
