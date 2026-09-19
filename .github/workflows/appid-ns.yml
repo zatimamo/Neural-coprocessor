@@ -1,0 +1,660 @@
+# ============================================================================
+# APPID_NS - the NGX ApplicationId for the Reserved18 sessions
+# ============================================================================
+# ONE build, ONE artifact, no compare job.
+#
+# THE HYPOTHESIS, AND WHY IT IS NEW
+#   NeuralScreen's WORKING Reserved18 path initialises NGX with
+#
+#       ApplicationId = 0x1000000ULL
+#
+#   for BOTH entry points - the core NVSDK_NGX_D3D12_Init and the snippet
+#   nvngx_dlssnr.dll!NVSDK_NGX_D3D12_Init_Ext. MGPU passes 0ULL to both, in the
+#   P1.0c startup probe and in the P4.1 stream session.
+#
+#   Every other measurable difference between the two paths has already been
+#   closed one at a time - the D3D12 device, the caller identity (the
+#   nvngx.dll_ module prefix), the runtime DLL, the architecture spoof, the
+#   expanded parameter contract, the resolution, the transport - and the two
+#   private NVAPI CUDA-interop calls still return NVAPI_ERROR under MGPU and
+#   NVAPI_OK under NeuralScreen. The ApplicationId is a value the two paths
+#   genuinely differ in, it reaches the same two entry points, and it has never
+#   been varied. That is what makes it the next single variable.
+#
+# WHAT THIS BUILD CHANGES - one number, at six call sites
+#   MGPU_APPID_NS=ON. Every Reserved18 session init is passed 0x1000000ULL:
+#       P1.0c core     NVSDK_NGX_D3D12_Init        (+ its Init_Ext fallback)
+#       P1.0c snippet  NVSDK_NGX_D3D12_Init_Ext    (+ its Init fallback)
+#       P4.1  core     NVSDK_NGX_D3D12_Init
+#       P4.1  snippet  NVSDK_NGX_D3D12_Init_Ext
+#   All six read one function, mgpu::appidns::reserved18_app_id(), so the four
+#   sessions cannot disagree with each other. With MGPU_APPID_NS absent the same
+#   function returns 0ULL and the build is the CONTROL.
+#
+#   There is NO fallback id, NO retry with another id, and
+#   NVSDK_NGX_D3D12_Init_with_ProjectID is never called: a second attempt would
+#   be a second variable.
+#
+# THE FROZEN BASELINE - asserted at configure time
+#   MGPU_RESHADE_NATIVE=ON       the RESHADENATIVE lane, as established
+#   MGPU_ARCH_COMPAT=ON          architecture spoofing untouched
+#   MGPU_CONTRACT_EXPANDED=ON    CreateFeature parameter contract untouched
+#   MGPU_NVAPI_EXPLICIT_INIT=OFF no explicit NvAPI_Initialize
+#   MGPU_CUDA_DIAG=ON            the observer for the two CUDA-interop calls
+#   device, proxy/native handling, queue/list/fence, contract, architecture hook,
+#   private NVAPI wrappers, runtime DLL, data path, SDK version, feature id,
+#   resolution, transport, depth and motion vectors - all untouched.
+#
+# WHAT THIS JOB REFUSES TO BUILD
+#   It diffs the pushed revision against the recorded baseline commit and fails
+#   if ANY file outside the APPID_NS scope changed, and if ANY line of
+#   gpu1_context.cpp changed that is not an ApplicationId line. "Change only the
+#   ApplicationId" is the entire claim of this experiment; a build that cannot
+#   demonstrate it is not evidence for it.
+#
+#   It also fails if the value 0x1000000 appears anywhere in src/ other than
+#   appid_ns.cpp/hpp, if a project-id init appears, if the C2-SR session (which
+#   is NOT a Reserved18 session) stops being passed 0ULL, or if the four fixed
+#   [APPID] lines are missing.
+#
+# THE RUN-TIME VALIDITY GATE - evaluated on the rig, from the log
+#   A run is a valid basis for this experiment only if BOTH hold:
+#       P1.0c Init = Success
+#       P4.1  Init = Success
+#   If either is FAIL_OutOfDate the NGX portion of that run is VOID - record it,
+#   and do not read its CUDA-interop statuses as a comparison.
+#   The runtime must be the already-established NeuralScreen snippet:
+#       SHA256 DCC0DC2414AEDEC4A8E084647070383BE068554042587180C20C784D4772D36F
+#
+# INTERPRETATION, FIXED IN ADVANCE
+#   On a valid run, observing only the descriptor status, the first CuModule
+#   status, and the Reserved18 CreateFeature result:
+#
+#     descriptor -1 -> 0  and  CuModule -1 -> 0
+#         -> the ApplicationId was part of the blocker.
+#     both still -1 with valid Init
+#         -> the ApplicationId is EXONERATED, and the work returns to
+#            PROCESSCONTEXT-AB.
+#   No third reading. A mixed result (one moves, one does not) is reported as
+#   MIXED and is not attributed to the ApplicationId.
+# ============================================================================
+
+name: appid-ns
+
+on:
+  workflow_dispatch:
+  push:
+    # Same dedicated branch as the other experiments. Not main.
+    branches: [archtest-ab]
+    paths:
+      - 'src/appid_ns.cpp'
+      - 'src/appid_ns.hpp'
+      - 'src/gpu1_context.cpp'
+      - 'CMakeLists.txt'
+      - '.github/workflows/appid-ns.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RESHADE_SHA: 18deaa52de0c425a78b329e9cb3c497281cd00ec
+  NGX_SHA: a291cc7d2cc642a51566f3dfd5376f635cd1b284
+  MINHOOK_SHA: c3fcafdc10146beb5919319d0683e44e3c30d537
+  # The commit this phase starts from: the state whose behaviour is the CONTROL.
+  # The containment gate below diffs against it, so it must be present in the
+  # clone - hence fetch-depth: 0.
+  APPID_NS_BASELINE: a38ffcb6ad732a2af07964272744c2b63c8b46c6
+
+jobs:
+  build:
+    runs-on: windows-latest
+    name: mgpu_appid_ns
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The containment gate diffs the pushed revision against a recorded
+          # baseline commit, which a depth-1 clone does not contain.
+          fetch-depth: 0
+
+      - name: Containment check
+        shell: bash
+        run: |
+          PATTERN='GetClockCalibration'
+          FOUND=0
+          for DIR in src assets; do
+            [ -d "$DIR" ] || continue
+            if grep -rnE "$PATTERN" "$DIR"; then FOUND=1; fi
+          done
+          if [ "$FOUND" -ne 0 ]; then
+            echo "::error::Out-of-scope symbol: GetClockCalibration is still guarded (P2.2)"
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------------
+      # THE CONTAINMENT GATE. This experiment claims that ONE value changed.
+      # That claim is checked against the baseline commit, not asserted.
+      # ---------------------------------------------------------------------
+      - name: Change ONLY the ApplicationId
+        shell: bash
+        run: |
+          BASE="${APPID_NS_BASELINE}"
+          if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo "::error::baseline ${BASE} is not in this clone. fetch-depth: 0 is required; if a new phase has started, re-point APPID_NS_BASELINE and say so in the workflow header."
+            exit 1
+          fi
+          echo "baseline ${BASE} -> HEAD $(git rev-parse HEAD)"
+
+          CHANGED=$(git diff --name-only "${BASE}" HEAD)
+          echo "--- changed paths since the baseline ---"
+          printf '%s\n' "$CHANGED"
+
+          ALLOWED='src/appid_ns\.cpp|src/appid_ns\.hpp|src/gpu1_context\.cpp|CMakeLists\.txt|\.github/workflows/appid-ns\.yml'
+          BAD=$(printf '%s\n' "$CHANGED" | grep -vE "^(${ALLOWED})$" || true)
+          if [ -n "$BAD" ]; then
+            echo "$BAD"
+            echo "::error::this build changes files outside the APPID_NS scope"
+            exit 1
+          fi
+
+          # Every changed line of gpu1_context.cpp must be an ApplicationId line.
+          # -U0 so that only added and removed lines are inspected, never context.
+          # The two directions are checked SEPARATELY, because they make two
+          # different claims: an added line is allowed only if it is part of this
+          # experiment, and a removed line is allowed only if it is the OLD
+          # literal form this experiment replaces.
+          DIFFLINES=$(git diff -U0 "${BASE}" HEAD -- src/gpu1_context.cpp \
+                      | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' || true)
+          echo "--- changed lines in gpu1_context.cpp ---"
+          printf '%s\n' "$DIFFLINES"
+
+          ADDED=$(printf '%s\n' "$DIFFLINES" | grep -E '^\+' || true)
+          BAD=$(printf '%s\n' "$ADDED" | grep -vE 'appidns|APPID_NS' || true)
+          if [ -n "$BAD" ]; then
+            echo "$BAD"
+            echo "::error::an added line of gpu1_context.cpp is not part of the APPID_NS experiment"
+            exit 1
+          fi
+
+          REMOVED=$(printf '%s\n' "$DIFFLINES" | grep -E '^-' || true)
+          BAD=$(printf '%s\n' "$REMOVED" \
+                | grep -vE 'p_(init|init_ext|iext)\(0ULL,|ps_init(_ext)?\(0ULL,' || true)
+          if [ -n "$BAD" ]; then
+            echo "$BAD"
+            echo "::error::a removed line of gpu1_context.cpp is not an old 0ULL NGX init"
+            exit 1
+          fi
+
+          # The two counts must also agree with the six known sites, so a change
+          # that removed six lines and added six unrelated appidns comments
+          # cannot pass.
+          NA=$(printf '%s\n' "$ADDED" | grep -c 'reserved18_app_id()' || true)
+          NR=$(printf '%s\n' "$REMOVED" | grep -cE '^-[[:space:]]*(\(void\))?(NVSDK_NGX_Result r = |r = )?(p_(init|init_ext|iext)|ps_init(_ext)?)\(0ULL,' || true)
+          [ "$NA" -eq 6 ] && [ "$NR" -eq 6 ] || {
+            echo "::error::expected 6 added and 6 removed ApplicationId lines, found $NA and $NR"
+            exit 1; }
+          echo "containment verified: $NA added ApplicationId lines, $NR removed 0ULL init lines, nothing else."
+
+      # ---------------------------------------------------------------------
+      # The variable itself.
+      # ---------------------------------------------------------------------
+      - name: Verify the ApplicationId variable is singular and bounded
+        shell: bash
+        run: |
+          test -f src/appid_ns.cpp
+          test -f src/appid_ns.hpp
+
+          # TWO ARMS, ONE FUNCTION, ONE VALUE EACH.
+          grep -qE 'option\(MGPU_APPID_NS' CMakeLists.txt || {
+            echo "::error::MGPU_APPID_NS is not an option"; exit 1; }
+          grep -qE '^[[:space:]]*const unsigned long long kReserved18AppId = 0x1000000ULL;' src/appid_ns.cpp || {
+            echo "::error::the APPID_NS arm does not use 0x1000000ULL"; exit 1; }
+          grep -qE '^[[:space:]]*const unsigned long long kReserved18AppId = 0ULL;' src/appid_ns.cpp || {
+            echo "::error::the CONTROL arm is not 0ULL"; exit 1; }
+          N=$(grep -cE 'kReserved18AppId = ' src/appid_ns.cpp || true)
+          [ "$N" -eq 2 ] || { echo "::error::expected exactly 2 arm definitions of the id, found $N"; exit 1; }
+          N=$(grep -cE 'unsigned long long reserved18_app_id\(\)' src/appid_ns.cpp || true)
+          [ "$N" -eq 1 ] || { echo "::error::expected exactly 1 definition of reserved18_app_id(), found $N"; exit 1; }
+
+          # THE VALUE MUST NOT HAVE LEAKED INTO CODE. 0x1000000 may appear on a
+          # code line in src/ only in these two files - not in a resolution, a
+          # feature id, a data path, the contract, or any other experiment. A
+          # comment is not code and cannot change a call, so comment lines are
+          # excluded here and are covered by the containment gate instead.
+          H=$(grep -rnE '0x1000000([^0-9A-Fa-f]|$)' src \
+              | grep -vE '^src/appid_ns\.(cpp|hpp):' \
+              | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
+          if [ -n "$H" ]; then
+            echo "$H"
+            echo "::error::the ApplicationId value appears in code outside appid_ns.cpp/hpp"
+            exit 1
+          fi
+
+          # NO FALLBACK, NO RETRY, NO PROJECT ID. Not in this experiment, and not
+          # anywhere else in the add-on where it could mask a failed Init. Checked
+          # on CODE lines: the header documents the prohibition by name, and a
+          # comment cannot call anything.
+          H=$(grep -rnE 'Init_with_ProjectID' src \
+              | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
+          if [ -n "$H" ]; then
+            echo "$H"
+            echo "::error::a project-id init is present in code; this experiment forbids it"
+            exit 1
+          fi
+
+          echo "variable verified: two arms, one function, one value, no leak, no project id."
+
+      # ---------------------------------------------------------------------
+      # The six call sites, and the one that must NOT move.
+      # ---------------------------------------------------------------------
+      - name: Verify the six Reserved18 sites and the excluded SR session
+        shell: bash
+        run: |
+          F=src/gpu1_context.cpp
+
+          # Six Reserved18 sites read the value from the one function.
+          N=$(grep -c 'mgpu::appidns::reserved18_app_id()' "$F" || true)
+          [ "$N" -eq 6 ] || {
+            echo "::error::expected exactly 6 Reserved18 init sites reading the id, found $N"
+            grep -n 'mgpu::appidns::reserved18_app_id()' "$F" || true; exit 1; }
+
+          # ... and no NGX init is left with a literal 0ULL except the C2-SR one,
+          # which is NOT a Reserved18 session and is deliberately unchanged.
+          LIT=$(grep -nE 'p_(init|init_ext|iext)\(0ULL,|ps_init(_ext)?\(0ULL,' "$F" || true)
+          CNT=$(printf '%s\n' "$LIT" | grep -c . || true)
+          [ "$CNT" -eq 1 ] || {
+            echo "$LIT"
+            echo "::error::expected exactly 1 remaining 0ULL NGX init (the C2-SR session), found $CNT"
+            exit 1; }
+          case "$LIT" in
+            *'s.sr_params'*) echo "the one remaining 0ULL init is the C2-SR session: $LIT" ;;
+            *) echo "::error::the remaining 0ULL init is not the C2-SR session: $LIT"; exit 1 ;;
+          esac
+
+          # The four fixed log lines are called, and each one's NEXT read of the
+          # value is the call it guards - checked by line position, so a mention
+          # in a comment cannot pass for a call site, and a stray call elsewhere
+          # cannot satisfy the check for the wrong session.
+          for FN in log_p1_core log_p1_snippet log_p4_core log_p4_snippet; do
+            grep -q "mgpu::appidns::${FN}();" "$F" || {
+              echo "::error::mgpu::appidns::${FN}() is not called"; exit 1; }
+            L=$(grep -n "mgpu::appidns::${FN}();" "$F" | head -n1 | cut -d: -f1)
+            C=$(awk -v s="$L" 'NR > s && /mgpu::appidns::reserved18_app_id\(\)/ { print NR; exit }' "$F")
+            [ -n "$C" ] || {
+              echo "::error::${FN} at line $L is not followed by any Reserved18 init"; exit 1; }
+            GAP=$((C - L))
+            [ "$GAP" -le 12 ] || {
+              echo "::error::${FN} at line $L and the init it guards at line $C are $GAP lines apart"; exit 1; }
+            echo "${FN} line $L -> the init it guards at line $C"
+          done
+
+          # The variant line is logged in the ordered bring-up block, before the
+          # modules and before any NGX call.
+          V=$(grep -n 'mgpu::appidns::log_variant();' "$F" | head -n1 | cut -d: -f1)
+          [ -n "$V" ] || { echo "::error::log_variant is never called"; exit 1; }
+
+          # The four wire formats are exactly the four required lines.
+          for S in '[APPID] %s app_id=0x%016llX' 'log_site("P1 core")' 'log_site("P1 snippet")' \
+                   'log_site("P4 core")' 'log_site("P4 snippet")'; do
+            grep -qF "$S" src/appid_ns.cpp || {
+              echo "::error::the fixed [APPID] line form is missing: $S"; exit 1; }
+          done
+          echo "sites verified: 6 Reserved18 reads, C2-SR untouched, 4 fixed log lines in place."
+
+      # ---------------------------------------------------------------------
+      # The frozen baseline must not have drifted.
+      # ---------------------------------------------------------------------
+      - name: Verify nothing outside the variable was edited
+        shell: bash
+        run: |
+          # The other experiments' switches are still present and still mean what
+          # they meant. A build where one of them silently changed is not this
+          # experiment.
+          for OPT in MGPU_ARCH_COMPAT MGPU_CONTRACT_EXPANDED MGPU_NVAPI_EXPLICIT_INIT \
+                     MGPU_CUDA_DIAG MGPU_RESHADE_NATIVE; do
+            grep -q "option(${OPT}" CMakeLists.txt || {
+              echo "::error::${OPT} is no longer an option"; exit 1; }
+          done
+          # appidns is referenced from exactly one translation unit.
+          H=$(grep -rl 'appidns' src | sort | tr '\n' ' ')
+          echo "files referencing appidns: $H"
+          [ "$H" = "src/appid_ns.cpp src/appid_ns.hpp src/gpu1_context.cpp " ] || {
+            echo "::error::appidns is referenced outside the expected three files"; exit 1; }
+          # The observer and the architecture hook are untouched by this phase.
+          grep -q 'cudadiag::select(id, answer)' src/arch_test.cpp || {
+            echo "::error::the CUDADIAG composition point is gone"; exit 1; }
+          grep -q 'get_arch_info_shim' src/arch_test.cpp || {
+            echo "::error::the architecture shim is gone"; exit 1; }
+          echo "baseline verified: no other experiment moved."
+
+      # ---------------------------------------------------------------------
+      # Structural substitutes for a compiler. appid_ns.cpp is a NEW
+      # translation unit in this phase, and it is the one file here that carries
+      # conditional compilation, so its nesting and its braces are checked
+      # rather than assumed.
+      # ---------------------------------------------------------------------
+      - name: Structural checks
+        shell: bash
+        run: |
+          for F in src/appid_ns.cpp src/appid_ns.hpp; do
+            test -f "$F" || { echo "::error::missing $F"; exit 1; }
+
+            awk '
+              /^[ \t]*#[ \t]*(ifdef|ifndef|if)\b/ { depth++ }
+              /^[ \t]*#[ \t]*endif\b/            { depth--; if (depth < 0) neg = 1 }
+              END {
+                if (depth != 0 || neg) {
+                  printf "::error::%s preprocessor nesting does not close (depth=%d, underflow=%d)\n", FILENAME, depth, neg
+                  exit 1
+                }
+              }
+            ' "$F" || exit 1
+
+            # Braces inside string literals and `//` comments are skipped by the
+            # same character walk that counts them, escaped quotes included, so
+            # the count is a fact about the code and not about the prose in it.
+            awk '
+              {
+                line = $0
+                instr = 0
+                for (i = 1; i <= length(line); i++) {
+                  c = substr(line, i, 1)
+                  if (instr) {
+                    if (c == "\\") { i++; continue }
+                    if (c == "\"") instr = 0
+                    continue
+                  }
+                  if (c == "\"") { instr = 1; continue }
+                  if (c == "/" && substr(line, i + 1, 1) == "/") break
+                  if (c == "{") depth++
+                  else if (c == "}") { depth--; if (depth < 0) neg = 1 }
+                }
+              }
+              END {
+                if (depth != 0 || neg) {
+                  printf "::error::%s brace imbalance (depth=%d, underflow=%d)\n", FILENAME, depth, neg
+                  exit 1
+                }
+              }
+            ' "$F" || exit 1
+            echo "$F: nesting closes, braces balance"
+          done
+
+          # Both arms must define the id exactly once. A build where only one arm
+          # defines it would not compile at all; this catches the case where the
+          # #else branch was lost in an edit.
+          grep -qE '^#ifdef MGPU_APPID_NS$' src/appid_ns.cpp || {
+            echo "::error::the #ifdef MGPU_APPID_NS line is missing"; exit 1; }
+          grep -qE '^#else$' src/appid_ns.cpp || {
+            echo "::error::the CONTROL arm is missing its #else"; exit 1; }
+          grep -qE '^#endif$' src/appid_ns.cpp || {
+            echo "::error::the arm block is not closed"; exit 1; }
+          # The compiled formatter must use std::snprintf, which is the form the
+          # rest of this add-on uses and which is therefore already proven to
+          # compile against this toolchain.
+          grep -q 'std::snprintf' src/appid_ns.cpp || {
+            echo "::error::appid_ns.cpp does not use std::snprintf"; exit 1; }
+          echo "structural checks passed: both arms present, nesting and braces closed."
+
+      - name: Fetch ReShade headers at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/reshade.tar.gz \
+            "https://codeload.github.com/crosire/reshade/tar.gz/${RESHADE_SHA}"
+          tar -xzf _dl/reshade.tar.gz -C _dl "reshade-${RESHADE_SHA}/include"
+          rm -rf ext/reshade
+          mv "_dl/reshade-${RESHADE_SHA}/include" ext/reshade
+          test -f ext/reshade/reshade.hpp
+          grep -q 'define RESHADE_API_VERSION 20' ext/reshade/reshade.hpp
+
+      - name: Fetch NVIDIA NGX headers at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/ngx.tar.gz \
+            "https://codeload.github.com/NVIDIA/DLSS/tar.gz/${NGX_SHA}"
+          tar -xzf _dl/ngx.tar.gz -C _dl --wildcards "*/include"
+          rm -rf ext/ngx
+          mv _dl/*/include ext/ngx
+          test -f ext/ngx/nvsdk_ngx.h
+          grep -rq 'NVSDK_NGX_Feature_Reserved18' ext/ngx || {
+            echo "::error::Pin drift - no NVSDK_NGX_Feature_Reserved18"; exit 1; }
+
+      - name: Fetch and build MinHook at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/minhook.tar.gz \
+            "https://codeload.github.com/TsudaKageyu/minhook/tar.gz/${MINHOOK_SHA}"
+          tar -xzf _dl/minhook.tar.gz -C _dl
+          rm -rf ext/minhook
+          mv _dl/minhook-* ext/minhook
+          test -f ext/minhook/include/MinHook.h
+          cmake -S ext/minhook -B ext/minhook/build -A x64 \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+          cmake --build ext/minhook/build --config Release
+          LIB=$(find ext/minhook/build -type f \( -iname 'minhook.x64.lib' -o -iname '*minhook*.lib' \) | head -n1)
+          if [ -z "$LIB" ]; then
+            echo "::error::no MinHook static library found"
+            find ext/minhook/build -type f | sort | head -50 || true
+            exit 1
+          fi
+          echo "discovered MinHook library: $LIB"
+          mkdir -p ext/minhook/lib
+          cp "$LIB" ext/minhook/lib/MinHook.lib
+
+      # All six flags are asserted. Only MGPU_APPID_NS is the variable.
+      - name: Configure (appid-ns)
+        shell: bash
+        run: |
+          cmake -B build -A x64 \
+            -DMGPU_ARCH_COMPAT=ON \
+            -DMGPU_CONTRACT_EXPANDED=ON \
+            -DMGPU_NVAPI_EXPLICIT_INIT=OFF \
+            -DMGPU_CUDA_DIAG=ON \
+            -DMGPU_RESHADE_NATIVE=ON \
+            -DMGPU_APPID_NS=ON \
+            -DMGPU_MINHOOK_DIR="${{ github.workspace }}/ext/minhook" 2>&1 | tee _cfg.txt
+
+          grep -qi "ARCHTEST variant = COMPAT" _cfg.txt || {
+            echo "::error::frozen variable drifted: MGPU_ARCH_COMPAT must be ON"
+            grep -ni 'ARCHTEST variant' _cfg.txt || true; exit 1; }
+          grep -qi "CREATECONTRACT variant = CONTRACT_EXPANDED" _cfg.txt || {
+            echo "::error::frozen variable drifted: MGPU_CONTRACT_EXPANDED must be ON"
+            grep -ni 'CREATECONTRACT variant' _cfg.txt || true; exit 1; }
+          grep -qi "NVAPIINIT variant = NVAPI_CONTROL" _cfg.txt || {
+            echo "::error::frozen variable drifted: MGPU_NVAPI_EXPLICIT_INIT must be OFF"
+            grep -ni 'NVAPIINIT variant' _cfg.txt || true; exit 1; }
+          grep -qi "CUDADIAG = ON" _cfg.txt || {
+            echo "::error::CUDADIAG must be ON - it is the instrument for this experiment"
+            grep -ni 'CUDADIAG' _cfg.txt || true; exit 1; }
+          grep -qi "RESHADENATIVE = ON" _cfg.txt || {
+            echo "::error::frozen variable drifted: MGPU_RESHADE_NATIVE must be ON"
+            grep -ni 'RESHADENATIVE' _cfg.txt || true; exit 1; }
+          grep -qi "APPID_NS = ON" _cfg.txt || {
+            echo "::error::MGPU_APPID_NS did not take - this build would be the CONTROL"
+            grep -ni 'APPID_NS' _cfg.txt || true; exit 1; }
+          grep -q "MinHook library linked from" _cfg.txt || {
+            echo "::error::configured WITHOUT MinHook - the arch hook would fail closed"; exit 1; }
+
+          echo "--- all variant lines ---"
+          grep -niE 'variant = |CUDADIAG|RESHADENATIVE|APPID_NS|MinHook' _cfg.txt || true
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Verify artifact name
+        shell: bash
+        run: |
+          if find build -name 'mgpu_bridge.addon64.dll' -type f | grep -q .; then
+            echo "::error::SUFFIX appended to .dll instead of replacing it"; exit 1
+          fi
+          ADDON=$(find build -name 'mgpu_bridge.addon64' -type f | head -n1)
+          if [ -z "$ADDON" ]; then
+            echo "::error::mgpu_bridge.addon64 not produced"
+            find build -maxdepth 3 -type f || true; exit 1
+          fi
+          echo "ADDON_PATH=$ADDON" >> "$GITHUB_ENV"
+          echo "Output verified: $ADDON"
+
+      # The value and the log tags must be IN the binary that ships, not merely
+      # in the source tree.
+      - name: Verify the experiment is in the binary
+        shell: bash
+        run: |
+          for S in APPID_NS 'APPID' 'P1 core' 'P1 snippet' 'P4 core' 'P4 snippet' \
+                   RESHADENATIVE CUDADIAG; do
+            if ! grep -qa "$S" "$ADDON_PATH"; then
+              echo "::error::'$S' is not present in $ADDON_PATH - the experiment was compiled out"
+              exit 1
+            fi
+          done
+          # The identifier and the value are compile-time constants; if the ON arm
+          # took, the string "APPID_NS" is present. The numeric value is not
+          # greppable as a string, so it is checked in the source gate above.
+          echo "experiment strings present in the artifact."
+
+      - name: Verify shipped presets are empty
+        shell: bash
+        run: |
+          FAIL=0
+          grep -nE '^\s*Techniques\s*=\s*\S' assets/gpu1.ini && FAIL=1
+          grep -n 'DEBUG' assets/gpu1.ini && FAIL=1
+          [ "$FAIL" -eq 0 ] || { echo "::error::shipped preset is not clean"; exit 1; }
+
+      - name: Verify shipped config
+        shell: bash
+        run: |
+          grep -qE '^\s*Frames\s*=\s*0\s*$' assets/mgpu.ini || {
+            echo "::error::assets/mgpu.ini does not set Frames=0"; exit 1; }
+          grep -qE '^\s*Depth\s*=\s*1\s*$' assets/mgpu.ini || {
+            echo "::error::assets/mgpu.ini does not set Depth=1"; exit 1; }
+          grep -qE '^\s*MVec\s*=\s*3\s*$' assets/mgpu.ini || {
+            echo "::error::assets/mgpu.ini does not set MVec=3"; exit 1; }
+
+      # The rename lives here and ONLY here, exactly as build.yml does it.
+      - name: Stage deploy set (appid-ns)
+        shell: bash
+        run: |
+          mkdir -p _deploy
+          cp "$ADDON_PATH" _deploy/nvngx.dll_mgpu_bridge.addon64
+          cp assets/gpu1.ini      _deploy/
+          cp assets/mgpu.ini      _deploy/
+          cp assets/ReShade2.ini  _deploy/
+          cp assets/README.txt    _deploy/
+          cp LICENSE              _deploy/
+          mkdir -p _deploy/reshade-shaders/Shaders
+          cp assets/reshade-shaders/Shaders/mgpu_depth_tap.fx _deploy/reshade-shaders/Shaders/
+          find _deploy -type f | sort
+          test -f _deploy/nvngx.dll_mgpu_bridge.addon64
+          case "$(ls _deploy)" in
+            *nvngx.dll_*) ;;
+            *) echo "::error::lost the nvngx.dll_ caller-gate prefix"; exit 1 ;;
+          esac
+          COUNT=$(find _deploy -type f | wc -l)
+          [ "$COUNT" -eq 7 ] || {
+            echo "::error::_deploy holds $COUNT files, expected 7"
+            find _deploy -type f | sort; exit 1; }
+
+      - name: Record the variant marker and hashes
+        shell: bash
+        run: |
+          {
+            echo "variant            = appid_ns"
+            echo
+            echo "THE VARIABLE: the NGX ApplicationId for the Reserved18 sessions."
+            echo "    CONTROL : 0ULL        (MGPU_APPID_NS absent)"
+            echo "    APPID_NS: 0x1000000ULL (MGPU_APPID_NS=ON - THIS artifact)"
+            echo
+            echo "Applied to all four Reserved18 sessions, core and snippet:"
+            echo "    P1.0c core     NVSDK_NGX_D3D12_Init        (+ Init_Ext fallback)"
+            echo "    P1.0c snippet  NVSDK_NGX_D3D12_Init_Ext    (+ Init fallback)"
+            echo "    P4.1  core     NVSDK_NGX_D3D12_Init"
+            echo "    P4.1  snippet  NVSDK_NGX_D3D12_Init_Ext"
+            echo "All six read mgpu::appidns::reserved18_app_id(), so the sessions"
+            echo "cannot disagree. No fallback id, no retry, no project id."
+            echo
+            echo "The C2-SR session (nvngx_dlss.dll) is NOT a Reserved18 session"
+            echo "and is UNCHANGED at 0ULL."
+            echo
+            echo "FROZEN BASELINE - every one asserted at configure time:"
+            echo "    MGPU_RESHADE_NATIVE=ON"
+            echo "    MGPU_ARCH_COMPAT=ON"
+            echo "    MGPU_CONTRACT_EXPANDED=ON"
+            echo "    MGPU_NVAPI_EXPLICIT_INIT=OFF"
+            echo "    MGPU_CUDA_DIAG=ON"
+            echo
+            echo "UNTOUCHED: D3D12 device, proxy/native handling, queue/list/fence,"
+            echo "contract, architecture hook, private NVAPI wrappers, runtime DLL,"
+            echo "data path, SDK version, feature id, resolution, transport, depth,"
+            echo "motion vectors."
+            echo
+            echo "REQUIRED RUNTIME (verify on the rig before reading any result):"
+            echo "    nvngx_dlssnr.dll"
+            echo "    SHA256 DCC0DC2414AEDEC4A8E084647070383BE068554042587180C20C784D4772D36F"
+            echo
+            echo "RUN-TIME VALIDITY GATE - a run is a valid basis only if BOTH hold:"
+            echo "    P1.0c Init = Success"
+            echo "    P4.1  Init = Success"
+            echo "If either is FAIL_OutOfDate the NGX portion of that run is VOID."
+            echo
+            echo "OBSERVE ONLY:"
+            echo "    GetCudaIndependentDescriptorObject  real status"
+            echo "    CreateCuModule                      first real status"
+            echo "    CreateFeature Reserved18            result"
+            echo
+            echo "INTERPRETATION, FIXED IN ADVANCE:"
+            echo "    both -1 -> 0 : the ApplicationId was part of the blocker"
+            echo "    both still -1 with valid Init : the ApplicationId is EXONERATED"
+            echo "    anything mixed : reported as MIXED, not attributed to the id"
+            echo
+            echo "commit             = ${GITHUB_SHA}"
+            echo "baseline           = ${APPID_NS_BASELINE}"
+            echo "run                = ${GITHUB_RUN_ID}"
+            echo "built              = $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "NOT AN A/B. One build, one artifact, no compare job. The CONTROL is"
+            echo "the pre-existing behaviour of the baseline commit, which this job"
+            echo "diffs against and which the containment gate verifies was not"
+            echo "otherwise modified."
+          } > APPID_NS_VARIANT.txt
+          cat APPID_NS_VARIANT.txt
+
+          {
+            echo "APPID_NS artifact hashes - appid_ns"
+            echo
+            echo "Deploy set (7 files):"
+            ( cd _deploy && find . -type f | sort | while read f; do
+                printf '%s  %s\n' "$(sha256sum "$f" | awk '{print $1}')" "$f"
+              done )
+            echo
+            echo "Add-on alone:"
+            printf '%s  %s\n' \
+              "$(sha256sum _deploy/nvngx.dll_mgpu_bridge.addon64 | awk '{print $1}')" \
+              "nvngx.dll_mgpu_bridge.addon64"
+          } > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Assert the deploy set is still exactly seven files
+        shell: bash
+        run: |
+          COUNT=$(find _deploy -type f | wc -l)
+          if [ "$COUNT" -ne 7 ]; then
+            echo "::error::_deploy holds $COUNT files immediately before upload, expected 7"
+            find _deploy -type f | sort; exit 1
+          fi
+          find _deploy -type f | sort
+          echo "deploy set is exactly 7 files; metadata stays outside it."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mgpu_appid_ns
+          path: |
+            _deploy/
+            SHA256SUMS.txt
+            APPID_NS_VARIANT.txt
+          if-no-files-found: error

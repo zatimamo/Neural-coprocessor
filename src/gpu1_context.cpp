@@ -45,6 +45,7 @@
 #include "nvapi_init.hpp"       // NVAPIINIT: the explicit-NVAPI-initialization A/B
 #include "cuda_diag.hpp"        // CUDADIAG: the two NVAPI CUDA-interop calls DLSS-NR makes
 #include "reshade_native.hpp"   // RESHADENATIVE: the P1.0c NGX lane on the unwrapped device
+#include "appid_ns.hpp"         // APPID_NS: the NGX ApplicationId for the Reserved18 sessions
 
 // R111. DXGI_STATUS_OCCLUDED comes from dxgi.h by way of <dxgi1_4.h> above.
 // Guarded because it is a SUCCESS code and a build where it went missing
@@ -2812,6 +2813,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         mgpu::contract::log_variant();
         mgpu::cudadiag::log_variant();
         mgpu::reshadenative::log_variant();
+        mgpu::appidns::log_variant();   // APPID_NS: variant and id, before anything is resolved
         mgpu::adapter::selection_result asel;
         mgpu::adapter::get_selection(asel);
         if (asel.valid)
@@ -3320,17 +3322,19 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         NVSDK_NGX_Result r;
         const char *which;
         bool callback_installed;
+        // APPID_NS: covers BOTH forms below - the core Reserved18 session.
+        mgpu::appidns::log_p1_core();
         if (p_init != nullptr)
         {
             which = "Init";
             callback_installed = true;
-            r = p_init(0ULL, data_path, dev, &common, NVSDK_NGX_Version_API);
+            r = p_init(mgpu::appidns::reserved18_app_id(), data_path, dev, &common, NVSDK_NGX_Version_API);
         }
         else
         {
             which = "Init_Ext (FALLBACK - no log callback installed)";
             callback_installed = false;
-            r = p_init_ext(0ULL, data_path, dev, NVSDK_NGX_Version_API, nullptr);
+            r = p_init_ext(mgpu::appidns::reserved18_app_id(), data_path, dev, NVSDK_NGX_Version_API, nullptr);
         }
         // The inputs, not just the verdict: app id and data path are the
         // two values most likely to be what the driver objects to, and they
@@ -3450,15 +3454,17 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
     {
         NVSDK_NGX_Result r;
         const char *which;
+        // APPID_NS: covers BOTH forms below - the snippet Reserved18 session.
+        mgpu::appidns::log_p1_snippet();
         if (ps_init_ext != nullptr)
         {
             which = "snippet Init_Ext";
-            r = ps_init_ext(0ULL, data_path, dev, NVSDK_NGX_Version_API, params);
+            r = ps_init_ext(mgpu::appidns::reserved18_app_id(), data_path, dev, NVSDK_NGX_Version_API, params);
         }
         else
         {
             which = "snippet Init";
-            r = ps_init(0ULL, data_path, dev, nullptr, NVSDK_NGX_Version_API);
+            r = ps_init(mgpu::appidns::reserved18_app_id(), data_path, dev, nullptr, NVSDK_NGX_Version_API);
         }
         snprintf(line, sizeof line,
                  "[MGPU][P1.0c] %s: result=0x%08X (%s) device=0x%p params=0x%p",
@@ -11429,7 +11435,9 @@ namespace
         mgpu::archtest::scope_begin("real stream arm");
         mgpu::cudadiag::scope_real_stream();   // CUDADIAG: label only, P4.1
 
-        NVSDK_NGX_Result r = p_init(0ULL, data_path, ndev, &common, NVSDK_NGX_Version_API);
+        // APPID_NS: the P4.1 stream core session, same value as P1.0c.
+        mgpu::appidns::log_p4_core();
+        NVSDK_NGX_Result r = p_init(mgpu::appidns::reserved18_app_id(), data_path, ndev, &common, NVSDK_NGX_Version_API);
         snprintf(line, sizeof line, "[MGPU][P4.1] Init: result=0x%08X (%s)",
                  (unsigned)r, ngx_result_name(r));
         mgpu::diag::info(line);
@@ -11465,7 +11473,9 @@ namespace
             mgpu::archtest::hook_remove();
             return false;
         }
-        (void)p_iext(0ULL, data_path, ndev, NVSDK_NGX_Version_API, s.nr_params);
+        // APPID_NS: the P4.1 stream snippet Reserved18 session.
+        mgpu::appidns::log_p4_snippet();
+        (void)p_iext(mgpu::appidns::reserved18_app_id(), data_path, ndev, NVSDK_NGX_Version_API, s.nr_params);
         (void)p_pop(s.nr_params);
         s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.width);
         s.nr_params->Set("DLSSNR.Height", (unsigned int)s.height);

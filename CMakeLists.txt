@@ -91,6 +91,13 @@ add_library(mgpu_bridge SHARED
     # the six above: no ReShade header, no link library, and the one GUID it
     # carries is written out because ReShade's IID_UnwrappedObject is internal.
     src/reshade_native.cpp
+    # APPID_NS: the NGX ApplicationId for the Reserved18 sessions. One number
+    # and five log lines. It creates no object, resolves no entry point, loads
+    # no module, writes no parameter and calls nothing in NGX or NVAPI; the
+    # call sites in gpu1_context.cpp read the value from here instead of
+    # writing a literal, so the id a session is initialised with and the id the
+    # log states cannot drift apart.
+    src/appid_ns.cpp
 )
 
 target_include_directories(mgpu_bridge PRIVATE
@@ -394,6 +401,42 @@ if(MGPU_RESHADE_NATIVE)
     message(STATUS "MGPU: RESHADENATIVE = ON (P1.0c NGX lane on the unwrapped device)")
 else()
     message(STATUS "MGPU: RESHADENATIVE = OFF (P1.0c lane unchanged, proxy device)")
+endif()
+
+# ---------------------------------------------------------------------------
+# APPID_NS. The NGX ApplicationId A/B for the Reserved18 sessions.
+#
+#   MGPU_APPID_NS absent  ->  CONTROL.  every Reserved18 init is passed 0ULL.
+#                                        This is today's behaviour, unchanged.
+#   MGPU_APPID_NS defined ->  APPID_NS. every Reserved18 init is passed
+#                                        0x1000000ULL, the value NeuralScreen's
+#                                        working Reserved18 path uses for BOTH
+#                                        the core Init and the snippet Init_Ext.
+#
+# SIX CALL SITES, FOUR SESSIONS, ONE FUNCTION
+#   P1.0c core     NVSDK_NGX_D3D12_Init        (and its Init_Ext fallback)
+#   P1.0c snippet  NVSDK_NGX_D3D12_Init_Ext    (and its Init fallback)
+#   P4.1  core     NVSDK_NGX_D3D12_Init
+#   P4.1  snippet  NVSDK_NGX_D3D12_Init_Ext
+#   All six call mgpu::appidns::reserved18_app_id(), so the sessions cannot
+#   disagree with each other. The C2-SR session (nvngx_dlss.dll) is NOT a
+#   Reserved18 session and keeps 0ULL.
+#
+# There is NO fallback id, NO retry with another id and NO project-id
+# substitution, in either arm: a second attempt would be a second variable.
+#
+# The CI job builds it with MGPU_ARCH_COMPAT=ON, MGPU_CONTRACT_EXPANDED=ON,
+# MGPU_NVAPI_EXPLICIT_INIT=OFF, MGPU_CUDA_DIAG=ON and MGPU_RESHADE_NATIVE=ON -
+# the frozen baseline - so this one number is the only thing that moves.
+# ---------------------------------------------------------------------------
+option(MGPU_APPID_NS
+       "APPID_NS: pass 0x1000000 as the NGX ApplicationId for the Reserved18 sessions"
+       OFF)
+if(MGPU_APPID_NS)
+    target_compile_definitions(mgpu_bridge PRIVATE MGPU_APPID_NS=1)
+    message(STATUS "MGPU: APPID_NS = ON (Reserved18 app id 0x1000000)")
+else()
+    message(STATUS "MGPU: APPID_NS = OFF (Reserved18 app id 0, control)")
 endif()
 
 option(MGPU_BUILD_TESTS "Build CPU-only adapter policy tests" OFF)
