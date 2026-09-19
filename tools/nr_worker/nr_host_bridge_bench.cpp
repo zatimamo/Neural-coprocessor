@@ -554,16 +554,61 @@ namespace
     //: COM pointers owned by unique_ptr with a Release deleter: every early return
     //: path then releases exactly once, including the failure paths, which is
     //: where the leak would otherwise be.
+    //: A minimal owning COM pointer.
+    //:
+    //: WHY NOT std::unique_ptr (which is what this started as): IID_PPV_ARGS
+    //: expands to `__uuidof(**(pp))` plus `IID_PPV_ARGS_Helper(pp)`, so it needs
+    //: the ADDRESS OF THE RAW POINTER. unique_ptr deliberately does not expose
+    //: that, and the SDK's helper only matches T**. Microsoft::WRL::ComPtr solves
+    //: this with an IID_PPV_ARGS_Helper overload of its own; this is the same idea
+    //: with less machinery, and the overload is right below.
     template <typename T>
-    struct ComDeleter
+    class Com
     {
-        void operator()(T *p) const
+    public:
+        Com() = default;
+        ~Com() { reset(); }
+        Com(const Com &) = delete;
+        Com &operator=(const Com &) = delete;
+        Com(Com &&o) noexcept : p_(o.p_) { o.p_ = nullptr; }
+        Com &operator=(Com &&o) noexcept
         {
-            if (p != nullptr) p->Release();
+            if (this != &o) { reset(); p_ = o.p_; o.p_ = nullptr; }
+            return *this;
         }
+
+        T *get() const { return p_; }
+        T *operator->() const { return p_; }
+        T &operator*() const { return *p_; }
+        explicit operator bool() const { return p_ != nullptr; }
+
+        T *release() { T *r = p_; p_ = nullptr; return r; }
+
+        void reset(T *p = nullptr)
+        {
+            if (p_ != nullptr) p_->Release();
+            p_ = p;
+        }
+
+        //: The address of the raw pointer, for IID_PPV_ARGS. Any previous object
+        //: is released first, which is what makes it safe to reuse a slot.
+        T **put()
+        {
+            reset();
+            return &p_;
+        }
+
+    private:
+        T *p_ = nullptr;
     };
+
+    //: IID_PPV_ARGS calls this unqualified, so the overload lives at global scope
+    //: where the SDK's own template lives.
     template <typename T>
-    using Com = std::unique_ptr<T, ComDeleter<T> >;
+    void **IID_PPV_ARGS_Helper(Com<T> *pp)
+    {
+        return reinterpret_cast<void **>(pp->put());
+    }
 
     struct DeviceReport
     {
