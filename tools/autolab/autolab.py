@@ -329,6 +329,22 @@ def preflight(cfg, console, reporter, deploy, cp, gh, run_dir):
     nr_sha = deploy.verify_nr_dll()
     ok("NR runtime hash matches the required NeuralScreen build", nr_sha.upper())
 
+    # THE NEURALSCREEN REFERENCE RUNTIME. This is the copy the PROCESSCONTEXT
+    # node runs against, and its DIRECTORY is the NGX data path the diagnostic
+    # derives - so it is located and verified here, before CI is asked to do
+    # anything, and a wrong or missing one is refused before anything is built.
+    ns_nr = deploy.ns_nr_dll_path
+    if not ns_nr:
+        raise PreflightError(
+            "paths.neuralscreen_nr_dll is not configured. The PROCESSCONTEXT node "
+            "runs the reference lane and needs the NeuralScreen runtime, not the "
+            "game's copy.")
+    if not os.path.isfile(ns_nr):
+        raise PreflightError("the NeuralScreen reference runtime is not there: %s" % ns_nr)
+    ns_sha = deploy.verify_ns_nr_dll()
+    ok("NeuralScreen reference runtime hash matches", ns_sha.upper())
+    ok("NeuralScreen reference data path", os.path.dirname(ns_nr))
+
     if cp.is_running():
         raise PreflightError("Cyberpunk is already running (pids %s). Close it and re-run."
                              % (cp.running_pids(),))
@@ -360,8 +376,11 @@ def preflight(cfg, console, reporter, deploy, cp, gh, run_dir):
     reporter.hash("addon.backup", backup["sha256"], path=backup["path"])
     reporter.hash("nr_dll", nr_sha, path=nr_path,
                   expected=cfg["required_nr_dll_sha256"])
+    reporter.hash("nr_dll.neuralscreen_reference", ns_sha, path=ns_nr,
+                  expected=cfg["required_nr_dll_sha256"])
     console("preflight OK")
     return {"installed_sha256": installed_sha, "backup": backup, "nr_dll_sha256": nr_sha,
+            "ns_nr_dll_sha256": ns_sha, "ns_nr_dll_path": ns_nr,
             "auth": auth}
 
 
@@ -383,7 +402,16 @@ def run_processcontext_node(name, spec, cfg, console, reporter, gh, deploy, run_
                   path=meta["addon_path"])
 
     runner = processcontext.ProcessContextRunner(cfg, console, gh)
-    result = runner.run(meta, run_dir)
+    # The reporter goes in so the SINGLE gate log can be kept aside the moment
+    # it is read, before the second phase can overwrite it.
+    result = runner.run(meta, run_dir, reporter=reporter)
+
+    # ALL FOUR arm logs, archived together once the run is over.
+    runner.archive_all_arm_logs({"dir": result["observations"]["staging_dir"]},
+                                reporter, result)
+    for arm, path in sorted((result["observations"].get("arm_logs_archived") or {}).items()):
+        reporter.hash("processcontext.%s.log" % arm, deployment.sha256_file(path),
+                      path=path)
 
     single = result["observations"]["arms"].get(
         experiments.PROCESSCONTEXT_REFERENCE_ARM, {})
@@ -666,49 +694,64 @@ REFERENCE_GATE_CONTROLS = [
 ]
 
 #: THE FAIL-FAST CONTRACT (TASK 2), asserted on the exact set of processes
-#: launched. SINGLE is a gate: when it does not reproduce, the other three must
-#: never be started.
+#: launched AND on the exact launcher invocations. SINGLE is a gate: when it does
+#: not reproduce, the other three must never be started.
 FAILFAST_CASES = [
     {"fixture": "pcab_all_ok",
+     "launcher_calls": [["single"],
+                        ["dual-held", "dual-active", "dual-released"]],
      "launched": ["single", "dual-held", "dual-active", "dual-released"],
+     "archived": 4,
      "verdict": "MULTI_DEVICE_EXONERATED",
      "next": "STREAMLINE_CONTEXT_REQUIRED"},
     {"fixture": "pcab_single_fail",
+     "launcher_calls": [["single"]],
      "launched": ["single"],
+     "archived": 1,
      "verdict": "PROCESSCONTEXT_REFERENCE_INVALID",
      "next": None},
     {"fixture": "pcab_held_fail",
+     "launcher_calls": [["single"],
+                        ["dual-held", "dual-active", "dual-released"]],
      "launched": ["single", "dual-held", "dual-active", "dual-released"],
+     "archived": 4,
      "verdict": "SECOND_LIVE_D3D12_DEVICE_SUFFICIENT",
      "next": None},
 ]
 
 
 class _StubRunner(processcontext.ProcessContextRunner):
-    """A ProcessContextRunner with the two side-effecting seams replaced.
+    """A ProcessContextRunner with the side-effecting seams replaced.
 
-    `stage()` and `run_arm()` are the ONLY places the real runner touches the
-    filesystem and starts a process. Overriding exactly those two lets the
+    `stage()` and `run_launcher()` are the ONLY places the real runner touches
+    the filesystem and starts a process. Overriding exactly those two lets the
     fail-fast sequencing be tested for real - the launched-arm list below is
     produced by the real run() - without a GPU, without the artifact and without
-    executing anything.
+    executing anything, including the launcher.
     """
 
     def __init__(self, cfg, log, fixture_dir):
         processcontext.ProcessContextRunner.__init__(self, cfg, log, gh=None)
         self.launched = []
+        self.launcher_calls = []
         self.fixture_dir = fixture_dir
 
     def stage(self, artifact_meta, staging_dir):
         os.makedirs(staging_dir, exist_ok=True)
-        return {"dir": staging_dir, "exe": "stub", "nr_dll": "stub"}
+        return {"dir": staging_dir, "exe": "stub", "launcher": "stub",
+                "nr_dll": "stub", "data_path": "stub"}
 
-    def run_arm(self, staged, arm):
-        self.launched.append(arm)
-        src = os.path.join(self.fixture_dir, "context-%s.log" % arm)
-        if os.path.isfile(src):
-            shutil.copy2(src, os.path.join(staged["dir"], "context-%s.log" % arm))
-        return {"returncode": 0, "stdout": "", "stderr": "", "seconds": 0.0}
+    def run_launcher(self, staged, arms):
+        # The launcher is not executed. What is asserted is WHICH arms it was
+        # asked for, and HOW MANY times - which is exactly what the gate decides.
+        self.launched.extend(arms)
+        self.launcher_calls.append(list(arms))
+        for arm in arms:
+            src = os.path.join(self.fixture_dir, "context-%s.log" % arm)
+            if os.path.isfile(src):
+                shutil.copy2(src, os.path.join(staged["dir"], "context-%s.log" % arm))
+        return {"arms": list(arms), "returncode": 0, "stdout": "", "stderr": "",
+                "seconds": 0.0}
 
     def run_table(self, staged):
         return {"returncode": 4, "stdout": "(stub table)"}
@@ -718,7 +761,8 @@ def _stub_config():
     return {
         "repository": "stub/stub", "branch": "stub",
         "paths": {"cyberpunk_exe": "", "install_dir": "", "addon_name": "",
-                  "reshade_log": "", "nr_dll": ""},
+                  "reshade_log": "", "nr_dll": "",
+                  "neuralscreen_nr_dll": "C:/stub/native/nvngx_dlssnr.dll"},
         "required_nr_dll_sha256": "0" * 64,
         "safety": {"allow_game_launch": False},
         "launch": {"exe": "", "args": [], "working_dir": ""},
@@ -845,14 +889,20 @@ def run_parser_tests(console):
 
     # ---- TASK 2: SINGLE is a gate, not a datum ---------------------------
     # The real run() is exercised with only its two side-effecting seams
-    # replaced, and the assertion is on the EXACT list of arms launched.
+    # replaced, and the assertions are on the EXACT launcher invocations, the
+    # exact arms launched, and the arm logs that were archived.
     node = experiments.node("PROCESSCONTEXT")
     for case in FAILFAST_CASES:
         fixture_dir = os.path.join(FIXTURES, case["fixture"])
         run_dir = tempfile.mkdtemp(prefix="autolab-failfast-")
+        reporter = None
         try:
+            reporter = report.Reporter(run_dir, console)
             runner = _StubRunner(_stub_config(), console, fixture_dir)
-            result = runner.run({"artifact_dir": "(stub)"}, run_dir)
+            result = runner.run({"artifact_dir": "(stub)"}, run_dir, reporter=reporter)
+            # EXACTLY what autolab.run_processcontext_node does next.
+            runner.archive_all_arm_logs({"dir": result["observations"]["staging_dir"]},
+                                        reporter, result)
         except Exception as exc:                      # noqa: BLE001
             failures.append("failfast/%s: raised %s: %s"
                             % (case["fixture"], type(exc).__name__, exc))
@@ -860,11 +910,26 @@ def run_parser_tests(console):
             continue
         decision = experiments.decide(node, result)
         bad = []
+        if runner.launcher_calls != case["launcher_calls"]:
+            bad.append("%s was launched as %r, expected %r"
+                       % (processcontext.LAUNCHER_NAME, runner.launcher_calls,
+                          case["launcher_calls"]))
         if runner.launched != case["launched"]:
             bad.append("launched %r, expected %r" % (runner.launched, case["launched"]))
         if decision.verdict != case["verdict"] or decision.next != case["next"]:
             bad.append("verdict %s/%s, expected %s/%s"
                        % (decision.verdict, decision.next, case["verdict"], case["next"]))
+        archived = result["observations"].get("arm_logs_archived") or {}
+        if len(archived) != case["archived"]:
+            bad.append("archived %d arm log(s) (%s), expected %d"
+                       % (len(archived), ", ".join(sorted(os.path.basename(p)
+                                                          for p in archived.values())),
+                          case["archived"]))
+        logs_dir = os.path.join(run_dir, "logs")
+        on_disk = sorted(os.listdir(logs_dir)) if os.path.isdir(logs_dir) else []
+        if len(on_disk) != case["archived"]:
+            bad.append("logs/ holds %r, expected %d file(s)"
+                       % (on_disk, case["archived"]))
         if case["fixture"] == "pcab_single_fail":
             # The point of the whole task: the other three were NOT started.
             if len(runner.launched) != 1:
@@ -873,13 +938,15 @@ def run_parser_tests(console):
             if result["observations"].get("arms_not_launched") != \
                     ["dual-held", "dual-active", "dual-released"]:
                 bad.append("arms_not_launched was not recorded")
+        reporter.close()
         shutil.rmtree(run_dir, ignore_errors=True)
         if bad:
             failures.append("failfast/%s:\n      %s" % (case["fixture"], "\n      ".join(bad)))
         else:
             passed += 1
-            console("  PASS failfast/%s -> launched %s -> %s"
-                    % (case["fixture"], ",".join(runner.launched), decision.verdict))
+            console("  PASS failfast/%s -> %d launcher call(s), launched %s, archived %d -> %s"
+                    % (case["fixture"], len(runner.launcher_calls),
+                       ",".join(runner.launched), len(archived), decision.verdict))
 
     # The graph, over fixture logs, through the real parsing path.
     node = experiments.node("PROCESSCONTEXT")

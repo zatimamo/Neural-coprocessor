@@ -26,10 +26,27 @@ THE REFERENCE GATE
     experiments.PROCESSCONTEXT_REFERENCE_GATE and evaluated here; it is not
     restated as prose.
 
+THE ARTIFACT'S OWN LAUNCHER IS WHAT RUNS
+    The node does not re-implement the four-arm sequence. It stages the built
+    artifact and launches RUN-CONTEXT-AB.cmd - the same script a human would run
+    - once for the SINGLE gate phase and once for the remaining three. That is
+    what makes the run reproducible by hand: there is one launcher, and AutoLab
+    calls it rather than a copy of it.
+
+    The launcher is given an explicit arm list for each phase, which is why it
+    can stop after SINGLE. With no arm list it still runs all four and prints
+    the fixed table, exactly as before.
+
+THE REFERENCE RUNTIME AND THE DATA PATH
+    --nr-dll is the NEURALSCREEN REFERENCE runtime, located from configuration
+    and hash-verified. It is passed through UNTOUCHED: the diagnostic derives the
+    NGX data path as dirname(--nr-dll), so copying the DLL into AutoLab's own
+    staging directory would move the reference data path away from
+    NeuralScreen's. The staging directory holds only the artifact's own files.
+
 NOTHING IS DEPLOYED
-    The diagnostic runs from the cache directory. The NR runtime is COPIED into
-    that directory from the game install - the game's own copy is only read, and
-    is never replaced.
+    The diagnostic runs from a staging directory under the run's results tree.
+    The game's add-on is untouched by this node, and Cyberpunk is never launched.
 """
 
 import os
@@ -39,14 +56,20 @@ import time
 
 import experiments
 import log_parser
+from github_actions import sha256_file
 
 
 class ProcessContextError(Exception):
     pass
 
 
+#: The artifact's own launcher. AutoLab calls THIS rather than re-implementing
+#: the four-arm sequence, so what runs is the script a human would run.
+LAUNCHER_NAME = "RUN-CONTEXT-AB.cmd"
+
 #: The name the executable must run under. The snippet inspects its caller's
-#: module file name and refuses anything without this substring.
+#: module file name and refuses anything without this substring. The launcher
+#: performs this rename; recorded here only so the fact is visible in one place.
 GATE_PREFIX = "nvngx.dll_"
 
 
@@ -59,11 +82,19 @@ class ProcessContextRunner(object):
         self.cache_dir = cfg["_cache_dir"]
         self.install_dir = cfg["paths"]["install_dir"]
         self.nr_dll_rel = cfg["paths"]["nr_dll"].replace("/", os.sep)
+        # THE REFERENCE RUNTIME. Absolute, from configuration, verified by the
+        # caller and again in stage().
+        self.ns_nr_dll = (cfg["paths"].get("neuralscreen_nr_dll") or "").replace("/", os.sep)
+        self.required_nr_sha = cfg["required_nr_dll_sha256"].lower()
 
     # -------------------------------------------------------------- staging
     def stage(self, artifact_meta, staging_dir):
-        """Lay out the artifact plus the NR runtime in a run directory."""
-        # The artifact's payload lives under `_pcab/`.
+        """Lay out the artifact in a run directory.
+
+        The NR runtime is NOT copied. --nr-dll is handed the reference path
+        itself, because the diagnostic derives the NGX data path from it and that
+        directory has to be NeuralScreen's.
+        """
         artifact_dir = artifact_meta["artifact_dir"]
         payload = os.path.join(artifact_dir, "_pcab")
         if not os.path.isdir(payload):
@@ -73,32 +104,55 @@ class ProcessContextRunner(object):
             raise ProcessContextError(
                 "the processcontext artifact does not contain processcontext_ab.exe "
                 "(looked in %s)" % payload)
+        launcher = os.path.join(payload, LAUNCHER_NAME)
+        if not os.path.isfile(launcher):
+            raise ProcessContextError(
+                "the processcontext artifact does not contain %s, so the four arms "
+                "cannot be driven the way a human would drive them" % LAUNCHER_NAME)
+
+        # LOCATE AND VERIFY THE REFERENCE RUNTIME, here as well as in preflight:
+        # this is the file the lane is measured against, and a stale copy beside
+        # the exe would be picked up silently if it were staged instead.
+        nr_dll = self.ns_nr_dll
+        if not nr_dll or not os.path.isfile(nr_dll):
+            raise ProcessContextError(
+                "the NeuralScreen reference runtime is not at %r. Set "
+                "paths.neuralscreen_nr_dll in config.yaml." % (nr_dll or "",))
+        got = sha256_file(nr_dll)
+        if got.lower() != self.required_nr_sha:
+            raise ProcessContextError(
+                "the NeuralScreen reference runtime does not match the required build:"
+                "\n  path     : %s\n  actual   : %s\n  required : %s"
+                % (nr_dll, got.upper(), self.required_nr_sha.upper()))
+        self.log("experiment PROCESSCONTEXT: reference runtime %s" % nr_dll)
+        self.log("experiment PROCESSCONTEXT: sha256 %s OK" % got.upper())
+        self.log("experiment PROCESSCONTEXT: derived data path will be %s"
+                 % os.path.dirname(nr_dll))
 
         os.makedirs(staging_dir, exist_ok=True)
-        for name in ("processcontext_ab.exe", "RUN-CONTEXT-AB.cmd", "README.txt"):
+        for name in ("processcontext_ab.exe", LAUNCHER_NAME, "README.txt"):
             src = os.path.join(payload, name)
             if os.path.isfile(src):
                 shutil.copy2(src, os.path.join(staging_dir, name))
 
-        # The NR runtime, copied OUT of the game install. The game's copy is
-        # read-only as far as AutoLab is concerned.
-        nr_src = os.path.join(self.install_dir, self.nr_dll_rel)
-        if not os.path.isfile(nr_src):
-            raise ProcessContextError(
-                "the diagnostic needs the NR runtime and it is not at %s" % nr_src)
-        nr_dst = os.path.join(staging_dir, "nvngx_dlssnr.dll")
-        shutil.copy2(nr_src, nr_dst)
-
-        gated = os.path.join(staging_dir, GATE_PREFIX + "processcontext_ab.exe")
-        shutil.copy2(exe, gated)
-        return {"dir": staging_dir, "exe": gated, "nr_dll": nr_dst}
+        return {"dir": staging_dir, "exe": os.path.join(staging_dir, "processcontext_ab.exe"),
+                "launcher": os.path.join(staging_dir, LAUNCHER_NAME),
+                "nr_dll": nr_dll, "data_path": os.path.dirname(nr_dll)}
 
     # ------------------------------------------------------------------ run
-    def run_arm(self, staged, arm):
-        """Run ONE arm as its own fresh process."""
+    def run_launcher(self, staged, arms):
+        """LAUNCH RUN-CONTEXT-AB.cmd for exactly these arms.
+
+        The artifact's own launcher, not a re-implementation of it: it performs
+        the nvngx.dll_-prefixed copy that the snippet's caller gate requires, and
+        it is the same script a human runs. An explicit arm list is what lets the
+        SINGLE gate stop the other three before they are ever started.
+        """
         started = time.time()
-        cmd = [staged["exe"], "--mode", arm, "--nr-dll", staged["nr_dll"]]
-        self.log("experiment PROCESSCONTEXT/%s: running" % arm)
+        comspec = os.environ.get("COMSPEC", "cmd.exe")
+        cmd = [comspec, "/c", staged["launcher"], staged["nr_dll"]] + list(arms)
+        self.log("experiment PROCESSCONTEXT: launching %s %s (arms: %s)"
+                 % (LAUNCHER_NAME, staged["nr_dll"], " ".join(arms)))
         try:
             proc = subprocess.run(cmd, cwd=staged["dir"], capture_output=True,
                                   text=True, timeout=self.timeout, errors="replace")
@@ -108,18 +162,27 @@ class ProcessContextRunner(object):
                 if isinstance(exc.stdout, bytes) else (exc.stdout or "")
             err, rc = "TIMEOUT after %ss" % self.timeout, None
         except OSError as exc:
-            out, err, rc = "", "could not start the arm: %s" % exc, None
-        self.log("experiment PROCESSCONTEXT/%s: exit %s in %.1fs"
-                 % (arm, rc, time.time() - started))
-        return {"returncode": rc, "stdout": out, "stderr": err,
-                "seconds": round(time.time() - started, 2)}
+            out, err, rc = "", "could not run the launcher: %s" % exc, None
+        elapsed = round(time.time() - started, 2)
+        self.log("experiment PROCESSCONTEXT: launcher (%s) exit %s in %.1fs"
+                 % (" ".join(arms), rc, elapsed))
+        for line in out.splitlines():
+            if line.strip():
+                self.log("  launcher| %s" % line.rstrip())
+        if err.strip():
+            for line in err.splitlines():
+                if line.strip():
+                    self.log("  launcher! %s" % line.rstrip())
+        return {"arms": list(arms), "returncode": rc, "stdout": out, "stderr": err,
+                "seconds": elapsed}
+
+    def run_arm(self, staged, arm):
+        """Run ONE arm through the launcher. Kept for the argparse-less path."""
+        return self.run_launcher(staged, [arm])
 
     def run_arms(self, staged):
-        """Kept for the maintenance path: run all four, no early exit."""
-        outputs = {}
-        for arm in experiments.PROCESSCONTEXT_ARMS:
-            outputs[arm] = self.run_arm(staged, arm)
-        return outputs
+        """All four through the launcher in one invocation (no gate)."""
+        return {"all": self.run_launcher(staged, experiments.PROCESSCONTEXT_ARMS)}
 
     def run_table(self, staged):
         """The artifact's own table, captured as evidence. Not a decision input."""
@@ -140,32 +203,35 @@ class ProcessContextRunner(object):
         return build_result(arms, artifact_meta, outputs, table, seconds)
 
     # ---------------------------------------------------------------- entry
-    def run(self, artifact_meta, run_dir):
-        """SINGLE first, then - ONLY if it passes the reference gate - the rest.
+    def run(self, artifact_meta, run_dir, reporter=None):
+        """SINGLE first through the launcher, then - ONLY if it passes - the rest.
 
         THE REFERENCE IS A GATE, NOT A DATUM. It is the control, so if it does
         not reproduce, nothing the other three arms could show would be
         readable: a difference between arms cannot be attributed to the variable
-        when the baseline itself is broken. Running them anyway would burn three
-        GPU processes and a game-free window to produce numbers that must then
-        be thrown away.
+        when the baseline itself is broken.
 
-        So the sequence is: launch SINGLE, parse it, evaluate the gate, and
-        decide. The other three processes are never started when SINGLE fails.
+        Both phases go through RUN-CONTEXT-AB.cmd. The launcher is given an
+        explicit arm list, which is the only reason SINGLE can stop the other
+        three before they are ever started.
         """
         staging = os.path.join(run_dir, "processcontext")
         staged = self.stage(artifact_meta, staging)
         started = time.time()
         outputs = {}
         arms = {}
-
         reference_arm = experiments.PROCESSCONTEXT_REFERENCE_ARM
 
-        # ---- 1. SINGLE, alone ------------------------------------------
-        outputs[reference_arm] = self.run_arm(staged, reference_arm)
-        arms.update(parse_arm_logs(staged["dir"], arms=[reference_arm]))
+        # ---- 1. SINGLE, alone, through the launcher ----------------------
+        outputs[reference_arm] = self.run_launcher(staged, [reference_arm])
+        parse_arm_logs(staged["dir"], arms=[reference_arm], out=arms)
         single = arms.get(reference_arm, {})
         reference_ok = single.get("reference_ok") is True
+
+        # NOTE: SINGLE runs exactly ONCE. The launcher is given an explicit arm
+        # list, so the second phase never re-runs it and context-single.log is
+        # never overwritten - which is why there is no separate "gate" copy of
+        # the log to keep.
 
         if not reference_ok:
             failing = single.get("reference_gate_failing") or []
@@ -186,16 +252,23 @@ class ProcessContextRunner(object):
             result["observations"]["arms_not_launched"] = [
                 a for a in experiments.PROCESSCONTEXT_ARMS if a != reference_arm]
             result["observations"]["staging_dir"] = staging
+            result["observations"]["steps"] = [
+                "locate the NeuralScreen reference runtime",
+                "verify its SHA256",
+                "launch %s (single)" % LAUNCHER_NAME,
+                "parse the PCAB-RESULT record for single",
+                "enforce SINGLE as the reference gate -> FAILED, STOP",
+                "archive the arm log that exists",
+            ]
             return result
 
-        self.log("experiment PROCESSCONTEXT: SINGLE passed the reference gate; "
-                 "launching the other three arms")
+        self.log("experiment PROCESSCONTEXT: SINGLE passed the reference gate; launching "
+                 "the other three arms through the same launcher")
 
-        # ---- 2. the rest, one fresh process each ------------------------
+        # ---- 2. the rest, through the same launcher ---------------------
         rest = [a for a in experiments.PROCESSCONTEXT_ARMS if a != reference_arm]
-        for arm in rest:
-            outputs[arm] = self.run_arm(staged, arm)
-            arms.update(parse_arm_logs(staged["dir"], arms=[arm]))
+        outputs["rest"] = self.run_launcher(staged, rest)
+        parse_arm_logs(staged["dir"], arms=rest, out=arms)
 
         table = self.run_table(staged)
         result = build_result(arms, artifact_meta, outputs, table,
@@ -203,7 +276,48 @@ class ProcessContextRunner(object):
         result["observations"]["stopped_after"] = None
         result["observations"]["staging_dir"] = staging
         result["observations"]["table_stdout"] = (table or {}).get("stdout", "")
+        result["observations"]["steps"] = [
+            "locate the NeuralScreen reference runtime",
+            "verify its SHA256",
+            "launch %s (single)" % LAUNCHER_NAME,
+            "parse the PCAB-RESULT record for single",
+            "enforce SINGLE as the reference gate -> PASSED",
+            "launch %s (%s)" % (LAUNCHER_NAME, " ".join(rest)),
+            "parse the PCAB-RESULT records for the remaining three arms",
+            "classify with the fixed A/B/C/D/E rules",
+            "archive all four arm logs",
+        ]
         return result
+
+    # -------------------------------------------------------------- archiving
+    def _archive_arm_log(self, reporter, path, arm):
+        if reporter is None or not os.path.isfile(path):
+            return None
+        try:
+            return reporter.archive(path, "processcontext-%s.log" % arm)
+        except Exception as exc:                      # noqa: BLE001
+            self.log("experiment PROCESSCONTEXT: could not archive %s (%s)" % (path, exc))
+            return None
+
+    def archive_all_arm_logs(self, staged, reporter, result):
+        """Copy every context-<mode>.log the run produced into the results tree.
+
+        All four after a full run; only SINGLE when the gate stopped the run,
+        because then the other three logs do not exist. A log that is not there
+        is not an archive failure - it is the gate having worked.
+        """
+        archived = {}
+        for arm in experiments.PROCESSCONTEXT_ARMS:
+            path = os.path.join(staged["dir"], "context-%s.log" % arm)
+            dest = self._archive_arm_log(reporter, path, arm)
+            if dest:
+                archived[arm] = dest
+        result["observations"]["arm_logs_archived"] = archived
+        if archived:
+            self.log("experiment PROCESSCONTEXT: archived %d arm log(s): %s"
+                     % (len(archived), ", ".join(sorted(os.path.basename(v)
+                                                        for v in archived.values()))))
+        return archived
 
 
 # ---------------------------------------------------------------------------
@@ -212,18 +326,22 @@ class ProcessContextRunner(object):
 # is the real path and not a copy of it.
 # ---------------------------------------------------------------------------
 
-def parse_arm_logs(log_dir, arms=None):
+def parse_arm_logs(log_dir, arms=None, out=None):
     """Parse `context-<mode>.log` for the named arms (default: all four).
 
     A missing log means the arm did not run: valid=None, reference_ok=None. It
     is never reported as a failure, because an arm that never ran is not
     evidence about the variable it was supposed to introduce.
+
+    Returns the parsed arms, and also merges them into `out` when given, so a
+    two-phase run can accumulate the SINGLE gate result and the other three
+    without re-reading anything.
     """
-    out = {}
+    result = {}
     for arm in (arms or experiments.PROCESSCONTEXT_ARMS):
         path = os.path.join(log_dir, "context-%s.log" % arm)
         if not os.path.isfile(path):
-            out[arm] = {
+            result[arm] = {
                 "mode": arm, "valid": None, "reference_ok": None,
                 "reason": "NO_LOG", "log_path": path, "log_present": False,
                 "note": "the arm produced no log file at all",
@@ -253,8 +371,10 @@ def parse_arm_logs(log_dir, arms=None):
                  "why": "; ".join(conflicts)}]
         summary["reference_ok"] = ok
         summary["reference_gate_failing"] = failing
-        out[arm] = summary
-    return out
+        result[arm] = summary
+    if out is not None:
+        out.update(result)
+    return result
 
 
 def build_result(arms, artifact_meta, outputs, table, seconds):

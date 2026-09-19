@@ -395,10 +395,32 @@ jobs:
             echo "::error::the launcher does not create the prefixed copy"; exit 1; }
           grep -qF 'for %%M in (single dual-held dual-active dual-released) do' "$F" || {
             echo "::error::the launcher does not run the four arms in the fixed order"; exit 1; }
-          grep -qF -- '"%RUNNAME%" --mode %%M --nr-dll "%NRDLL%"' "$F" || {
+          grep -qF -- '"%RUNNAME%" --mode %1 --nr-dll "%NRDLL%"' "$F" || {
             echo "::error::each arm is not launched as its own process with the NR DLL"; exit 1; }
           grep -qF -- '"%EXE%" --mode table' "$F" || {
             echo "::error::the launcher does not print the fixed table"; exit 1; }
+          # THE OPTIONAL ARM LIST. With no arm names the script must still run
+          # the four arms in the fixed order and print the table - that is the
+          # documented invocation. With arm names it must run ONLY those, which is
+          # what lets an orchestrator enforce SINGLE as a gate.
+          grep -qF 'set "FIRSTARM=%~2"' "$F" || {
+            echo "::error::the launcher does not read an optional arm list"; exit 1; }
+          grep -qF 'for %%M in (single dual-held dual-active dual-released) do call :pcab_arm %%M' "$F" || {
+            echo "::error::the default invocation no longer runs the four arms in the fixed order"; exit 1; }
+          grep -qF 'for %%M in (%ARMS%) do call :pcab_arm %%M' "$F" || {
+            echo "::error::the launcher cannot run an explicit arm list"; exit 1; }
+          grep -qF 'if not "%EXPLICIT%"=="" goto :pcab_explicit' "$F" || {
+            echo "::error::the two run paths are not separated by a goto"; exit 1; }
+          grep -qF ':pcab_arm' "$F" || {
+            echo "::error::the single-arm subroutine is gone"; exit 1; }
+          # cmd.exe closes a parenthesised block at the first unescaped ")" -
+          # including one inside an echo - which silently truncates the block and
+          # lets the other branch run. The launcher was bitten by exactly that,
+          # so parenthesised blocks are not used for the two run paths at all.
+          N=$(grep -c ') else (' "$F" || true)
+          [ "$N" -eq 0 ] || {
+            echo "::error::the launcher uses a parenthesised if/else block; an echo containing ')' there truncates it"; exit 1; }
+          echo "launcher verified: four arms, one process each, prefixed name, fixed table, optional arm list."
           # The launcher must not launch the game and must not deploy. It NAMES
           # Cyberpunk in a note saying it was not launched, so the check is for
           # the game's executable and for deployment verbs, not for the word.
@@ -407,7 +429,6 @@ jobs:
           # CRLF: a batch file with bare LF line endings is not reliably parsed.
           CRLF=$(grep -c $'\r' "$F" || true)
           [ "$CRLF" -ge 30 ] || { echo "::error::$F has only $CRLF CR-terminated lines - it is not CRLF"; exit 1; }
-          echo "launcher verified: four arms, one process each, prefixed name, fixed table."
 
       # ---------------------------------------------------------------------
       # 6. Structural substitutes for a compiler, which the rig these sources

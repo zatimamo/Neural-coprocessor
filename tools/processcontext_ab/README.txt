@@ -119,6 +119,22 @@ HOW TO RUN
     RUN-CONTEXT-AB.cmd
     RUN-CONTEXT-AB.cmd "C:\full\path\to\nvngx_dlssnr.dll"
 
+Those two run all four arms in the fixed order and then print the fixed table.
+That is the documented invocation and the only one a human needs.
+
+An OPTIONAL arm list after the DLL path selects which arms run. When one is
+given, only those arms run and the fixed table is NOT printed, because it
+compares four arms and only some were asked for:
+
+    RUN-CONTEXT-AB.cmd "" single
+    RUN-CONTEXT-AB.cmd "C:\...\native\nvngx_dlssnr.dll" single
+    RUN-CONTEXT-AB.cmd "C:\...\native\nvngx_dlssnr.dll" dual-held dual-active
+
+This exists so an orchestrator can enforce SINGLE as a reference GATE: run
+single, read its result, and only then decide whether the other three are worth
+a process each. It does not change what any arm does, and with no arm names the
+script behaves exactly as it always has.
+
 The NR DLL defaults to nvngx_dlssnr.dll beside the script. Its SHA256 is
 computed and printed BEFORE it is loaded, and a mismatch aborts without loading
 anything:
@@ -154,7 +170,8 @@ if the name lacks the prefix.
 FILES
 
     processcontext_ab.exe       the diagnostic
-    RUN-CONTEXT-AB.cmd          runs all four arms, then prints the table
+    RUN-CONTEXT-AB.cmd          runs all four arms, then prints the table; an
+                                optional arm list selects a subset
     README.txt                  this file
     SHA256SUMS.txt              hashes of the above
 

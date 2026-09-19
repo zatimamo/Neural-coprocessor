@@ -30,9 +30,18 @@ paths:
   # The ReShade log AutoLab tails. It is removed before each game run and
   # archived after it; nothing else in the game directory is touched.
   reshade_log:   'ReShade.log'
-  # The private DLSS-NR runtime, relative to install_dir. AutoLab verifies its
-  # hash and NEVER replaces it.
+  # The private DLSS-NR runtime AS THE GAME SEES IT, relative to install_dir.
+  # AutoLab verifies its hash and NEVER replaces it.
   nr_dll:        'mgpu/nvngx_dlssnr.dll'
+  # THE NEURALSCREEN REFERENCE RUNTIME, absolute.
+  #
+  # The PROCESSCONTEXT node runs THE REFERENCE LANE, so it must use THIS copy
+  # and not the game's: the diagnostic derives the NGX data path as
+  # dirname(--nr-dll), and for the reference run that directory has to be the
+  # one NeuralScreen itself hands NGX. AutoLab passes this path through
+  # untouched - it does not copy the DLL into its own staging directory, because
+  # that would move the derived data path away from the reference.
+  neuralscreen_nr_dll: 'C:/Users/Zatima/Desktop/neuralscreen-v1.15.0-full/native/nvngx_dlssnr.dll'
 
 # The NeuralScreen runtime this whole investigation is measured against.
 required_nr_dll_sha256: DCC0DC2414AEDEC4A8E084647070383BE068554042587180C20C784D4772D36F

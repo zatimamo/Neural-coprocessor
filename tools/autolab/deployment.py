@@ -30,6 +30,7 @@ class Deployment(object):
         self.install_dir = paths["install_dir"]
         self.addon_name = paths["addon_name"]
         self.nr_dll_rel = paths["nr_dll"]
+        self.ns_nr_dll = paths.get("neuralscreen_nr_dll") or ""
         self.required_nr_sha = cfg["required_nr_dll_sha256"].lower()
         self.log = log
         self._backup = None
@@ -44,21 +45,39 @@ class Deployment(object):
     def nr_dll_path(self):
         return os.path.join(self.install_dir, self.nr_dll_rel.replace("/", os.sep))
 
+    @property
+    def ns_nr_dll_path(self):
+        return self.ns_nr_dll.replace("/", os.sep) if self.ns_nr_dll else ""
+
     # ------------------------------------------------------------ integrity
-    def verify_nr_dll(self):
-        """Hash the runtime. Raises on a mismatch. Never writes anything."""
-        path = self.nr_dll_path
+    def _verify_one(self, path, what):
+        if not path:
+            raise DeploymentError("%s: no path is configured" % what)
         if not os.path.isfile(path):
-            raise DeploymentError("the NR runtime is not at %s" % path)
+            raise DeploymentError("%s is not at %s" % (what, path))
         actual = sha256_file(path)
         if actual.lower() != self.required_nr_sha:
             raise DeploymentError(
-                "the NR runtime hash does not match the required NeuralScreen build.\n"
+                "%s does not match the required NeuralScreen build.\n"
                 "  path     : %s\n  actual   : %s\n  required : %s\n"
                 "AutoLab does NOT replace the runtime. Put the required build in "
-                "place yourself and re-run." % (path, actual.upper(),
-                                                self.required_nr_sha.upper()))
+                "place yourself and re-run."
+                % (what, path, actual.upper(), self.required_nr_sha.upper()))
         return actual
+
+    def verify_nr_dll(self):
+        """Hash the runtime the GAME loads. Raises on a mismatch. Never writes."""
+        return self._verify_one(self.nr_dll_path, "the NR runtime in the game install")
+
+    def verify_ns_nr_dll(self):
+        """Hash the NEURALSCREEN REFERENCE runtime the PROCESSCONTEXT node uses.
+
+        Located from configuration and verified here, before any build, so a
+        missing or wrong reference runtime is refused before CI is asked to do
+        anything. This is the copy the reference lane runs against.
+        """
+        return self._verify_one(self.ns_nr_dll_path,
+                                "the NeuralScreen reference NR runtime")
 
     def addon_sha(self):
         return sha256_file(self.addon_path)
