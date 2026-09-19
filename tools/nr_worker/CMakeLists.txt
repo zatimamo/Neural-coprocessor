@@ -100,7 +100,17 @@ add_executable(nr_transport_bench
   nr_slots.cpp
   nr_json.cpp)
 
-foreach(TARGET mgpu_nr_worker nr_selftest nr_ipc_probe nr_transport_bench)
+# ------------------------------------------------- the HOST-BRIDGE transport bench
+# The cross-adapter transport was measured and rejected on this machine; this is
+# the replacement comparison: EXISTING_HEAP (file mapping opened as a heap on both
+# devices) against CPU_STAGING (readback -> mapped -> host ring -> mapped -> upload).
+add_executable(nr_host_bridge_bench
+  nr_host_bridge_bench.cpp
+  nr_slots.cpp
+  nr_json.cpp)
+
+foreach(TARGET mgpu_nr_worker nr_selftest nr_ipc_probe nr_transport_bench
+               nr_host_bridge_bench)
   target_include_directories(${TARGET} PRIVATE
     "${NR_PROVEN_DIR}"
     "${PCAB_NGX_DIR}"
@@ -126,6 +136,9 @@ target_link_libraries(mgpu_nr_worker PRIVATE
   d3d12 dxgi bcrypt shell32)
 
 target_link_libraries(nr_transport_bench PRIVATE
+  d3d12 dxgi bcrypt)
+
+target_link_libraries(nr_host_bridge_bench PRIVATE
   d3d12 dxgi bcrypt)
 
 message(STATUS "NR-WORKER: proven layer from ${NR_PROVEN_DIR}")

@@ -434,10 +434,10 @@ jobs:
           fi
           echo "all four targets built"
 
-      - name: Verify the four binaries
+      - name: Verify the five binaries
         shell: bash
         run: |
-          for B in mgpu_nr_worker nr_selftest nr_ipc_probe nr_transport_bench; do
+          for B in mgpu_nr_worker nr_selftest nr_ipc_probe nr_transport_bench nr_host_bridge_bench; do
             F=$(find build-nr -name "$B.exe" -type f | head -n1)
             [ -n "$F" ] || { echo "::error::$B.exe was not produced"; exit 1; }
             echo "$B: $F"
@@ -446,10 +446,41 @@ jobs:
           BENCH=$(find build-nr -name 'nr_transport_bench.exe' -type f | head -n1)
           SELF=$(find build-nr -name 'nr_selftest.exe' -type f | head -n1)
           PROBE=$(find build-nr -name 'nr_ipc_probe.exe' -type f | head -n1)
+          BRIDGE=$(find build-nr -name 'nr_host_bridge_bench.exe' -type f | head -n1)
           echo "WORKER=$WORKER" >> "$GITHUB_ENV"
           echo "BENCH=$BENCH"   >> "$GITHUB_ENV"
           echo "SELF=$SELF"     >> "$GITHUB_ENV"
           echo "PROBE=$PROBE"   >> "$GITHUB_ENV"
+          echo "BRIDGE=$BRIDGE" >> "$GITHUB_ENV"
+
+          # THE HOST-BRIDGE BENCHMARK MUST NOT REACH FOR WHAT WAS REJECTED. Mode A
+          # is a file mapping opened as a heap on both devices; mode B is an
+          # ordinary readback/upload pair. Neither may use the cross-adapter
+          # sharing that carries nothing on this machine, and a gate is how that
+          # stays true rather than being a promise in a comment. Comments are
+          # stripped first, because the file explains what it does NOT use.
+          TMPD=$(mktemp -d)
+          sed 's|//.*$||' tools/nr_worker/nr_host_bridge_bench.cpp > "$TMPD/hb.cpp"
+          RC=0
+          for S in 'SHARED_CROSS_ADAPTER' 'ALLOW_CROSS_ADAPTER' 'CreateSharedHandle' \
+                   'OpenSharedHandle' 'OpenSharedHandleByName'; do
+            H=$(grep -n -- "$S" "$TMPD/hb.cpp" || true)
+            if [ -n "$H" ]; then
+              echo "$H"; echo "::error::'$S' is in the host-bridge benchmark's code"; RC=1
+            fi
+          done
+          # And the feature query this milestone turns on must be there.
+          grep -q 'D3D12_FEATURE_EXISTING_HEAPS' "$TMPD/hb.cpp" || {
+            echo "::error::the host-bridge benchmark never queries D3D12_FEATURE_EXISTING_HEAPS"
+            RC=1
+          }
+          grep -q 'OpenExistingHeapFromFileMapping' "$TMPD/hb.cpp" || {
+            echo "::error::the host-bridge benchmark never opens an existing heap"
+            RC=1
+          }
+          rm -rf "$TMPD"
+          [ "$RC" -eq 0 ] || exit 1
+          echo "host-bridge verified: no cross-adapter sharing, and the existing-heap path is present."
 
           # The worker carries the lane's instrumentation and the protocol.
           for S in 'WORKER_READY' 'WORKER_FAILED' 'NR-WORKER-RESULT' 'MGPU_NR_' \
@@ -598,15 +629,17 @@ jobs:
           cp "$SELF"   _nrworker/nr_selftest.exe
           cp "$PROBE"  _nrworker/nr_ipc_probe.exe
           cp "$BENCH"  _nrworker/nr_transport_bench.exe
+          cp "$BRIDGE" _nrworker/nr_host_bridge_bench.exe
           cp tools/nr_worker/RUN-NR-WORKER.cmd _nrworker/
           cp tools/nr_worker/README.txt       _nrworker/
 
           ( cd _nrworker && sha256sum mgpu_nr_worker.exe nr_selftest.exe nr_ipc_probe.exe \
-              nr_transport_bench.exe RUN-NR-WORKER.cmd README.txt ) > _nrworker/SHA256SUMS.txt
+              nr_transport_bench.exe nr_host_bridge_bench.exe RUN-NR-WORKER.cmd README.txt ) \
+            > _nrworker/SHA256SUMS.txt
           cat _nrworker/SHA256SUMS.txt
 
           COUNT=$(find _nrworker -type f | wc -l)
-          [ "$COUNT" -eq 7 ] || { echo "::error::the artifact holds $COUNT files, expected 7"; find _nrworker -type f | sort; exit 1; }
+          [ "$COUNT" -eq 8 ] || { echo "::error::the artifact holds $COUNT files, expected 8"; find _nrworker -type f | sort; exit 1; }
 
           {
             echo "variant   = nr-worker"
