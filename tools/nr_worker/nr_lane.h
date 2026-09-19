@@ -127,6 +127,11 @@ namespace nr
         unsigned long long ngx_version_accepted = 0;
         bool               ngx_version_swept = false;
 
+        //: How many times core Init was called before it succeeded. More than one
+        //: means the run met the transient FAIL_OutOfDate and the retry covered
+        //: it - which is a fact worth recording rather than hiding.
+        unsigned           core_init_attempts = 0;
+
         //: The full eight-condition result, evaluated here so that a caller has
         //: one boolean to check rather than a private copy of the rules.
         bool proven() const

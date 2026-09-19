@@ -461,9 +461,36 @@ namespace nr
             }
             else
             {
-                pcab::logf("[lane]   declaring SDK version stamp 0x%016llX", stamp);
-                res.core_init = (unsigned)p_init(pcab::NS_APPLICATION_ID, data_path, g_lane.dev,
-                                                 &common, (NVSDK_NGX_Version)stamp);
+                // A BOUNDED RETRY, and it is evidence-based rather than hopeful.
+                // On this machine the SAME call, with the SAME arguments and the
+                // SAME runtime, returned FAIL_OutOfDate once and Success on every
+                // later attempt with nothing else changed. So the refusal is
+                // transient, and retrying it in-process is the cheap half of the
+                // mitigation the supervisor will need; a PERSISTENT refusal still
+                // fails, after the attempts are logged.
+                const unsigned attempts_max = 5;
+                unsigned attempts_used = 0;
+                for (unsigned attempt = 1; attempt <= attempts_max; ++attempt)
+                {
+                    ++attempts_used;
+                    pcab::logf("[lane]   declaring SDK version stamp 0x%016llX (attempt %u/%u)",
+                               stamp, attempt, attempts_max);
+                    res.core_init = (unsigned)p_init(pcab::NS_APPLICATION_ID, data_path,
+                                                     g_lane.dev, &common,
+                                                     (NVSDK_NGX_Version)stamp);
+                    if (res.core_init == 0x1u) break;
+                    // Only the transient refusal is worth retrying. Anything else
+                    // is an answer and is reported as one.
+                    if (res.core_init != 0xBAD0000Cu) break;
+                    if (attempt < attempts_max)
+                    {
+                        pcab::logf("[lane]   core Init returned 0xBAD0000C FAIL_OutOfDate. That is "
+                                   "the transient refusal seen on this machine; retrying in this "
+                                   "process before giving up.");
+                        Sleep(400);
+                    }
+                }
+                res.core_init_attempts = attempts_used;
             }
             pcab::logf("[lane]   core NVSDK_NGX_D3D12_Init(app_id=0x%016llX) -> 0x%08X (%s)",
                        (unsigned long long)pcab::NS_APPLICATION_ID, res.core_init,

@@ -203,9 +203,12 @@ namespace
                    "arch_patched=%s observer=%s",
                    r.core_init, r.alloc, r.snip_init, r.arch_patched ? "yes" : "NO",
                    r.observer_installed ? "yes" : "NO");
-        pcab::logf("[worker] NGX SDK version declared = 0x%016llX%s",
+        pcab::logf("[worker] NGX SDK version declared = 0x%016llX%s  core Init attempts = %u%s",
                    r.ngx_version_used,
-                   r.ngx_version_swept ? " (found by the sweep)" : "");
+                   r.ngx_version_swept ? " (found by the sweep)" : "",
+                   r.core_init_attempts,
+                   (r.core_init_attempts > 1u) ? "  (the transient FAIL_OutOfDate was retried "
+                                                 "through)" : "");
 
         // ONE machine-readable line, so a caller does not have to parse prose.
         pcab::logf("NR-WORKER-RESULT proven=%s core_init=0x%08X alloc=0x%08X "
