@@ -44,6 +44,31 @@ THE REFERENCE RUNTIME AND THE DATA PATH
     staging directory would move the reference data path away from
     NeuralScreen's. The staging directory holds only the artifact's own files.
 
+THE SPLIT-PROCESS NODE, AND WHY IT HAS ITS OWN PHASE 1
+    SPLITPROCESS_ISOLATION answers one question: does the RTX 4070 lane still
+    fail when the active Ti SUPER D3D12 state is alive in a DIFFERENT process?
+
+        PHASE 1   the SAME processcontext_ab.exe --mode single, alone, through the
+                  same launcher. The current environment must reproduce the
+                  eight-condition reference IMMEDIATELY BEFORE the holder test.
+                  Historical success is not a substitute: if this fails the run
+                  stops as SPLITPROCESS_REFERENCE_INVALID and holder_ti.exe is
+                  never launched.
+        PHASE 2   holder_ti.exe (PROCESS A) is launched and must report
+                  HOLDER_READY while remaining alive; then the SAME
+                  processcontext_ab.exe runs the SAME single arm as PROCESS B;
+                  then the holder is stopped and must report HOLDER_STOPPED.
+
+    THE EXECUTABLE IS HASHED BEFORE EACH LAUNCH AND THE TWO HASHES MUST MATCH.
+    If the binary changed between PHASE 1 and PHASE 2 the two phases are not the
+    same experiment, PROCESS B is not launched and the run is not readable.
+
+    PROCESS A IS A SEPARATE PROGRAM. It is holder_ti.exe from the same artifact,
+    not a mode of the diagnostic: the diagnostic's sources are frozen at the
+    implementation that produced the PROCESSCONTEXT evidence, and the CI gate
+    proves it. Nothing about PROCESS B is forked, re-implemented or
+    parameterised differently from the PROCESSCONTEXT reference arm.
+
 NOTHING IS DEPLOYED
     The diagnostic runs from a staging directory under the run's results tree.
     The game's add-on is untouched by this node, and Cyberpunk is never launched.
@@ -65,15 +90,23 @@ class ProcessContextError(Exception):
     pass
 
 
-#: holder-ti: PROCESS A of the split-process experiment. A fifth MODE, not a
-#: fifth arm - it never runs the NR lane and is not read by --mode table.
-HOLDER_MODE = "holder-ti"
+#: PROCESS A of the split-process node. A SEPARATE EXECUTABLE, shipped in the
+#: same artifact, in its own process - never a mode of processcontext_ab.exe,
+#: because the binary running the RTX 4070 lane has to be the proven one.
+HOLDER_EXE_NAME = "holder_ti.exe"
+
+#: The holder's protocol. It prints exactly these, alone on a line.
 HOLDER_READY = "HOLDER_READY"
 HOLDER_FAILED = "HOLDER_FAILED"
+HOLDER_STOPPED = "HOLDER_STOPPED"
 
-#: The holder runs under its own prefixed copy so it cannot collide with the
-#: copy the launcher makes for PROCESS B while both are alive.
-HOLDER_EXE_NAME = "nvngx.dll_pcab_holder.exe"
+#: The holder writes its own log; AutoLab names the file so the archive has a
+#: deterministic source.
+HOLDER_LOG_NAME = "context-holder.log"
+
+#: PHASE 1's log is preserved under this name before PHASE 2 overwrites
+#: context-single.log - both phases run the same arm, so they share a file name.
+PHASE1_LOG_NAME = "phase1-reference.log"
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +210,12 @@ class ProcessContextRunner(object):
             raise ProcessContextError(
                 "the processcontext artifact does not contain processcontext_ab.exe "
                 "(looked in %s)" % payload)
+        holder = os.path.join(payload, HOLDER_EXE_NAME)
+        if not os.path.isfile(holder):
+            raise ProcessContextError(
+                "the processcontext artifact does not contain %s, so PROCESS A of the "
+                "split-process node cannot be launched (looked in %s)"
+                % (HOLDER_EXE_NAME, payload))
         launcher = os.path.join(payload, LAUNCHER_NAME)
         if not os.path.isfile(launcher):
             raise ProcessContextError(
@@ -203,12 +242,16 @@ class ProcessContextRunner(object):
                  % os.path.dirname(nr_dll))
 
         os.makedirs(staging_dir, exist_ok=True)
-        for name in ("processcontext_ab.exe", LAUNCHER_NAME, "README.txt"):
+        for name in ("processcontext_ab.exe", HOLDER_EXE_NAME, LAUNCHER_NAME, "README.txt"):
             src = os.path.join(payload, name)
             if os.path.isfile(src):
                 shutil.copy2(src, os.path.join(staging_dir, name))
 
         return {"dir": staging_dir, "exe": os.path.join(staging_dir, "processcontext_ab.exe"),
+                "holder_exe": os.path.join(staging_dir, HOLDER_EXE_NAME),
+                "holder_sha256": (sha256_file(os.path.join(staging_dir, HOLDER_EXE_NAME)).lower()
+                                  if os.path.isfile(os.path.join(staging_dir, HOLDER_EXE_NAME))
+                                  else None),
                 "launcher": os.path.join(staging_dir, LAUNCHER_NAME),
                 "nr_dll": nr_dll, "data_path": os.path.dirname(nr_dll)}
 
@@ -363,38 +406,28 @@ class ProcessContextRunner(object):
         return result
 
     # ------------------------------------------------------- split-process
-    def _make_holder_copy(self, staged):
-        """A prefixed copy of the exe for the holder to run under.
-
-        The holder never loads the snippet, so the caller gate does not apply to
-        it - but it is run under a name carrying the prefix anyway so its log is
-        not cluttered by a warning about a gate that cannot affect it, and under a
-        name of its own so it cannot collide with the copy the launcher makes for
-        PROCESS B while both are alive.
-        """
-        src = staged["exe"]
-        dest = os.path.join(staged["dir"], HOLDER_EXE_NAME)
-        shutil.copy2(src, dest)
-        return dest
-
     def start_holder(self, staged, event_name, on_line=None):
-        """PROCESS A: launch holder-ti, wait for HOLDER_READY, prove it is alive.
+        """PROCESS A: launch holder_ti.exe, wait for HOLDER_READY, prove it is alive.
 
-        The holder is started with stdin as a PIPE we own, so that closing that
-        pipe is a stop signal the holder honours even if everything else fails -
-        and so that a holder can never outlive this process.
+        holder_ti.exe is the SEPARATE executable from the artifact, not a mode of
+        the diagnostic: it holds active Ti SUPER D3D12 state and does nothing
+        else. It is started with stdin as a PIPE we own, so that closing that
+        pipe is a stop signal it honours even if everything else fails - and so
+        that a holder can never outlive this process.
         """
-        exe = self._make_holder_copy(staged)
-        cmd = [exe, "--mode", HOLDER_MODE, "--holder-event", event_name,
-               "--holder-seconds", "0"]         # 0 = no cap; the parent is the control
-        self.log("experiment SPLITPROCESS_ISOLATION: PROCESS A - launching holder-ti")
+        exe = staged["holder_exe"]
+        cmd = [exe, "--event", event_name,
+               "--seconds", "0",                 # 0 = no cap; the parent is the control
+               "--log", HOLDER_LOG_NAME]
+        self.log("experiment SPLITPROCESS_ISOLATION: PROCESS A - launching %s"
+                 % HOLDER_EXE_NAME)
         self.log("experiment SPLITPROCESS_ISOLATION:   %s" % " ".join(cmd))
         proc = subprocess.Popen(cmd, cwd=staged["dir"], stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, errors="replace", bufsize=1)
         holder = {"process": proc, "exe": exe, "event_name": event_name,
-                  "ready": False, "failed": False, "lines": [], "returncode": None,
-                  "stop_reason": None}
+                  "ready": False, "failed": False, "stopped": False, "lines": [],
+                  "returncode": None, "stop_reason": None}
 
         # Drain stdout on a thread: the holder may outlive this read loop, and a
         # full pipe would block it.
@@ -411,6 +444,8 @@ class ProcessContextRunner(object):
                         holder["ready"] = True
                     if line.strip() == HOLDER_FAILED:
                         holder["failed"] = True
+                    if line.strip() == HOLDER_STOPPED:
+                        holder["stopped"] = True
             except Exception:                     # noqa: BLE001 - the pipe closed
                 pass
 
@@ -483,17 +518,24 @@ class ProcessContextRunner(object):
                 proc.wait()
 
         holder["returncode"] = proc.returncode
-        holder["stopped"] = True
-        self.log("experiment SPLITPROCESS_ISOLATION: holder exited %s" % proc.returncode)
+        holder["stop_requested"] = True
+        self.log("experiment SPLITPROCESS_ISOLATION: holder exited %s (HOLDER_STOPPED "
+                 "seen: %s)" % (proc.returncode, bool(holder.get("stopped"))))
         return holder
 
     def run_split(self, artifact_meta, run_dir, reporter=None):
-        """PROCESS A holds Ti SUPER state; PROCESS B is the existing SINGLE arm.
+        """PHASE 1 the current reference; PHASE 2 PROCESS A + the same SINGLE arm.
+
+        PHASE 1 exists because historical success is not evidence about TODAY. The
+        exact executable that will run as PROCESS B must reproduce the
+        eight-condition reference in this environment immediately beforehand; if
+        it does not, the holder is never launched and the node stops as
+        SPLITPROCESS_REFERENCE_INVALID, which is a statement about the machine and
+        not about process isolation.
 
         PROCESS B is the SAME executable, the SAME launcher invocation and the
-        SAME single arm as the PROCESSCONTEXT node uses. Nothing about it is
-        forked, re-implemented or parameterised differently: if it differs at all
-        from the reference run, the comparison this node exists to make is void.
+        SAME single arm as the PROCESSCONTEXT node uses. Its SHA256 is recorded
+        before both launches and the two must be equal.
         """
         staging = os.path.join(run_dir, "splitprocess")
         staged = self.stage(artifact_meta, staging)
@@ -501,88 +543,322 @@ class ProcessContextRunner(object):
         reference_arm = experiments.PROCESSCONTEXT_REFERENCE_ARM
         event_name = "Local\\MGPU_PCAB_HOLDER_STOP_%lu" % os.getpid()
 
+        outputs = {}
+        arms = {}
+        table = None
+        holder = None
+        process_b_ran = False
+        bytes_changed = False
+
+        # THE SAME BYTES IN BOTH PHASES. Taken before PHASE 1 and again before
+        # PHASE 2: if the binary changed in between, the two phases are not the
+        # same experiment and PROCESS B is not launched at all.
+        sha_phase1 = sha256_file(staged["exe"]).lower()
+        self.log("experiment SPLITPROCESS_ISOLATION: processcontext_ab.exe sha256 %s"
+                 % sha_phase1.upper())
+        if reporter is not None:
+            reporter.hash("splitprocess.processcontext_ab.exe.phase1", sha_phase1,
+                          path=staged["exe"])
+            if staged.get("holder_sha256"):
+                reporter.hash("splitprocess.%s" % HOLDER_EXE_NAME,
+                              staged["holder_sha256"], path=staged["holder_exe"])
+
+        # ---- PHASE 1: the current reference control ------------------------
+        self.log("experiment SPLITPROCESS_ISOLATION: PHASE 1 - the reference control, "
+                 "alone, in its own process")
+        outputs["phase1"] = self.run_launcher(staged, [reference_arm])
+        parse_arm_logs(staged["dir"], arms=[reference_arm], out=arms)
+        phase1_summary = dict(arms.get(reference_arm, {}))
+        phase1_ok = phase1_summary.get("reference_ok") is True
+        phase1_detail = self._gate_detail(phase1_summary)
+        self._keep_phase1_log(staged, reference_arm)
+
+        if not phase1_ok:
+            self.log("experiment SPLITPROCESS_ISOLATION: PHASE 1 did NOT pass the "
+                     "reference gate - the executable that would run as PROCESS B does "
+                     "not reproduce the reference in this environment right now")
+            self.log("experiment SPLITPROCESS_ISOLATION: %s" % phase1_detail)
+            self.log("experiment SPLITPROCESS_ISOLATION: STOP - %s was NOT launched"
+                     % HOLDER_EXE_NAME)
+            # `arms.single` means PROCESS B and nothing else. PHASE 1's numbers live
+            # in observations.phase1, so a run in which PROCESS B never started can
+            # never be read as if it had - PHASE 1's own log is in the staging
+            # directory under the same file name.
+            arms = {reference_arm: self._process_b_absent(
+                reference_arm, "PHASE_1_REFERENCE_INVALID")}
+            result = self._split_result(arms, phase1_summary, artifact_meta, outputs,
+                                        table, started, staged, event_name, holder,
+                                        phase1_ok=False, phase1_detail=phase1_detail,
+                                        sha_phase1=sha_phase1, sha_phase2=None,
+                                        process_b_ran=False, bytes_changed=False)
+            return result
+
+        self.log("experiment SPLITPROCESS_ISOLATION: PHASE 1 passed the reference gate; "
+                 "the same executable will now run as PROCESS B")
+
+        # ---- PHASE 2: PROCESS A holds the state, PROCESS B is the same arm --
         # The event is created and owned HERE, before the holder starts, so there
         # is exactly one owner and a stale event from an earlier run cannot be
         # inherited.
         holder_event_create(event_name)
-
-        holder = None
-        outputs = {}
-        arms = {}
-        table = None
+        sha_phase2 = sha256_file(staged["exe"]).lower()
+        if reporter is not None:
+            reporter.hash("splitprocess.processcontext_ab.exe.phase2", sha_phase2,
+                          path=staged["exe"])
+        if sha_phase2 != sha_phase1:
+            bytes_changed = True
+            self.log("experiment SPLITPROCESS_ISOLATION: processcontext_ab.exe CHANGED "
+                     "between PHASE 1 (%s) and PHASE 2 (%s)"
+                     % (sha_phase1.upper(), sha_phase2.upper()))
         try:
             # ---- 1 + 2 + 3. PROCESS A, and prove it is alive --------------
             holder = self.start_holder(staged, event_name)
 
-            if holder["ready"] and holder.get("alive_after_ready"):
-                # ---- 4. PROCESS B: the existing SINGLE arm, unchanged -----
-                self.log("experiment SPLITPROCESS_ISOLATION: PROCESS B - the existing SINGLE "
-                         "arm, launched separately and unchanged")
+            if holder["ready"] and holder.get("alive_after_ready") and not bytes_changed:
+                # ---- 4. PROCESS B: the same SINGLE arm, unchanged --------
+                self.log("experiment SPLITPROCESS_ISOLATION: PROCESS B - the SAME SINGLE "
+                         "arm, the same executable, the same %s invocation, in its own "
+                         "process" % LAUNCHER_NAME)
                 outputs[reference_arm] = self.run_launcher(staged, [reference_arm])
+                process_b_ran = True
+            elif bytes_changed:
+                self.log("experiment SPLITPROCESS_ISOLATION: PROCESS B is NOT launched - "
+                         "the executable changed between PHASE 1 and PHASE 2, so the two "
+                         "phases would not be the same experiment")
             else:
                 self.log("experiment SPLITPROCESS_ISOLATION: the holder did not establish "
                          "its state, so PROCESS B is NOT launched - there is nothing to "
                          "isolate and a run without the variable would answer nothing")
         finally:
-            # ---- 6. terminate the holder cleanly, on EVERY path -----------
+            # ---- 7. terminate the holder cleanly, on EVERY path -----------
             if holder is not None:
                 self.stop_holder(holder)
             holder_event_close(event_name)
 
         # ---- 5. parse PROCESS B's existing PCAB-RESULT -------------------
-        parse_arm_logs(staged["dir"], arms=[reference_arm], out=arms)
+        if process_b_ran:
+            arms = {}
+            parse_arm_logs(staged["dir"], arms=[reference_arm], out=arms)
+        else:
+            holder_ok = bool(holder and holder["ready"]
+                             and holder.get("alive_after_ready"))
+            if bytes_changed:
+                why = "EXECUTABLE_CHANGED_BETWEEN_PHASES"
+            elif not holder_ok:
+                why = "HOLDER_NOT_ESTABLISHED"
+            else:
+                why = "PROCESS_B_NOT_LAUNCHED"
+            arms = {reference_arm: self._process_b_absent(reference_arm, why)}
 
+        result = self._split_result(arms, phase1_summary, artifact_meta, outputs, table,
+                                    started, staged, event_name, holder,
+                                    phase1_ok=True, phase1_detail=phase1_detail,
+                                    sha_phase1=sha_phase1, sha_phase2=sha_phase2,
+                                    process_b_ran=process_b_ran,
+                                    bytes_changed=bytes_changed)
+        return result
+
+    # ------------------------------------------------------------------ helpers
+    @staticmethod
+    def _process_b_absent(reference_arm, why):
+        """The record for a PROCESS B that never ran.
+
+        Deliberately NOT a parse of the staging directory: PHASE 1 wrote
+        context-single.log there under the very name PROCESS B would have used, so
+        reading the directory would report PHASE 1's numbers as PROCESS B's. An
+        absent arm is reported as absent, with a reason, and every gate condition
+        then fails to match - which is what routes the run to a STOP.
+        """
+        return {
+            "mode": reference_arm, "valid": None, "reference_ok": None,
+            "reference_gate_failing": [], "reason": why,
+            "log_path": None, "log_present": False,
+            "note": "PROCESS B did not run, so it has no result - it is NOT PHASE 1's",
+        }
+
+    @staticmethod
+    def _gate_detail(summary):
+        """The failing conditions, in words, for the log and the result reason."""
+        failing = summary.get("reference_gate_failing") or []
+        if not failing:
+            return "the arm produced no result to evaluate"
+        return "; ".join(
+            "%s %s%s (saw %r)" % (c.get("field"), c.get("op"),
+                                  "" if "value" not in c else " %r" % c["value"],
+                                  summary.get(c.get("field")))
+            for c in failing)
+
+    def _keep_phase1_log(self, staged, reference_arm):
+        """Preserve PHASE 1's arm log.
+
+        Both phases run the SAME arm, so both write context-single.log and the
+        second would overwrite the first. PHASE 1's log is the evidence that the
+        reference reproduced immediately before the holder test, so it is kept
+        under its own name before PHASE 2 starts.
+        """
+        src = os.path.join(staged["dir"], "context-%s.log" % reference_arm)
+        if not os.path.isfile(src):
+            return None
+        dest = os.path.join(staged["dir"], PHASE1_LOG_NAME)
+        try:
+            shutil.copy2(src, dest)
+        except OSError as exc:                        # noqa: BLE001
+            self.log("experiment SPLITPROCESS_ISOLATION: could not preserve the PHASE 1 "
+                     "log (%s)" % exc)
+            return None
+        return dest
+
+    def _split_result(self, arms, phase1_summary, artifact_meta, outputs, table,
+                      started, staged, event_name, holder, phase1_ok, phase1_detail,
+                      sha_phase1, sha_phase2, process_b_ran, bytes_changed):
+        """The split-process result object, in the common shape.
+
+        `valid` here means ONE thing: this run produced a readable isolation
+        outcome - the reference reproduced, the holder held, the holder stopped
+        cleanly and PROCESS B actually ran. It is not the four-arm validity of
+        the PROCESSCONTEXT node, which is why it is stated rather than derived
+        from `arms`: only one arm is ever run here.
+        """
         result = build_result(arms, artifact_meta, outputs, table,
                               round(time.time() - started, 2))
         result["kind"] = "splitprocess"
         result["experiment"] = "SPLITPROCESS_ISOLATION"
-        single = arms.get(reference_arm, {})
-        result["holder_established"] = bool(holder and holder["ready"]
-                                           and holder.get("alive_after_ready"))
+        single = dict(arms.get(experiments.PROCESSCONTEXT_REFERENCE_ARM, {}))
+
+        holder_established = bool(holder and holder["ready"]
+                                  and holder.get("alive_after_ready"))
+        holder_stopped = bool(holder and holder.get("stopped"))
+        process_b_ok = single.get("reference_ok") is True
+
+        result["phase1_ok"] = bool(phase1_ok)
+        result["holder_established"] = holder_established
+        result["holder_stopped"] = holder_stopped
+        result["process_b_ran"] = bool(process_b_ran)
+        result["exe_same_bytes"] = not bytes_changed
+
+        if not phase1_ok:
+            result["valid"] = False
+            result["reason"] = (
+                "PHASE 1 REFERENCE INVALID: the executable that would run as PROCESS B "
+                "did not reproduce the eight-condition reference in this environment "
+                "immediately beforehand, so %s was not launched and this run says "
+                "nothing about process isolation: %s" % (HOLDER_EXE_NAME, phase1_detail))
+        elif not holder_established:
+            result["valid"] = False
+            result["reason"] = (
+                "%s did not establish active Ti SUPER D3D12 state (ready=%s, alive=%s, "
+                "exit=%s), so PROCESS B was not launched"
+                % (HOLDER_EXE_NAME, bool(holder and holder["ready"]),
+                   bool(holder and holder.get("alive_after_ready")),
+                   holder["returncode"] if holder else None))
+        elif not holder_stopped:
+            result["valid"] = False
+            result["reason"] = (
+                "the holder held its state but did not report HOLDER_STOPPED (exit=%s), so "
+                "the run did not end cleanly" % (holder["returncode"] if holder else None))
+        elif bytes_changed:
+            result["valid"] = False
+            result["reason"] = (
+                "the executable changed between PHASE 1 (%s) and PHASE 2 (%s), so the two "
+                "phases are not the same experiment and PROCESS B was not launched"
+                % (sha_phase1.upper(), sha_phase2.upper()))
+        else:
+            result["valid"] = True
+            result["reason"] = (
+                "PHASE 1 reproduced the reference with processcontext_ab.exe, %s held its "
+                "state while the SAME executable ran the SAME single arm as PROCESS B, and "
+                "the holder stopped cleanly" % HOLDER_EXE_NAME)
+
+        result["observations"]["phase1"] = {
+            "passed": bool(phase1_ok),
+            "detail": phase1_detail,
+            "summary": phase1_summary,
+            "log": PHASE1_LOG_NAME,
+            "returncode": (outputs.get("phase1") or {}).get("returncode"),
+        }
         result["observations"]["holder"] = {
-            "exe": holder["exe"] if holder else None,
+            "exe": holder["exe"] if holder else os.path.join(staged["dir"], HOLDER_EXE_NAME),
+            "sha256": staged.get("holder_sha256"),
             "event_name": event_name,
             "ready": bool(holder and holder["ready"]),
             "failed_line": bool(holder and holder["failed"]),
             "alive_after_ready": bool(holder and holder.get("alive_after_ready")),
+            "stopped_line": holder_stopped,
             "returncode": holder["returncode"] if holder else None,
+            "log": HOLDER_LOG_NAME,
             "lines": list(holder["lines"]) if holder else [],
         }
+        result["observations"]["executable_sha256"] = {
+            "phase1": sha_phase1,
+            "phase2": sha_phase2,
+            # None, not True: in a run that never reached PHASE 2 there are no two
+            # hashes to compare, and "identical" would be a claim about a launch
+            # that did not happen.
+            "identical": (None if sha_phase2 is None else not bytes_changed),
+        }
         result["observations"]["process_b"] = (
-            "the existing SINGLE arm, the same executable and the same %s invocation the "
+            "the SAME SINGLE arm, the same executable and the same %s invocation the "
             "PROCESSCONTEXT node uses, in its own process" % LAUNCHER_NAME)
         result["observations"]["process_b_summary"] = single
-        result["observations"]["staging_dir"] = staging
+        result["observations"]["staging_dir"] = staged["dir"]
         result["observations"]["steps"] = [
-            "launch holder-ti as PROCESS A",
+            "PHASE 1: launch %s (single) alone and hash the executable" % LAUNCHER_NAME,
+            ("PHASE 1: reference gate -> PASSED" if phase1_ok
+             else "PHASE 1: reference gate -> FAILED, STOP, holder NOT launched"),
+            "PHASE 2: hash the executable again and compare with PHASE 1",
+            "PHASE 2: launch %s as PROCESS A" % HOLDER_EXE_NAME,
             "wait for exactly HOLDER_READY",
             "verify the holder process is still alive",
-            ("launch the existing SINGLE arm as PROCESS B" if result["holder_established"]
-             else "PROCESS B NOT launched: the holder did not establish its state"),
+            ("launch the SAME single arm as PROCESS B" if process_b_ran
+             else "PROCESS B NOT launched"),
             "parse PROCESS B's existing PCAB-RESULT",
-            "terminate the holder cleanly",
-            "archive holder.log and context-single.log",
+            "signal the named stop event and require HOLDER_STOPPED",
+            "archive the PHASE 1 log, the holder log and PROCESS B's log",
         ]
         return result
 
     # -------------------------------------------------------------- archiving
     def archive_split_logs(self, result, reporter):
-        """Archive holder.log and context-single.log."""
+        """Archive the three logs the split-process node produces.
+
+            holder.log                    PROCESS A, written by holder_ti.exe
+            processcontext-single.log     PROCESS B, the same name the
+                                          PROCESSCONTEXT node uses for the SINGLE
+                                          arm, so the two runs are comparable
+            splitprocess-phase1.log       PHASE 1's copy of the same arm, which is
+                                          the evidence the reference reproduced
+                                          immediately before the holder test
+        """
         staged_dir = result["observations"]["staging_dir"]
         archived = {}
-        holder_log = os.path.join(staged_dir, "context-%s.log" % HOLDER_MODE)
+
+        holder_log = os.path.join(staged_dir, HOLDER_LOG_NAME)
         if reporter is not None and os.path.isfile(holder_log):
             try:
                 archived["holder"] = reporter.archive(holder_log, "holder.log")
             except Exception as exc:              # noqa: BLE001
                 self.log("experiment SPLITPROCESS_ISOLATION: could not archive the holder "
                          "log (%s)" % exc)
-        single_log = os.path.join(staged_dir, "context-%s.log"
-                                  % experiments.PROCESSCONTEXT_REFERENCE_ARM)
-        dest = self._archive_arm_log(reporter, single_log,
-                                     experiments.PROCESSCONTEXT_REFERENCE_ARM)
-        if dest:
-            archived["single"] = dest
+
+        phase1_log = os.path.join(staged_dir, PHASE1_LOG_NAME)
+        if reporter is not None and os.path.isfile(phase1_log):
+            try:
+                archived["phase1"] = reporter.archive(phase1_log,
+                                                      "splitprocess-phase1.log")
+            except Exception as exc:              # noqa: BLE001
+                self.log("experiment SPLITPROCESS_ISOLATION: could not archive the PHASE 1 "
+                         "log (%s)" % exc)
+
+        # PROCESS B's own log, named exactly as the PROCESSCONTEXT node names the
+        # SINGLE arm's log. Only present when PROCESS B actually ran.
+        if result.get("process_b_ran"):
+            single_log = os.path.join(staged_dir, "context-%s.log"
+                                      % experiments.PROCESSCONTEXT_REFERENCE_ARM)
+            dest = self._archive_arm_log(reporter, single_log,
+                                         experiments.PROCESSCONTEXT_REFERENCE_ARM)
+            if dest:
+                archived["single"] = dest
+
         result["observations"]["logs_archived"] = archived
         if archived:
             self.log("experiment SPLITPROCESS_ISOLATION: archived %s"

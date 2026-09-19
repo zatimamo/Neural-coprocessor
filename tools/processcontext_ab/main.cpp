@@ -35,27 +35,6 @@
 // in, which is the directory NeuralScreen hands NGX. The NR DLL path and the
 // derived data path are both logged, and the DLL must be inside the data path.
 //
-// THE FIFTH MODE, AND IT IS NOT AN ARM
-//
-//   --mode holder-ti    Keeps ACTIVE RTX 4070 Ti SUPER D3D12 state alive in a
-//                       process of its own, and nothing else: a device, a DIRECT
-//                       queue and a small CBV/SRV/UAV descriptor heap.
-//
-//   It exists for ONE question, which the four arms raise and cannot answer:
-//   the dual-active arm shows that active second-adapter state in the SAME
-//   process breaks the RTX 4070 lane. Does it still break it when the state is
-//   in a DIFFERENT process?
-//
-//   So the holder is PROCESS A, it prints HOLDER_READY once its state is
-//   established, and it then waits for a stop signal. PROCESS B is the existing
-//   SINGLE arm, launched completely separately and completely unchanged. If B
-//   succeeds, process isolation is validated as the fix direction.
-//
-//   It never loads the NGX core, never touches NVAPI, never installs the
-//   architecture patch, never creates the RTX 4070 device, never creates a
-//   swapchain and never submits anything. It RETURNS before the lane begins, so
-//   there is no code path from the holder into the lane.
-//
 // INTERPRETATION, FIXED IN ADVANCE - one rule per arm, in this order:
 //
 //   E) SINGLE does not succeed  -> THE DIAGNOSTIC IS INVALID. Stop. Interpret
@@ -109,12 +88,6 @@ namespace
     // 10DE:2786 RTX 4070 - the adapter NeuralScreen's lane works on.
     const unsigned PCI_RTX_4070  = 0x2786u;
     const unsigned VENDOR_NVIDIA = 0x10DEu;
-
-    // The fifth mode. NOT one of the four arms: it never runs the NR lane, so it
-    // is not in MODE_NAMES, it is not read by --mode table, and it is not part of
-    // the experiment's result rules.
-    const char *HOLDER_MODE = "holder-ti";
-    const unsigned HOLDER_DEFAULT_SECONDS = 1800u;
 
     // The exact snippet build NeuralScreen v1.15.0 runs. A different build has a
     // different runtime and the comparison would be against the wrong thing, so
@@ -282,139 +255,6 @@ namespace
         FARPROC p = (m != nullptr) ? GetProcAddress(m, name) : nullptr;
         pcab::logf("[ngx] %-40s (%-7s) -> %p", name, who, (void *)p);
         return p;
-    }
-
-    // ------------------------------------------------- the holder-ti process
-    //
-    // holder-ti EXISTS ONLY TO KEEP ACTIVE Ti SUPER D3D12 STATE ALIVE in a
-    // process of its own. It is PROCESS A of the split-process experiment.
-    //
-    // It never loads the NGX core, never touches NVAPI, never creates the RTX
-    // 4070 device, never creates a swapchain and never submits anything. What it
-    // holds is exactly the state that PROCESSCONTEXT's dual-active arm showed to
-    // be sufficient to break an RTX 4070 NR lane in the SAME process: a device, a
-    // DIRECT queue and a small CBV/SRV/UAV descriptor heap.
-    //
-    // If an RTX 4070 NR lane succeeds in a DIFFERENT process while this is alive,
-    // process isolation is the fix direction.
-
-    // True while the parent still has stdin open. A byte written by the parent is
-    // an EXPLICIT STOP COMMAND, and a broken pipe means the parent is gone -
-    // which is what keeps a holder from outliving its orchestrator.
-    bool holder_stdin_open()
-    {
-        HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
-        if (h == nullptr || h == INVALID_HANDLE_VALUE) return true;
-        DWORD avail = 0;
-        if (PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr))
-        {
-            if (avail == 0) return true;
-            char buf[64];
-            DWORD got = 0;
-            if (ReadFile(h, buf, sizeof buf, &got, nullptr) && got > 0)
-            {
-                pcab::logf("[holder] an explicit stop command arrived on stdin (%lu byte(s))",
-                           (unsigned long)got);
-                return false;
-            }
-            return true;
-        }
-        if (GetLastError() == ERROR_BROKEN_PIPE)
-        {
-            pcab::logf("[holder] stdin is closed - the parent is gone");
-            return false;
-        }
-        // Not a pipe at all. The named event is then the only control, which is
-        // the documented first choice anyway.
-        return true;
-    }
-
-    int run_holder_ti(IDXGIAdapter1 *adapter, const DXGI_ADAPTER_DESC1 &desc,
-                      const wchar_t *event_name, unsigned cap_seconds)
-    {
-        pcab::logf("[holder] PROCESS A - active Ti SUPER D3D12 state, and nothing else");
-        pcab::logf("[holder] adapter: desc=\"%ls\" vendor=0x%04X device=0x%04X "
-                   "luid=%08lX:%08lX",
-                   desc.Description, desc.VendorId, desc.DeviceId,
-                   (unsigned long)desc.AdapterLuid.HighPart,
-                   (unsigned long)desc.AdapterLuid.LowPart);
-        pcab::logf("[holder] NO NGX, NO NVAPI, NO arch patch, NO RTX 4070 device, NO "
-                   "swapchain, NO submissions");
-
-        ID3D12Device *dev = nullptr;
-        HRESULT hr = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev));
-        pcab::logf("[holder] D3D12CreateDevice(FL_11_0) hr=0x%08X device=%p",
-                   (unsigned)hr, (void *)dev);
-        if (FAILED(hr) || dev == nullptr) { pcab::logf("HOLDER_FAILED"); return 1; }
-
-        ID3D12CommandQueue *queue = nullptr;
-        D3D12_COMMAND_QUEUE_DESC qd{};
-        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-        qd.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-        hr = dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue));
-        pcab::logf("[holder] CreateCommandQueue(DIRECT) hr=0x%08X queue=%p",
-                   (unsigned)hr, (void *)queue);
-        if (FAILED(hr) || queue == nullptr) { pcab::logf("HOLDER_FAILED"); return 1; }
-
-        ID3D12DescriptorHeap *heap = nullptr;
-        D3D12_DESCRIPTOR_HEAP_DESC hd{};
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = 8;
-        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        hr = dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap));
-        pcab::logf("[holder] CreateDescriptorHeap(CBV_SRV_UAV x8, SHADER_VISIBLE) "
-                   "hr=0x%08X heap=%p", (unsigned)hr, (void *)heap);
-        if (FAILED(hr) || heap == nullptr) { pcab::logf("HOLDER_FAILED"); return 1; }
-
-        // The named stop event. The PARENT owns it; this process only opens it,
-        // so there is exactly one owner and no way for a stale event to be
-        // inherited from an earlier run.
-        HANDLE stop = nullptr;
-        if (event_name != nullptr && event_name[0] != L'\0')
-        {
-            stop = OpenEventW(SYNCHRONIZE, FALSE, event_name);
-            pcab::logf("[holder] stop event \"%ls\" -> %p%s", event_name, (void *)stop,
-                       (stop != nullptr) ? "" : "  (could not be opened; stdin is the control)");
-        }
-        else
-        {
-            pcab::logf("[holder] no stop event was named; stdin is the control");
-        }
-
-        pcab::logf("[holder] the state is established and will be HELD. Waiting for the stop "
-                   "signal: the named event, an explicit byte on stdin, or stdin closing - "
-                   "which is what happens if the parent dies. Cap %u seconds.",
-                   cap_seconds);
-        pcab::logf("HOLDER_READY");
-
-        const DWORD started = GetTickCount();
-        const char *why = "the cap expired";
-        for (;;)
-        {
-            if (stop != nullptr && WaitForSingleObject(stop, 0) == WAIT_OBJECT_0)
-            {
-                why = "the named stop event was signalled";
-                break;
-            }
-            if (!holder_stdin_open())
-            {
-                why = "stdin closed, or an explicit stop command";
-                break;
-            }
-            if (cap_seconds != 0 && (GetTickCount() - started) / 1000u >= cap_seconds)
-            {
-                why = "the cap expired";
-                break;
-            }
-            Sleep(100);
-        }
-
-        pcab::logf("[holder] stopping: %s", why);
-        if (stop != nullptr) CloseHandle(stop);
-        pcab::logf("[holder] held state is released by process exit; nothing was submitted");
-        pcab::logf("HOLDER_STOPPED");
-        return 0;
     }
 
     // ------------------------------------------------------------ the table
@@ -660,11 +500,8 @@ int main(int argc, char **argv)
     const char *mode = nullptr;
     static wchar_t w_nr_dll[MAX_PATH * 2]{};
     static wchar_t w_data[MAX_PATH * 2]{};
-    static wchar_t w_holder_event[MAX_PATH]{};
     const wchar_t *nr_dll = nullptr;
     const wchar_t *data_path = nullptr;
-    const wchar_t *holder_event = nullptr;
-    unsigned holder_seconds = HOLDER_DEFAULT_SECONDS;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -686,16 +523,6 @@ int main(int argc, char **argv)
             MultiByteToWideChar(CP_ACP, 0, argv[++i], -1, w_data, MAX_PATH * 2);
             data_path = w_data;
         }
-        else if (std::strcmp(argv[i], "--holder-event") == 0 && i + 1 < argc)
-        {
-            MultiByteToWideChar(CP_ACP, 0, argv[++i], -1, w_holder_event, MAX_PATH);
-            holder_event = w_holder_event;
-        }
-        else if (std::strcmp(argv[i], "--holder-seconds") == 0 && i + 1 < argc)
-        {
-            const long v = std::strtol(argv[++i], nullptr, 10);
-            holder_seconds = (v > 0) ? (unsigned)v : 0u;
-        }
         else
         {
             std::fprintf(stderr, "PROCESSCONTEXT-AB: unrecognised argument \"%s\"\n", argv[i]);
@@ -707,29 +534,26 @@ int main(int argc, char **argv)
     {
         std::fprintf(stderr,
                      "PROCESSCONTEXT-AB\n"
-                     "  --mode single|dual-held|dual-active|dual-released|table|holder-ti\n"
-                     "  --nr-dll <path to nvngx_dlssnr.dll>   (the four arms only; the\n"
-                     "                                         data path is dirname of it)\n"
-                     "  --data-path <NGX data path>           (OVERRIDE ONLY; the derived\n"
-                     "                                         path must contain the DLL)\n"
-                     "  --holder-event <name>                 (holder-ti: named stop event)\n"
-                     "  --holder-seconds <n>                  (holder-ti: wait cap, 0 = none)\n");
+                     "  --mode single|dual-held|dual-active|dual-released|table\n"
+                     "  --nr-dll <path to nvngx_dlssnr.dll>   (required for the four modes)\n"
+                     "  --data-path <NGX data path>           (OVERRIDE ONLY. By default the\n"
+                     "                                         data path is dirname(--nr-dll),\n"
+                     "                                         which is NeuralScreen's own data\n"
+                     "                                         path, and the DLL must be inside it.)\n");
         return 1;
     }
 
     if (std::strcmp(mode, "table") == 0) return run_table();
 
-    const bool is_holder = (std::strcmp(mode, HOLDER_MODE) == 0);
-
     int mode_index = -1;
     for (int i = 0; i < 4; ++i)
         if (std::strcmp(mode, MODE_NAMES[i]) == 0) mode_index = i;
-    if (mode_index < 0 && !is_holder)
+    if (mode_index < 0)
     {
         std::fprintf(stderr, "PROCESSCONTEXT-AB: unknown --mode \"%s\"\n", mode);
         return 1;
     }
-    if (nr_dll == nullptr && !is_holder)
+    if (nr_dll == nullptr)
     {
         std::fprintf(stderr, "PROCESSCONTEXT-AB: --nr-dll is required for mode \"%s\"\n", mode);
         return 1;
@@ -762,16 +586,6 @@ int main(int argc, char **argv)
                    "caller check can be satisfied. (The MGPU add-on deploys the same way, under a "
                    "file name carrying that prefix.)");
     }
-    else if (is_holder)
-    {
-        // The caller gate is about the DLSSNR snippet refusing a caller whose
-        // module name does not contain "nvngx.dll". The holder never loads the
-        // snippet and never calls into it, so the gate does not apply to it and
-        // warning about it here would be noise in holder.log.
-        pcab::logf("[self]  the module file name does not contain \"nvngx.dll\". That gate is "
-                   "about the DLSSNR snippet's caller, and holder-ti never loads or calls the "
-                   "snippet, so it does not apply to this mode.");
-    }
     else
     {
         pcab::logf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
@@ -801,7 +615,6 @@ int main(int argc, char **argv)
     // inconsistent pair of paths is refused before anything is hashed or
     // loaded, and the derivation is testable without a correctly-hashed DLL.
     wchar_t derived_data[MAX_PATH * 2]{};
-    if (!is_holder)
     {
         wcsncpy(derived_data, nr_dll, MAX_PATH * 2 - 1);
         wchar_t *slash = wcsrchr(derived_data, L'\\');
@@ -842,10 +655,6 @@ int main(int argc, char **argv)
     pcab::logf("");
 
     // ---- the NR DLL hash gate, BEFORE the load ---------------------------
-    // holder-ti never loads the runtime, so it has nothing to gate: it skips
-    // both the hash and the data path entirely rather than hashing 165 MB of a
-    // file it will not touch.
-    if (!is_holder)
     {
         char hex[65] = "";
         unsigned long size = 0;
@@ -941,20 +750,6 @@ int main(int argc, char **argv)
                    (unsigned long)d_4070.AdapterLuid.LowPart);
     }
     pcab::logf("");
-
-    // ---- holder-ti: PROCESS A of the split-process experiment -------------
-    //
-    // It stops HERE. Everything below this point is the RTX 4070 NR lane - the
-    // NGX core, core Init, AllocateParameters, NvAPI, the architecture patch,
-    // the observer, the snippet and CreateFeature - and the holder must have
-    // none of it. Returning here is what makes that structural rather than a
-    // promise: there is no path from the holder into the lane.
-    if (is_holder)
-    {
-        const int rc = run_holder_ti(ad_ti, d_ti, holder_event, holder_seconds);
-        pcab::log_close();
-        return rc;
-    }
 
     // ---- the mode's second-adapter state, established BEFORE the lane -----
     ID3D12Device *dev_ti = nullptr;

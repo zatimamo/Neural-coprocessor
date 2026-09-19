@@ -230,8 +230,15 @@ GRAPH = {
         # process breaks the RTX 4070 lane. This asks the only question that
         # follows from it, and asks it with the SAME SINGLE implementation:
         #
-        #   PROCESS A   holder-ti: Ti SUPER device + DIRECT queue + heap, alive
-        #   PROCESS B   the existing SINGLE arm, unchanged, launched separately
+        #   PHASE 1     processcontext_ab.exe --mode single ALONE, in this
+        #               environment, immediately before the holder test. Historical
+        #               success is not a substitute: the executable that is about
+        #               to run as PROCESS B has to prove itself first, or a
+        #               transient failure would be misread as an isolation result.
+        #   PHASE 2     PROCESS A  holder_ti.exe - a SEPARATE executable, holding
+        #                           Ti SUPER device + DIRECT queue + heap, alive
+        #               PROCESS B  the SAME single arm, the SAME executable, the
+        #                           SAME launcher invocation as PHASE 1
         #
         # If B succeeds, process isolation is the validated fix direction and the
         # diagnostic graph is complete for this line of investigation.
@@ -239,44 +246,70 @@ GRAPH = {
             "experiment": "SPLITPROCESS_ISOLATION",
             "implemented": True,
             "workflow": "PROCESSCONTEXT",
-            "summary_rows": ["SPLIT/HOLDER", "SPLIT/SINGLE"],
+            "summary_rows": ["SPLIT/PHASE1", "SPLIT/HOLDER", "SPLIT/SINGLE"],
             "terminal": True,
             "decisions": [
+                # PHASE 1 did not reproduce. Nothing about process isolation can be
+                # read from this run, and the holder was never launched.
+                {"id": "SPLITPROCESS_REFERENCE_INVALID",
+                 "verdict": "SPLITPROCESS_REFERENCE_INVALID",
+                 "next": None, "stop": True,
+                 "because": "the exact executable that would run as PROCESS B did not "
+                            "reproduce the eight-condition reference in this environment "
+                            "immediately beforehand, so the run measures the environment "
+                            "and not process isolation",
+                 "when": [{"field": "phase1_ok", "op": "is_not_true"}]},
+
                 # The holder could not establish the state it exists to hold, so
                 # nothing was isolated and the run says nothing.
                 {"id": "INVALID_HOLDER",
                  "verdict": "INVALID_HOLDER",
                  "next": None, "stop": True,
-                 "because": "the holder process did not establish active Ti SUPER D3D12 "
-                            "state, so no process-to-process comparison exists",
-                 "when": [{"field": "holder_established", "op": "is_not_true"}]},
+                 "because": "holder_ti.exe did not establish active Ti SUPER D3D12 state, "
+                            "so no process-to-process comparison exists",
+                 "when": [{"field": "phase1_ok", "op": "is_true"},
+                          {"field": "holder_established", "op": "is_not_true"}]},
 
-                # THE RESULT THE ARCHITECTURE PREDICTS.
+                # THE RESULT THE ARCHITECTURE PREDICTS. The holder must also have
+                # stopped cleanly: a holder that had to be killed means the run did
+                # not finish the way it was specified to.
                 {"id": "PROCESS_ISOLATION_VALIDATED",
                  "verdict": "PROCESS_ISOLATION_VALIDATED",
                  "next": None, "stop": True,
-                 "because": "the SINGLE arm reproduced the full eight-condition reference "
-                            "in a process of its own while active Ti SUPER D3D12 state was "
-                            "alive in another process",
-                 "when": [{"field": "holder_established", "op": "is_true"},
+                 "because": "the SAME single arm reproduced the full eight-condition "
+                            "reference in a process of its own while active Ti SUPER D3D12 "
+                            "state was alive in another process",
+                 "when": [{"field": "phase1_ok", "op": "is_true"},
+                          {"field": "holder_established", "op": "is_true"},
+                          {"field": "holder_stopped", "op": "is_true"},
                           {"field": "arms.single.reference_ok", "op": "is_true"}]},
 
-                # The same failure as the same-process dual-active arm.
+                # THE SAME FAILURE, not merely some failure. The verdict names the
+                # same-process failure signature, so it is required literally:
+                # descriptor -1, CuModule -1, Reserved18 0xBAD00002. A lane that
+                # failed in any OTHER way is a different event and falls through to
+                # UNEXPECTED_MIXED_STATE rather than being reported as this one.
                 {"id": "PROCESS_ISOLATION_NOT_SUFFICIENT",
                  "verdict": "PROCESS_ISOLATION_NOT_SUFFICIENT",
                  "next": None, "stop": True,
-                 "because": "the SINGLE arm failed with the same statuses while the Ti SUPER "
-                            "state was held in a different process, so moving the lane into "
-                            "its own process is not sufficient",
-                 "when": [{"field": "holder_established", "op": "is_true"},
-                          {"field": "arms.single.reference_ok", "op": "is_false"}]},
+                 "because": "the same arm failed with the same-process signature - descriptor "
+                            "-1, CuModule -1, Reserved18 0xBAD00002 - while the Ti SUPER state "
+                            "was held in a different process, so moving the lane into its own "
+                            "process is not sufficient",
+                 "when": [{"field": "phase1_ok", "op": "is_true"},
+                          {"field": "holder_established", "op": "is_true"},
+                          {"field": "holder_stopped", "op": "is_true"},
+                          {"field": "arms.single.descriptor_status", "op": "eq", "value": -1},
+                          {"field": "arms.single.cumodule_status", "op": "eq", "value": -1},
+                          {"field": "arms.single.feature", "op": "eq", "value": 0xBAD00002}]},
             ],
             "fallback": {
                 "id": "UNEXPECTED_MIXED_STATE",
                 "verdict": "UNEXPECTED_MIXED_STATE",
                 "next": None, "stop": True,
-                "because": "the split-process run did not produce one of the three "
-                           "predefined outcomes",
+                "because": "the split-process run did not produce one of the four "
+                           "predefined outcomes - including a PROCESS B failure that is "
+                           "not the same-process failure signature",
             },
         },
 

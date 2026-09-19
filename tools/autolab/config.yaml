@@ -73,7 +73,7 @@ timeouts:
   # PROCESSCONTEXT runs four arms, each loading a ~166 MB DLL and creating
   # devices. Generous, because a slow load is not a result.
   processcontext_seconds: 420
-  # SPLITPROCESS_ISOLATION: how long to wait for holder-ti to print
+  # SPLITPROCESS_ISOLATION: how long to wait for holder_ti.exe to print
   # HOLDER_READY, and how long to wait for it to stop at each graded step of the
   # shutdown (named event, then stdin close, then terminate).
   holder_ready_seconds: 60

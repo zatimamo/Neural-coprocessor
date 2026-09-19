@@ -42,6 +42,27 @@
 #   question, and a diagnostic that quietly includes MGPU code is a change to
 #   MGPU behaviour by another name.
 #
+# TWO BINARIES, AND WHY THEY ARE SEPARATE
+#   The artifact carries processcontext_ab.exe AND holder_ti.exe. The holder is
+#   PROCESS A of SPLITPROCESS_ISOLATION: it holds active Ti SUPER D3D12 state in
+#   its own process while PROCESS B runs the SINGLE arm.
+#
+#   The holder is NOT a mode of the diagnostic. Adding one would have changed the
+#   executable running the RTX 4070 reference lane, and an isolation experiment
+#   whose reference binary changed is not an isolation experiment. So:
+#
+#     * tools/processcontext_ab/ is FROZEN - this workflow fails unless every file
+#       in it is byte-identical to commit 6e2d527, the implementation that
+#       produced the known-good PROCESSCONTEXT evidence;
+#     * the holder lives only in tools/processcontext_holder/, with no shared
+#       source, no NGX headers and no MinHook;
+#     * the diagnostic must not contain holder-ti, HOLDER_READY, HOLDER_FAILED,
+#       --holder-event or --holder-seconds, and the holder must not contain
+#       NVSDK_NGX, nvngx_dlssnr, NvAPI_Initialize or Reserved18. Both are checked
+#       in the SOURCE and in the BINARY, so the two cannot have been confused;
+#     * every import of the holder is checked: d3d12 and dxgi, and nothing that
+#       could reach a neural runtime.
+#
 # GPU-FREE BEHAVIOURAL TESTS
 #   The runners have no NVIDIA adapter, so the four arms cannot be exercised
 #   here. Three paths can be, and are: the table path with no logs present, the
@@ -60,6 +81,7 @@ on:
     branches: [archtest-ab]
     paths:
       - 'tools/processcontext_ab/**'
+      - 'tools/processcontext_holder/**'
       - '.github/workflows/processcontext-ab.yml'
 
 concurrency:
@@ -79,6 +101,164 @@ jobs:
     name: processcontext-ab
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The freeze gate below diffs tools/processcontext_ab/ against commit
+          # 6e2d527, so the history has to be here.
+          fetch-depth: 0
+
+      # ---------------------------------------------------------------------
+      # 0. THE FREEZE. tools/processcontext_ab/ must be the exact implementation
+      #    that produced the known-good PROCESSCONTEXT evidence. This is not a
+      #    style rule: SPLITPROCESS_ISOLATION compares the SINGLE arm against a
+      #    holder in another process, and that comparison is void if the
+      #    executable running the lane changed between the two runs.
+      #
+      #    The check is on the CONTENT HASH OF EACH FILE against the blob id git
+      #    holds for commit 6e2d527, which is line-ending independent: a checkout
+      #    with core.autocrlf=true and one with it false hash the same here, and
+      #    a plain sha256 of the checked-out file would not. A sha256 manifest
+      #    was tried first and failed exactly that way - and it would have failed
+      #    as a false ALARM on a correct tree, which is worse than no gate.
+      # ---------------------------------------------------------------------
+      - name: The known-good diagnostic is frozen
+        shell: bash
+        run: |
+          FAIL=0
+          CHECKED=0
+          while read -r WANT PATHNAME; do
+            [ -n "$PATHNAME" ] || continue
+            GOT=$(git hash-object -- "$PATHNAME" 2>/dev/null || echo MISSING)
+            CHECKED=$((CHECKED + 1))
+            if [ "$GOT" != "$WANT" ]; then
+              echo "::error::$PATHNAME hashes to $GOT, expected the 6e2d527 blob $WANT"
+              FAIL=1
+            else
+              echo "$PATHNAME: OK ($GOT)"
+            fi
+          done <<'EOF'
+          7c080b2c577649bb74f83e551dfb3aa7afd96217 tools/processcontext_ab/CMakeLists.txt
+          4b7e2db0f1fea75c67d52fb512fe34e0a9c9e3ad tools/processcontext_ab/README.txt
+          fc6ce467e961b8567544ba8fa41f9518a96b4ddd tools/processcontext_ab/RUN-CONTEXT-AB.cmd
+          12ccdd26dd6be85e0e0777f411f956a0f2f96d72 tools/processcontext_ab/main.cpp
+          23ba2bcf7129c1412e4ec9a7637fd8b5fea4e736 tools/processcontext_ab/nv.cpp
+          5fb039e843bd3abef689e8722eaa4541a094d265 tools/processcontext_ab/nv.h
+          b292b5da088f8fb777d9e259fe5cb5b5b56da1eb tools/processcontext_ab/observe.cpp
+          d6b99ab0b126e4805811df24e2998d839d831856 tools/processcontext_ab/observe.hpp
+          EOF
+          # A walk that checked nothing would report nothing wrong.
+          [ "$CHECKED" -eq 8 ] || {
+            echo "::error::the freeze gate checked $CHECKED file(s), expected 8"; exit 1; }
+          [ "$FAIL" -eq 0 ] || {
+            echo "::error::tools/processcontext_ab/ is no longer the known-good implementation."
+            exit 1; }
+
+          # Exactly these files and no others: a new file in the directory is a
+          # change to the diagnostic even before anything compiles it.
+          FOUND=$(cd tools/processcontext_ab && ls -1 | sort | tr '\n' ' ')
+          WANT="CMakeLists.txt README.txt RUN-CONTEXT-AB.cmd main.cpp nv.cpp nv.h observe.cpp observe.hpp "
+          [ "$FOUND" = "$WANT" ] || {
+            echo "::error::tools/processcontext_ab/ holds [$FOUND], expected [$WANT]"; exit 1; }
+
+          # And the same statement in git's terms, against the commit that
+          # produced the evidence: no modification, no addition, no deletion.
+          git diff --exit-code 6e2d527 -- tools/processcontext_ab || {
+            echo "::error::tools/processcontext_ab/ differs from 6e2d527"; exit 1; }
+          git diff --cached --exit-code 6e2d527 -- tools/processcontext_ab || {
+            echo "::error::the staged tools/processcontext_ab/ differs from 6e2d527"; exit 1; }
+          echo "freeze verified: all 8 files hash to their 6e2d527 blobs and git reports no difference."
+
+      # ---------------------------------------------------------------------
+      # 0b. THE HOLDER IS CONTAINED. Whatever the holder is, it is here and only
+      #     here, and it can reach nothing.
+      # ---------------------------------------------------------------------
+      - name: The holder is contained
+        shell: bash
+        run: |
+          test -d tools/processcontext_holder
+          for F in main.cpp CMakeLists.txt README.txt; do
+            test -f "tools/processcontext_holder/$F" || {
+              echo "::error::missing tools/processcontext_holder/$F"; exit 1; }
+          done
+
+          # Exactly these three files and no others: a new file here is new
+          # behaviour in PROCESS A, and PROCESS A is supposed to do five things.
+          FOUND=$(cd tools/processcontext_holder && ls -1 | sort | tr '\n' ' ')
+          WANT="CMakeLists.txt README.txt main.cpp "
+          [ "$FOUND" = "$WANT" ] || {
+            echo "::error::tools/processcontext_holder/ holds [$FOUND], expected [$WANT]"; exit 1; }
+
+          # The holder must not reach out of its own directory, and must not
+          # include the diagnostic it is deliberately independent of. The FILE
+          # NAME is stripped first: this directory is called
+          # processcontext_holder, so matching the path would match everything.
+          H=$(grep -rnE '^[[:space:]]*#include' tools/processcontext_holder \
+                | sed 's/^[^:]*:[0-9]*://' \
+                | grep -E '\.\./|processcontext|nv\.h|observe|MinHook|nvsdk|nvapi' || true)
+          [ -z "$H" ] || {
+            echo "$H"; echo "::error::the holder includes something outside its own directory"; exit 1; }
+
+          # NO NEURAL RUNTIME, AND NO WAY TO CALL ONE - asserted on the CODE, with
+          # the comments stripped, because those comments name these things in
+          # order to disclaim them. The stripped copies go to a temp directory so
+          # that the token gate below cannot find them and report itself.
+          TMPD=$(mktemp -d)
+          sed 's|//.*$||' tools/processcontext_holder/main.cpp > "$TMPD/main.txt"
+          sed 's/#.*$//'   tools/processcontext_holder/CMakeLists.txt > "$TMPD/cmake.txt"
+          RC=0
+          for S in NVSDK_NGX nvngx_dlssnr NvAPI_Initialize Reserved18 nvapi64 nvapi \
+                   MinHook GetProcAddress LoadLibrary; do
+            H=$(grep -n -- "$S" "$TMPD/main.txt" "$TMPD/cmake.txt" || true)
+            if [ -n "$H" ]; then
+              echo "$H"; echo "::error::'$S' appears in the holder's code"; RC=1
+            fi
+          done
+          rm -rf "$TMPD"
+          [ "$RC" -eq 0 ] || exit 1
+
+          # The holder must NOT have grown an NGX or MinHook option: an option to
+          # point it at those trees is a dependency waiting to be switched on.
+          grep -q 'target_link_libraries(holder_ti PRIVATE' tools/processcontext_holder/CMakeLists.txt || {
+            echo "::error::the holder does not declare its link libraries"; exit 1; }
+          # And the libraries it declares are d3d12 and dxgi, exactly.
+          LIBS=$(awk '/target_link_libraries\(holder_ti PRIVATE/,/\)/' \
+                   tools/processcontext_holder/CMakeLists.txt \
+                 | grep -oE '^[[:space:]]+[A-Za-z0-9_]+' | tr -d ' ' | sort | tr '\n' ' ')
+          [ "$LIBS" = "d3d12 dxgi " ] || {
+            echo "::error::the holder links [$LIBS], expected [d3d12 dxgi ]"; exit 1; }
+          echo "holder contained: no neural runtime, no NVAPI, no detour library, no dynamic loading, no diagnostic source, no climbing include, and d3d12 + dxgi only."
+
+      # ---------------------------------------------------------------------
+      # 0c. HOLDER FUNCTIONALITY EXISTS ONLY HERE. The holder's own protocol
+      #     tokens must not have leaked into any other source in the repository.
+      #     tools/autolab/ is the DRIVER: it waits for the tokens and names the
+      #     executable, so it is the one permitted place outside this directory.
+      #
+      #     Vendored downloads, build trees, caches and run outputs are excluded:
+      #     they are not sources and they are not in a clean checkout anyway.
+      # ---------------------------------------------------------------------
+      - name: Holder tokens exist only in the holder and its driver
+        shell: bash
+        run: |
+          ALLOW='^tools/processcontext_holder/|^tools/autolab/|^\.github/workflows/'
+          SKIP='--exclude-dir=.git --exclude-dir=ext --exclude-dir=_dl --exclude-dir=results
+                --exclude-dir=cache --exclude-dir=__pycache__ --exclude-dir=build-pcab
+                --exclude-dir=build-holder'
+          BAD=0
+          for S in HOLDER_READY HOLDER_FAILED HOLDER_STOPPED holder_ti --holder-event --holder-seconds; do
+            H=$(grep -rn \
+                  --include='*.cpp' --include='*.h' --include='*.hpp' --include='*.c' \
+                  --include='*.py' --include='*.cmd' --include='*.bat' --include='*.txt' \
+                  --include='*.yml' --include='*.yaml' --include='*.md' --include='CMakeLists.txt' \
+                  $SKIP -- "$S" . \
+                | sed 's|^\./||' | grep -vE "$ALLOW" || true)
+            if [ -n "$H" ]; then
+              echo "$H"
+              echo "::error::'$S' appears outside the holder and its driver"
+              BAD=1
+            fi
+          done
+          [ "$BAD" -eq 0 ] || exit 1
+          echo "holder tokens are confined to tools/processcontext_holder/ and the driver."
 
       # ---------------------------------------------------------------------
       # 1. The diagnostic must be standalone. If it reaches into the add-on,
@@ -667,28 +847,22 @@ jobs:
           H=$(grep -nF 'CreateConstantBufferView' "$M" || true)
           [ -z "$H" ] || { echo "$H"; note "dual-active writes a CBV; it must hold device+queue+heap only"; }
 
-          # ---- REQUIRED: holder-ti, and its boundaries -------------------
-          # The holder keeps ACTIVE Ti SUPER state alive in its own process. It
-          # must have NONE of the lane: no NGX core, no NVAPI, no patch, no RTX
-          # 4070 device, no swapchain, no submissions.
-          grep -qF 'HOLDER_MODE = "holder-ti"' "$M" || note "the holder-ti mode name is missing"
-          grep -qF 'run_holder_ti(ad_ti, d_ti, holder_event, holder_seconds)' "$M" || \
-            note "the holder is not driven from the Ti SUPER adapter selected by device id"
-          grep -qF 'HOLDER_READY' "$M" || note "the holder never prints HOLDER_READY"
-          grep -qF 'HOLDER_FAILED' "$M" || note "the holder has no failure line for a state it could not establish"
-          grep -qF "OpenEventW(SYNCHRONIZE, FALSE, event_name)" "$M" || \
-            note "the holder does not wait on a named stop event"
-          grep -qF 'holder_stdin_open()' "$M" || \
-            note "the holder does not watch stdin for a stop command or the parent going away"
-          # It RETURNS before the lane. Asserted by position, because that is
-          # what makes "no NGX in the holder" structural rather than a promise.
-          L_HOLDER=$(line_of "$M" 'if (is_holder)')
-          L_CORE2=$(line_of "$M" 'pcab::ngx_load_core()')
-          order_ok "$L_HOLDER" "$L_CORE2" || note "THE HOLDER CAN REACH THE LANE - its branch is not before the NGX core load"
-          echo "holder: branch=$L_HOLDER before the lane at $L_CORE2"
+          # ---- REJECTED: any holder surface at all -----------------------
+          # The holder is a SEPARATE PROGRAM now (tools/processcontext_holder/),
+          # because a holder MODE inside this file would have changed the
+          # executable that runs the RTX 4070 reference lane - and an isolation
+          # experiment whose reference binary changed is not an isolation
+          # experiment. This source is frozen at the implementation that produced
+          # the PROCESSCONTEXT evidence; the manifest gate above is the real
+          # proof, and this is the second, readable statement of the same rule.
+          for S in 'holder-ti' 'holder_ti' 'HOLDER_READY' 'HOLDER_FAILED' 'HOLDER_STOPPED' \
+                   '--holder-event' '--holder-seconds' 'is_holder' 'run_holder_ti'; do
+            H=$(grep -nF -- "$S" "$M" || true)
+            [ -z "$H" ] || { echo "$H"; note "'$S' is back in the diagnostic: it has grown a holder surface"; }
+          done
 
           [ "$FAIL" -eq 0 ] || exit 1
-          echo "reference contract verified: app id, private block, order, V2 stamp, per-GPU spoof target and the eight SINGLE conditions are all present, and every superseded construct is absent."
+          echo "reference contract verified: app id, private block, order, V2 stamp, per-GPU spoof target and the eight SINGLE conditions are all present, every superseded construct is absent, and the file carries no holder surface."
 
       # ---------------------------------------------------------------------
       # 7. Dependencies, pinned. Same SHAs as every other workflow in this repo.
@@ -751,6 +925,140 @@ jobs:
       - name: Build (processcontext-ab)
         run: cmake --build build-pcab --config Release
 
+      # ---------------------------------------------------------------------
+      # 8b. The holder. Its own project, its own binary, no dependencies to
+      #     point at: the configure line is deliberately shorter than the
+      #     diagnostic's, and that difference is the containment.
+      # ---------------------------------------------------------------------
+      - name: Configure (processcontext-holder)
+        shell: bash
+        run: |
+          cmake -S tools/processcontext_holder -B build-holder -A x64 2>&1 | tee _cfg_holder.txt
+          grep -q "PROCESSCONTEXT-HOLDER: independent" _cfg_holder.txt || {
+            echo "::error::the holder's configure did not state its independence"; exit 1; }
+          grep -q "PROCESSCONTEXT-HOLDER: output" _cfg_holder.txt || {
+            echo "::error::the holder's output path was not announced"; exit 1; }
+          echo "--- configure summary ---"
+          grep -n "PROCESSCONTEXT-HOLDER" _cfg_holder.txt
+
+      - name: Build (processcontext-holder)
+        run: cmake --build build-holder --config Release
+
+      - name: Verify the holder binary and its imports
+        shell: bash
+        run: |
+          HEXE=$(find build-holder -name 'holder_ti.exe' -type f | head -n1)
+          if [ -z "$HEXE" ]; then
+            echo "::error::holder_ti.exe was not produced"
+            find build-holder -maxdepth 3 -type f || true
+            exit 1
+          fi
+          echo "HEXE_PATH=$HEXE" >> "$GITHUB_ENV"
+          echo "output: $HEXE"
+
+          # The holder's own protocol must be IN the binary, or the parent would
+          # wait forever for a line this build cannot print.
+          for S in HOLDER_READY HOLDER_FAILED HOLDER_STOPPED \
+                   'CreateDXGIFactory1' 'D3D12CreateDevice' 'CreateCommandQueue' \
+                   'CreateDescriptorHeap' 'CBV_SRV_UAV' 'context-holder.log'; do
+            if ! grep -qa -- "$S" "$HEXE"; then
+              echo "::error::'$S' is not present in $HEXE - the holder was compiled out"
+              exit 1
+            fi
+          done
+
+          # AND NO NEURAL RUNTIME. The four identifiers the holder must not
+          # contain, in the BINARY that ships.
+          for S in NVSDK_NGX nvngx_dlssnr NvAPI_Initialize Reserved18; do
+            if grep -qa -- "$S" "$HEXE"; then
+              echo "::error::'$S' is present in $HEXE - this is not a holder, it is a lane"
+              exit 1
+            fi
+          done
+
+          # ---- the import table ------------------------------------------
+          # A string scan cannot see a library the holder links but never names.
+          # The imports are read directly: d3d12 and dxgi, plus the CRT and
+          # kernel32/dxgi machinery every console program has. Anything that
+          # could reach a neural runtime fails the build.
+          python - "$HEXE" <<'PY'
+          import struct, sys
+
+          path = sys.argv[1]
+          data = open(path, "rb").read()
+
+          # PE: e_lfanew at 0x3C, then the optional header's data directories.
+          # In a PE32+ optional header the data directories start at offset 112,
+          # so directory 0 (exports) is at 112 and directory 1 (IMPORTS) is at
+          # 120. Reading 112 gives the export directory, which an executable
+          # normally does not have - so the mistake shows up as "not mapped"
+          # rather than as an empty list.
+          e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+          assert data[e_lfanew:e_lfanew + 4] == b"PE\0\0", "not a PE image"
+          coff = e_lfanew + 4
+          n_sections = struct.unpack_from("<H", data, coff + 2)[0]
+          opt_size = struct.unpack_from("<H", data, coff + 16)[0]
+          opt = coff + 20
+          magic = struct.unpack_from("<H", data, opt)[0]
+          assert magic == 0x20B, "not a PE32+ image"
+          n_dirs = struct.unpack_from("<I", data, opt + 108)[0]
+          assert n_dirs >= 2, "the image has no import data directory"
+          imp_rva, imp_size = struct.unpack_from("<II", data, opt + 120)
+          assert imp_rva and imp_size, "the import data directory is empty"
+          sections = []
+          sec = opt + opt_size
+          for i in range(n_sections):
+            off = sec + i * 40
+            va, vsize = struct.unpack_from("<II", data, off + 12)
+            raw_size, raw = struct.unpack_from("<II", data, off + 16)
+            sections.append((va, max(vsize, raw_size), raw))
+
+          def rva_to_off(rva):
+            for va, size, raw in sections:
+              if va <= rva < va + size:
+                  return raw + (rva - va)
+            return None
+
+          off = rva_to_off(imp_rva)
+          assert off is not None, "the import directory is not mapped"
+          names = []
+          while True:
+            entry = data[off:off + 20]
+            if len(entry) < 20 or entry == b"\0" * 20:
+                break
+            name_rva = struct.unpack_from("<I", entry, 12)[0]
+            if name_rva == 0:
+                break
+            no = rva_to_off(name_rva)
+            end = data.index(b"\0", no)
+            names.append(data[no:end].decode("ascii", "replace"))
+            off += 20
+
+          print("imports: " + ", ".join(sorted(names)))
+
+          # POSITIVE CONTROL. A reader that silently found nothing would let any
+          # binary through, so an empty import list is a failure of the gate
+          # itself and not a pass.
+          if len(names) < 3:
+            print("::error::only %d import(s) were read - the import table walk "
+                  "is not working" % len(names))
+            sys.exit(1)
+
+          FORBIDDEN = ("nvapi", "ngx", "dlss", "cuda", "nvcuda", "nvml", "minhook")
+          bad = [n for n in names
+                 if any(f in n.lower() for f in FORBIDDEN)]
+          if bad:
+            print("::error::the holder imports %s" % ", ".join(bad))
+            sys.exit(1)
+          required = {"d3d12.dll", "dxgi.dll"}
+          missing = sorted(required - set(n.lower() for n in names))
+          if missing:
+            print("::error::the holder does not import %s" % ", ".join(missing))
+            sys.exit(1)
+          print("imports verified: d3d12 and dxgi, and nothing that reaches a neural runtime.")
+          PY
+          echo "holder verified: protocol present, forbidden identifiers absent, imports clean."
+
       - name: Verify the artifact
         shell: bash
         run: |
@@ -786,7 +1094,21 @@ jobs:
               exit 1
             fi
           done
-          echo "instrumentation strings present; no game path, add-on name or deployment path."
+
+          # NOR ANY HOLDER SURFACE. The holder is a different program with a
+          # different job, and the isolation experiment is only readable if the
+          # binary running the RTX 4070 lane is the one that ran the reference
+          # arm. A holder mode or a holder token reappearing here means the
+          # diagnostic was modified again, and the run would be void.
+          for S in 'holder-ti' 'HOLDER_READY' 'HOLDER_FAILED' 'HOLDER_STOPPED' \
+                   '--holder-event' '--holder-seconds' 'holder_ti'; do
+            if grep -qa -- "$S" "$EXE"; then
+              echo "::error::'$S' is present in $EXE - the diagnostic has grown a holder surface"
+              exit 1
+            fi
+          done
+          echo "instrumentation strings present; no game path, add-on name or deployment path,"
+          echo "and no holder surface: processcontext_ab.exe is the frozen reference binary."
 
       # ---------------------------------------------------------------------
       # 9. The three GPU-free behavioural tests. The runner has no NVIDIA
@@ -897,22 +1219,37 @@ jobs:
           echo "(g) a matching --data-path override is accepted, then the hash gate"
 
       # ---------------------------------------------------------------------
-      # 10. The artifact: exactly the four files the deliverable names.
+      # 10. The artifact: the two executables, the launcher, the README and the
+      #     manifest. holder_ti.exe ships here because the split-process node
+      #     needs BOTH processes to come from one verified build.
       # ---------------------------------------------------------------------
       - name: Stage and hash the artifact
         shell: bash
         run: |
           mkdir -p _pcab
           cp "$EXE_PATH"                       _pcab/processcontext_ab.exe
+          cp "$HEXE_PATH"                      _pcab/holder_ti.exe
           cp tools/processcontext_ab/RUN-CONTEXT-AB.cmd _pcab/
           cp tools/processcontext_ab/README.txt         _pcab/
 
-          ( cd _pcab && sha256sum processcontext_ab.exe RUN-CONTEXT-AB.cmd README.txt ) > _pcab/SHA256SUMS.txt
+          ( cd _pcab && sha256sum processcontext_ab.exe holder_ti.exe RUN-CONTEXT-AB.cmd README.txt ) > _pcab/SHA256SUMS.txt
           cat _pcab/SHA256SUMS.txt
 
+          # THE TWO BINARIES MUST NOT BE THE SAME FILE, and each must be the one
+          # it claims to be: the diagnostic carries the lane's instrumentation,
+          # the holder carries none of it.
+          grep -qa 'PCAB-RESULT' _pcab/processcontext_ab.exe || {
+            echo "::error::processcontext_ab.exe has no PCAB-RESULT"; exit 1; }
+          grep -qa 'PCAB-RESULT' _pcab/holder_ti.exe && {
+            echo "::error::holder_ti.exe contains the diagnostic's result line"; exit 1; }
+          if cmp -s _pcab/processcontext_ab.exe _pcab/holder_ti.exe; then
+            echo "::error::the two executables are identical"; exit 1
+          fi
+
           COUNT=$(find _pcab -type f | wc -l)
-          [ "$COUNT" -eq 4 ] || { echo "::error::the artifact holds $COUNT files, expected 4"; find _pcab -type f | sort; exit 1; }
+          [ "$COUNT" -eq 5 ] || { echo "::error::the artifact holds $COUNT files, expected 5"; find _pcab -type f | sort; exit 1; }
           test -f _pcab/processcontext_ab.exe
+          test -f _pcab/holder_ti.exe
           test -f _pcab/RUN-CONTEXT-AB.cmd
           test -f _pcab/README.txt
           test -f _pcab/SHA256SUMS.txt
@@ -925,21 +1262,30 @@ jobs:
             echo "why the private NVAPI CUDA-interop calls 0x0DDAC234 and 0xAD1A677D"
             echo "fail inside Cyberpunk but succeed in NeuralScreen."
             echo
+            echo "holder_ti.exe: PROCESS A of SPLITPROCESS_ISOLATION. It holds active"
+            echo "RTX 4070 Ti SUPER D3D12 state - device, DIRECT queue, CBV/SRV/UAV"
+            echo "heap - in its own process while processcontext_ab.exe runs the SINGLE"
+            echo "arm in another. No NGX, no NVAPI, no CUDA, no NR runtime, no"
+            echo "swapchain, no submission. It shares no source with the diagnostic:"
+            echo "the executable running the lane has to be the proven one."
+            echo
             echo "commit    = ${GITHUB_SHA}"
             echo "run       = ${GITHUB_RUN_ID}"
             echo "built     = $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo
-            echo "build command:"
+            echo "build commands:"
             echo "  cmake -S tools/processcontext_ab -B build-pcab -A x64 \\"
             echo "        -DPCAB_NGX_DIR=<ext/ngx> -DPCAB_MINHOOK_DIR=<ext/minhook>"
             echo "  cmake --build build-pcab --config Release"
+            echo "  cmake -S tools/processcontext_holder -B build-holder -A x64"
+            echo "  cmake --build build-holder --config Release"
             echo
             echo "pins:"
             echo "  NVIDIA/DLSS       ${NGX_SHA}"
             echo "  TsudaKageyu/minhook ${MINHOOK_SHA}"
             echo
-            echo "This diagnostic does NOT modify MGPU, NeuralScreen, Cyberpunk or any"
-            echo "NVIDIA binary, and it never launches the game. It does not deploy."
+            echo "This does NOT modify MGPU, NeuralScreen, Cyberpunk or any NVIDIA"
+            echo "binary, and it never launches the game. It does not deploy."
           } > PCAB_VARIANT.txt
           cat PCAB_VARIANT.txt
 

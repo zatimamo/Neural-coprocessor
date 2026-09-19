@@ -121,35 +121,66 @@ or ACTIVE_SECOND_DEVICE_STATE_SUFFICIENT - in either case a second adapter's
 D3D12 state exists inside the process that runs the RTX 4070 lane, and the
 question that follows is the same.
 
-    PROCESS A   --mode holder-ti: Ti SUPER device + DIRECT queue + a small
-                CBV/SRV/UAV heap, in a process of its own. It prints
-                HOLDER_READY once the state is established, then waits for a
-                stop signal. No NGX, no NVAPI, no RTX 4070 device, no
-                swapchain, no submissions. It RETURNS before the lane begins,
-                so there is no code path from the holder into the lane.
-    PROCESS B   the EXISTING SINGLE arm, unchanged, through the same launcher.
-                Nothing about it is forked or parameterised differently.
+The node runs its OWN reference control first. Historical success is not a
+substitute for it: the exact executable that is about to run as PROCESS B has to
+reproduce the reference in THIS environment immediately beforehand, or a
+transient failure would be misread as an isolation result.
 
-Sequence: launch PROCESS A, wait for exactly HOLDER_READY, verify the holder is
-still alive, launch PROCESS B, parse its PCAB-RESULT, terminate the holder
-cleanly, archive holder.log and context-single.log. The holder is stopped in a
+    PHASE 1     processcontext_ab.exe --mode single, alone, through
+                RUN-CONTEXT-AB.cmd - the same arm the PROCESSCONTEXT node uses.
+                Its SHA256 is recorded. If it fails the eight-condition gate the
+                node stops as SPLITPROCESS_REFERENCE_INVALID and the holder is
+                never launched.
+    PHASE 2     PROCESS A   holder_ti.exe - a SEPARATE EXECUTABLE from the same
+                            artifact, in its own process: Ti SUPER device +
+                            DIRECT queue + a small CBV/SRV/UAV heap. It prints
+                            HOLDER_READY once the state is established, then
+                            waits for a stop signal. No NGX, no NVAPI, no CUDA,
+                            no RTX 4070 device, no swapchain, no submissions.
+                PROCESS B   the SAME SINGLE arm, the SAME executable, the SAME
+                            launcher invocation as PHASE 1.
+
+The diagnostic's executable is NOT modified to hold state. Adding a holder mode
+to it would have changed the very binary the comparison is about, so the holder
+is its own program, its own CMake project, with no shared source - and the CI
+gate fails unless tools/processcontext_ab/ is byte-identical to the commit that
+produced the known-good PROCESSCONTEXT evidence.
+
+Sequence: PHASE 1 and its gate, hash the executable, launch PROCESS A, wait for
+exactly HOLDER_READY, verify the holder is still alive, hash the executable AGAIN
+and require the two hashes to be equal, launch PROCESS B, parse its PCAB-RESULT,
+signal the named stop event, require HOLDER_STOPPED, archive holder.log,
+processcontext-single.log and splitprocess-phase1.log. The holder is stopped in a
 finally block, graded: the named stop event, then closing its stdin, then
 terminate. Closing stdin is what keeps a holder from outliving AutoLab.
 
+If the executable's bytes differ between PHASE 1 and PHASE 2, PROCESS B is NOT
+launched: the two phases would not be the same experiment.
+
 Verdicts, all terminal:
 
+    SPLITPROCESS_REFERENCE_INVALID  PHASE 1 did not reproduce here and now, so
+                                    the holder was NOT launched and the run says
+                                    nothing about process isolation
     INVALID_HOLDER                  the holder did not establish its state, so
                                     PROCESS B was NOT launched
     PROCESS_ISOLATION_VALIDATED     PROCESS B satisfied the full eight-condition
                                     reference gate with the Ti SUPER state alive
                                     elsewhere -> the diagnostic graph is complete
                                     for this line of investigation
-    PROCESS_ISOLATION_NOT_SUFFICIENT PROCESS B failed the same way
+    PROCESS_ISOLATION_NOT_SUFFICIENT PROCESS B failed with the SAME signature as
+                                    the same-process dual-active arm: descriptor
+                                    -1, CuModule -1, Reserved18 0xBAD00002. A
+                                    failure with any OTHER signature is not this
+                                    verdict; it is UNEXPECTED_MIXED_STATE.
+    UNEXPECTED_MIXED_STATE          anything else
 
 The summary carries the comparison explicitly:
 
     SAME PROCESS / dual-active:  Descriptor -1   CuModule -1   Reserved18 BAD00002
-    SPLIT PROCESS:               Descriptor  0   CuModule  0   Reserved18 Success
+    SPLIT PROCESS PHASE 1:       Descriptor  0   CuModule  0   Reserved18 Success
+    SPLIT PROCESS PHASE 2:       Descriptor  0   CuModule  0   Reserved18 Success
+                                 (the Ti SUPER state alive in another process)
 
 Built only from what the two nodes recorded: a missing arm or an unestablished
 holder is reported as MISSING/NOT_APPLICABLE, never filled in with the value the

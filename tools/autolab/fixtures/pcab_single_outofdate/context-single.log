@@ -1,0 +1,4 @@
+PROCESSCONTEXT-AB  mode=single  pid=23112  started=2026-09-19 16:00:00
+[lane]  core NVSDK_NGX_D3D12_Init(app_id=0x0000000001000000) -> 0xBAD0000C (FAIL_OutOfDate)
+[lane]  core Init is not Success. Nothing downstream can be formed on an uninitialised session, so the lane stops here and reports FAIL.
+PCAB-RESULT mode=single valid=YES reason=CORE_INIT_NOT_SUCCESS control=FAIL core_init=0xBAD0000C alloc=0x00000000 snip_init=0x00000000 feature=0x00000000 desc_status=NA desc_calls=0 desc_probes=0 cu_status=NA cu_calls=0 cu_probes=0 blob=0 handle=0x0
