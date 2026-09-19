@@ -410,7 +410,7 @@ jobs:
           set +e
           : > build-nr.log
           RC=0
-          for T in mgpu_nr_worker nr_selftest nr_ipc_probe nr_transport_bench; do
+          for T in mgpu_nr_worker nr_selftest nr_ipc_probe nr_transport_bench nr_host_bridge_bench; do
             echo "=== $T ===" | tee -a build-nr.log
             cmake --build build-nr --config Release --target "$T" 2>&1 | tee -a build-nr.log
             TRC=${PIPESTATUS[0]}
