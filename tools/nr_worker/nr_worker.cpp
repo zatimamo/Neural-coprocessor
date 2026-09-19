@@ -75,6 +75,8 @@ namespace
         unsigned       accept_seconds = 30;
         unsigned       serve_seconds = 0;       // 0 = until SHUTDOWN or disconnect
         bool           help = false;
+        unsigned long long ngx_version = 0;     // 0 = the header's default stamp
+        bool           ngx_version_sweep = false;
     };
 
     void usage()
@@ -84,6 +86,14 @@ namespace
             "\n"
             "  --nr-dll <path>          the exact nvngx_dlssnr.dll (required for the lane)\n"
             "  --nr-dll-sha256 <hex>    the runtime this build insists on; \"\" disables the gate\n"
+            "  --ngx-version <hex>      the NGX SDK version stamp this application declares.\n"
+            "                           The driver refuses a stamp older than it requires with\n"
+            "                           0xBAD0000C FAIL_OutOfDate; the pinned headers are old,\n"
+            "                           so a current driver needs this set.\n"
+            "  --ngx-version-sweep      ask the runtime which stamp it accepts, by trying a\n"
+            "                           ladder of real NGX versions ascending and keeping the\n"
+            "                           lowest one that returns Success. Run once, then pass\n"
+            "                           the answer with --ngx-version.\n"
             "  --prove                  run the lane and report the eight conditions, then exit\n"
             "  --serve                  run the lane, then serve the control protocol\n"
             "  --protocol-only          serve WITHOUT touching NVAPI, NGX or D3D12\n"
@@ -152,6 +162,14 @@ namespace
                     store = vn;
                     a.log_name = store.c_str();
                 }
+                else if (std::strcmp(narrow, "--ngx-version") == 0 && i + 1 < argc)
+                {
+                    a.ngx_version = std::wcstoull(argv[++i], nullptr, 0);
+                }
+                else if (std::strcmp(narrow, "--ngx-version-sweep") == 0)
+                {
+                    a.ngx_version_sweep = true;
+                }
                 else if (std::strcmp(narrow, "--accept-seconds") == 0 && i + 1 < argc)
                 {
                     a.accept_seconds = (unsigned)std::wcstoul(argv[++i], nullptr, 10);
@@ -185,6 +203,9 @@ namespace
                    "arch_patched=%s observer=%s",
                    r.core_init, r.alloc, r.snip_init, r.arch_patched ? "yes" : "NO",
                    r.observer_installed ? "yes" : "NO");
+        pcab::logf("[worker] NGX SDK version declared = 0x%016llX%s",
+                   r.ngx_version_used,
+                   r.ngx_version_swept ? " (found by the sweep)" : "");
 
         // ONE machine-readable line, so a caller does not have to parse prose.
         pcab::logf("NR-WORKER-RESULT proven=%s core_init=0x%08X alloc=0x%08X "
@@ -491,6 +512,8 @@ int main(int argc, char **argv)
         nr::LaneOptions opt;
         opt.nr_dll = args.nr_dll;
         opt.expected_nr_sha256 = args.nr_sha256;
+        opt.ngx_version = args.ngx_version;
+        opt.ngx_version_sweep = args.ngx_version_sweep;
         lane_ran = nr::lane_run(opt, lane);
         if (!lane_ran)
         {

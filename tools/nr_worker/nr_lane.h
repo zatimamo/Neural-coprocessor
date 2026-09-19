@@ -72,6 +72,25 @@ namespace nr
         unsigned       adapter_vendor = NR_VENDOR_NVIDIA;
         unsigned       adapter_device = NR_DEVICE_RTX_4070;
         bool           require_arch_patch = true;
+
+        //: THE NGX SDK VERSION STAMP, and why it is an option rather than a
+        //: constant. NVSDK_NGX_D3D12_Init takes the version of the SDK the
+        //: APPLICATION was built against, and the driver's _nvngx.dll refuses a
+        //: stamp older than the one it requires with 0xBAD0000C FAIL_OutOfDate.
+        //: The headers this repo pins are old; the driver on this machine is
+        //: current, so the header default is refused. Declaring the right version
+        //: is the application's job, not a driver bug - and it is not "patching a
+        //: return code": the call is genuinely made with a version the runtime
+        //: accepts, and every result below it is still the runtime's own.
+        //:
+        //: 0 means "use the header's NVSDK_NGX_Version_API".
+        unsigned long long ngx_version = 0;
+
+        //: Ask the runtime which stamp it accepts, by trying a documented ladder
+        //: of versions in ascending order and keeping the LOWEST one that returns
+        //: Success. Used to find the answer once; the answer then goes in
+        //: --ngx-version so a run is deterministic.
+        bool ngx_version_sweep = false;
     };
 
     struct LaneResult
@@ -100,6 +119,13 @@ namespace nr
         unsigned luid_high = 0;
         unsigned luid_low = 0;
         wchar_t  adapter_name[128] = L"";
+
+        //: The SDK version stamp this run declared, the one the sweep found, and
+        //: whether a sweep was performed at all. Recorded because the stamp is
+        //: part of what makes a run reproducible.
+        unsigned long long ngx_version_used = 0;
+        unsigned long long ngx_version_accepted = 0;
+        bool               ngx_version_swept = false;
 
         //: The full eight-condition result, evaluated here so that a caller has
         //: one boolean to check rather than a private copy of the rules.

@@ -401,8 +401,70 @@ namespace nr
             common.LoggingInfo.DisableOtherLoggingSinks = true;
             pcab::logf("[lane]   FeatureCommonInfo: zero-initialised, logging callback = discard, "
                        "MinimumLoggingLevel = OFF, DisableOtherLoggingSinks = true");
-            res.core_init = (unsigned)p_init(pcab::NS_APPLICATION_ID, data_path, g_lane.dev,
-                                             &common, NVSDK_NGX_Version_API);
+
+            unsigned long long stamp = opt.ngx_version ? opt.ngx_version
+                                                      : (unsigned long long)NVSDK_NGX_Version_API;
+
+            if (opt.ngx_version_sweep)
+            {
+                // THE LADDER. Ascending, so the answer is the LOWEST stamp the
+                // installed runtime accepts rather than the highest that happens
+                // to work. Each entry is a real NGX SDK version number; the
+                // encoding is 0xMMmmppbb, which is why they read as they do.
+                static const unsigned long long ladder[] = {
+                    0x0000000000020000ull,   // 2.0   - the header default era
+                    0x0000000000020200ull,   // 2.2
+                    0x0000000000020301ull,   // 2.3.1
+                    0x0000000000020401ull,   // 2.4.1
+                    0x0000000000020501ull,   // 2.5.1
+                    0x0000000000030100ull,   // 3.1
+                    0x0000000000030502ull,   // 3.5.2
+                    0x0000000000030700ull,   // 3.7
+                    0x0000000000030800ull,   // 3.8
+                    0x0000000000030900ull,   // 3.9
+                    0x0000000000040000ull,   // 4.0
+                    0x0000000000050000ull,   // 5.0
+                    0x0000000000060000ull,   // 6.0 - past anything documented, kept so
+                                             //       the ladder's END is visible too
+                };
+                pcab::logf("[ngxver] sweeping %u candidate SDK version stamps, ascending",
+                           (unsigned)(sizeof ladder / sizeof ladder[0]));
+                unsigned long long accepted = 0;
+                unsigned accepted_result = 0;
+                for (unsigned k = 0; k < sizeof ladder / sizeof ladder[0]; ++k)
+                {
+                    const unsigned r = (unsigned)p_init(pcab::NS_APPLICATION_ID, data_path,
+                                                        g_lane.dev, &common,
+                                                        (NVSDK_NGX_Version)ladder[k]);
+                    pcab::logf("[ngxver] 0x%016llX -> 0x%08X (%s)", ladder[k], r,
+                               ngx_result_name(r));
+                    if (r == 0x1u) { accepted = ladder[k]; accepted_result = r; break; }
+                }
+                if (accepted != 0)
+                {
+                    pcab::logf("[ngxver] ACCEPTED 0x%016llX - this runtime wants a stamp at least "
+                               "this new", accepted);
+                    stamp = accepted;
+                    res.core_init = accepted_result;
+                    res.ngx_version_accepted = accepted;
+                    res.ngx_version_swept = true;
+                }
+                else
+                {
+                    pcab::logf("[ngxver] NO candidate was accepted. The runtime refused every "
+                               "stamp in the ladder, so this is not simply an out-of-date "
+                               "declaration and the sweep says nothing more than that.");
+                    res.core_init = 0xBAD0000Cu;
+                    res.ngx_version_swept = true;
+                    return true;
+                }
+            }
+            else
+            {
+                pcab::logf("[lane]   declaring SDK version stamp 0x%016llX", stamp);
+                res.core_init = (unsigned)p_init(pcab::NS_APPLICATION_ID, data_path, g_lane.dev,
+                                                 &common, (NVSDK_NGX_Version)stamp);
+            }
             pcab::logf("[lane]   core NVSDK_NGX_D3D12_Init(app_id=0x%016llX) -> 0x%08X (%s)",
                        (unsigned long long)pcab::NS_APPLICATION_ID, res.core_init,
                        ngx_result_name(res.core_init));
@@ -410,9 +472,19 @@ namespace nr
             {
                 pcab::logf("[lane]   core Init is not Success. Nothing downstream can be formed on "
                            "an uninitialised session, so the lane stops here.");
+                if (!opt.ngx_version_sweep)
+                {
+                    pcab::logf("[lane]   FAIL_OutOfDate here means the declared SDK version is "
+                               "older than the installed runtime requires. Re-run with "
+                               "--ngx-version-sweep to ask the runtime which stamp it accepts, "
+                               "then pass that value with --ngx-version.");
+                }
                 // The lane RAN; it just did not succeed. That is a result.
                 return true;
             }
+            // The snippet's Init_Ext is given the SAME stamp: the two halves of one
+            // session must agree about which SDK they are speaking.
+            res.ngx_version_used = stamp;
         }
 
         // 5. the parameter block, from AllocateParameters. A block this lane OWNS.
@@ -483,7 +555,8 @@ namespace nr
 
         // 10. the snippet's own Reserved18 session, same app id, with our block.
         res.snip_init = (unsigned)p_sinit(pcab::NS_APPLICATION_ID, data_path, g_lane.dev,
-                                         NVSDK_NGX_Version_API, g_lane.params);
+                                          (NVSDK_NGX_Version)res.ngx_version_used,
+                                          g_lane.params);
         pcab::logf("[lane]   snippet NVSDK_NGX_D3D12_Init_Ext(app_id=0x%016llX) -> 0x%08X (%s)",
                    (unsigned long long)pcab::NS_APPLICATION_ID, res.snip_init,
                    ngx_result_name(res.snip_init));
