@@ -11460,10 +11460,43 @@ namespace
         // UNEXPLAINED. The arm-step markers stay, because they are what
         // localised it and they will localise it again.
 
-        r = p_caps(&s.nr_params);
+        // ---- PRIVBLOCK: the NR session gets a PRIVATE parameter block ----
+        //
+        // DEFECT C, closed for the neural path. This build took the NR block from
+        // NVSDK_NGX_D3D12_GetCapabilityParameters, which returns the CORE's block -
+        // and the core has ONE block per process. The title's own NGX session on
+        // GPU 0 is using that same map. The reference lane that creates
+        // Reserved18 successfully on this rig (NeuralScreen's order, reproduced by
+        // processcontext_ab single and by the out-of-process worker) allocates its
+        // own block with NVSDK_NGX_D3D12_AllocateParameters and never touches the
+        // core's.
+        //
+        // Why this is the prime suspect for 0xBAD00002: with two active devices in
+        // the process the snippet has to decide WHICH device the call is for, and
+        // the DLL says so in its own strings - "Error: multiple active Devices
+        // present and CreateFeature() didn't specify wanted Device". A block that
+        // belongs to the other adapter's session is the one thing in this process
+        // that can carry that wrong answer, and it is the one difference between
+        // this path and the lane that works.
+        typedef NVSDK_NGX_Result (NVSDK_CONV *pfn_alloc_nr)(NVSDK_NGX_Parameter **);
+        char wpb[160] = {};
+        pfn_alloc_nr p_alloc_nr = (pfn_alloc_nr)
+            ngx_resolve(mods, "NVSDK_NGX_D3D12_AllocateParameters", ngx_prefer::core,
+                        wpb, sizeof wpb);
+        if (p_alloc_nr == nullptr)
+        {
+            mgpu::diag::error("[MGPU][P4.1] AllocateParameters did not resolve - the NR session "
+                              "cannot take a private block (DEFECT C) and would have to share the "
+                              "core's.");
+            mgpu::archtest::scope_end(); mgpu::cudadiag::scope_outside();
+            mgpu::archtest::hook_remove();
+            return false;
+        }
+        r = p_alloc_nr(&s.nr_params);
         if (r != NVSDK_NGX_Result_Success || s.nr_params == nullptr)
         {
-            snprintf(line, sizeof line, "[MGPU][P4.1] GetCapabilityParameters failed 0x%08X (%s)",
+            snprintf(line, sizeof line,
+                     "[MGPU][P4.1] PRIVATE AllocateParameters failed 0x%08X (%s)",
                      (unsigned)r, ngx_result_name(r));
             mgpu::diag::error(line);
             // ARCHTEST: scope 2 exit. Disarm and drop the hooks on this path
@@ -11473,6 +11506,9 @@ namespace
             mgpu::archtest::hook_remove();
             return false;
         }
+        mgpu::diag::info("[MGPU][P4.1] NR parameter block: PRIVATE (AllocateParameters). The "
+                         "core's shared block is NOT used for the neural session - it belongs to "
+                         "the title's own NGX session on the other adapter.");
         // APPID_NS: the P4.1 stream snippet Reserved18 session.
         mgpu::appidns::log_p4_snippet();
         (void)p_iext(mgpu::appidns::reserved18_app_id(), data_path, ndev, NVSDK_NGX_Version_API, s.nr_params);
