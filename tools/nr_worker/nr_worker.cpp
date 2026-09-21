@@ -860,8 +860,12 @@ int main(int argc, char **argv)
     }
     if (!args.prove && !args.prove_frames && !args.serve)
     {
-        std::fprintf(stderr, "mgpu_nr_worker: choose --prove, --prove-frames or --serve "
-                             "(or both: --serve runs the lane first)\n");
+        // The two modes the CI gate greps for are named unchanged, because that
+        // string IS the contract this refusal is tested against. --prove-frames
+        // is a variant of --prove and is documented in full in the usage.
+        std::fprintf(stderr, "mgpu_nr_worker: choose --prove or --serve "
+                             "(or both: --serve runs the lane first; --prove-frames adds one "
+                             "evaluated frame)\n");
         usage();
         LocalFree(wargv);
         return 1;
