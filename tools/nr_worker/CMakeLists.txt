@@ -93,6 +93,17 @@ add_executable(nr_ipc_probe
   nr_slots.cpp
   nr_json.cpp)
 
+# ------------------------------------------------- the host-staged slot client
+# The tool that proves a FRAME crosses a process boundary and comes back: it
+# creates the four named mappings, sends CONFIG, submits frames, and hashes the
+# OUTPUT slot against a sentinel. GPU-free - it links only the CRT and kernel32,
+# so it runs wherever the worker can. This is the shape the add-on will copy.
+add_executable(nr_slot_client
+  nr_slot_client.cpp
+  nr_proto.cpp
+  nr_pipe.cpp
+  nr_slots.cpp)
+
 # --------------------------------------------------------- the transport bench
 add_executable(nr_transport_bench
   nr_bench.cpp
@@ -109,7 +120,7 @@ add_executable(nr_host_bridge_bench
   nr_slots.cpp
   nr_json.cpp)
 
-foreach(TARGET mgpu_nr_worker nr_selftest nr_ipc_probe nr_transport_bench
+foreach(TARGET mgpu_nr_worker nr_selftest nr_ipc_probe nr_slot_client nr_transport_bench
                nr_host_bridge_bench)
   target_include_directories(${TARGET} PRIVATE
     "${NR_PROVEN_DIR}"

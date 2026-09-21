@@ -410,7 +410,7 @@ jobs:
           set +e
           : > build-nr.log
           RC=0
-          for T in mgpu_nr_worker nr_selftest nr_ipc_probe nr_transport_bench nr_host_bridge_bench; do
+          for T in mgpu_nr_worker nr_selftest nr_ipc_probe nr_transport_bench nr_host_bridge_bench nr_slot_client; do
             echo "=== $T ===" | tee -a build-nr.log
             cmake --build build-nr --config Release --target "$T" 2>&1 | tee -a build-nr.log
             TRC=${PIPESTATUS[0]}
@@ -432,12 +432,12 @@ jobs:
             tail -n 40 build-nr.log
             exit 1
           fi
-          echo "all four targets built"
+          echo "all six targets built"
 
-      - name: Verify the five binaries
+      - name: Verify the six binaries
         shell: bash
         run: |
-          for B in mgpu_nr_worker nr_selftest nr_ipc_probe nr_transport_bench nr_host_bridge_bench; do
+          for B in mgpu_nr_worker nr_selftest nr_ipc_probe nr_transport_bench nr_host_bridge_bench nr_slot_client; do
             F=$(find build-nr -name "$B.exe" -type f | head -n1)
             [ -n "$F" ] || { echo "::error::$B.exe was not produced"; exit 1; }
             echo "$B: $F"
@@ -447,11 +447,13 @@ jobs:
           SELF=$(find build-nr -name 'nr_selftest.exe' -type f | head -n1)
           PROBE=$(find build-nr -name 'nr_ipc_probe.exe' -type f | head -n1)
           BRIDGE=$(find build-nr -name 'nr_host_bridge_bench.exe' -type f | head -n1)
+          SLOT=$(find build-nr -name 'nr_slot_client.exe' -type f | head -n1)
           echo "WORKER=$WORKER" >> "$GITHUB_ENV"
           echo "BENCH=$BENCH"   >> "$GITHUB_ENV"
           echo "SELF=$SELF"     >> "$GITHUB_ENV"
           echo "PROBE=$PROBE"   >> "$GITHUB_ENV"
           echo "BRIDGE=$BRIDGE" >> "$GITHUB_ENV"
+          echo "SLOT=$SLOT"     >> "$GITHUB_ENV"
 
           # THE HOST-BRIDGE BENCHMARK MUST NOT REACH FOR WHAT WAS REJECTED. Mode A
           # is a file mapping opened as a heap on both devices; mode B is an
@@ -603,6 +605,39 @@ jobs:
             echo "::error::the protocol-only worker did not say it has no session"; exit 1; }
           echo "handshake ok: the real worker and the real probe agreed, over a real named pipe."
 
+          # ------------------------------------------------------------------
+          # AND THE CLIENT ITSELF, on its OWN worker, so the probe's worker is
+          # already finished and the two cannot interfere. What this buys: the
+          # client's control path - four published mappings, HELLO, the worker's
+          # answer, the Reserved18 gate - is exercised for real with no GPU,
+          # because a --protocol-only worker reports -1 and the client must stop
+          # there rather than submit frames to a worker that has no feature. The
+          # frame round trip needs both GPUs and is proved on the rig, not here.
+          # ------------------------------------------------------------------
+          ../"$WORKER" --serve --protocol-only --accept-seconds 30 \
+            --pipe '\\.\pipe\MGPU_NR_CI_SLOT' --log-name nr-worker-ci-slot &
+          SPID=$!
+          sleep 3
+          set +e
+          ../"$SLOT" --pipe '\\.\pipe\MGPU_NR_CI_SLOT' --frames 1 \
+            --expect-protocol-only > slotclient.txt 2>&1
+          SRC=$?
+          set -e
+          cat slotclient.txt
+          [ "$SRC" -eq 0 ] || { echo "::error::nr_slot_client exited $SRC"; exit 1; }
+          grep -q 'SLOTCLIENT-RESULT ok=YES protocol_only=YES' slotclient.txt || {
+            echo "::error::the slot client did not report a clean protocol-only stop"; exit 1; }
+          for S in '[slots]' 'reserved18=-1' 'SLOTCLIENT-RESULT'; do
+            grep -q -- "$S" slotclient.txt || {
+              echo "::error::the slot client never reported $S"; exit 1; }
+          done
+          wait $SPID
+          SRC=$?
+          [ "$SRC" -eq 0 ] || { echo "::error::the slot client's worker exited $SRC"; exit 1; }
+          grep -q 'WORKER_READY' context-nr-worker-ci-slot.log || {
+            echo "::error::the slot client's worker never printed WORKER_READY"; exit 1; }
+          echo "slot client ok: four mappings published, HELLO answered, Reserved18 gate honoured."
+
       - name: The benchmark refuses to invent an adapter
         shell: bash
         run: |
@@ -619,7 +654,7 @@ jobs:
           echo "adapter selection ok: exit $RC, and it named what it did not find."
 
       # ---------------------------------------------------------------------
-      # 10. The artifact: four binaries, the runner and the README.
+      # 10. The artifact: six binaries, the runner and the README.
       # ---------------------------------------------------------------------
       - name: Stage and hash the artifact
         shell: bash
@@ -630,16 +665,18 @@ jobs:
           cp "$PROBE"  _nrworker/nr_ipc_probe.exe
           cp "$BENCH"  _nrworker/nr_transport_bench.exe
           cp "$BRIDGE" _nrworker/nr_host_bridge_bench.exe
+          cp "$SLOT"   _nrworker/nr_slot_client.exe
           cp tools/nr_worker/RUN-NR-WORKER.cmd _nrworker/
           cp tools/nr_worker/README.txt       _nrworker/
 
           ( cd _nrworker && sha256sum mgpu_nr_worker.exe nr_selftest.exe nr_ipc_probe.exe \
-              nr_transport_bench.exe nr_host_bridge_bench.exe RUN-NR-WORKER.cmd README.txt ) \
+              nr_transport_bench.exe nr_host_bridge_bench.exe nr_slot_client.exe \
+              RUN-NR-WORKER.cmd README.txt ) \
             > _nrworker/SHA256SUMS.txt
           cat _nrworker/SHA256SUMS.txt
 
           COUNT=$(find _nrworker -type f | wc -l)
-          [ "$COUNT" -eq 8 ] || { echo "::error::the artifact holds $COUNT files, expected 8"; find _nrworker -type f | sort; exit 1; }
+          [ "$COUNT" -eq 9 ] || { echo "::error::the artifact holds $COUNT files, expected 9"; find _nrworker -type f | sort; exit 1; }
 
           {
             echo "variant   = nr-worker"
@@ -657,6 +694,9 @@ jobs:
             echo "nr_selftest.exe         GPU-free tests, including a real named-pipe"
             echo "                        handshake"
             echo "nr_ipc_probe.exe        the client half of the protocol"
+            echo "nr_slot_client.exe      a client that moves four frames through"
+            echo "                        the worker and hashes what comes back -"
+            echo "                        the shape the game-side add-on will copy"
             echo "nr_transport_bench.exe  the two-GPU cross-adapter round trip. It"
             echo "                        loads no NGX and no NVAPI, on purpose."
             echo
