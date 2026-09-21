@@ -70,6 +70,7 @@ namespace
         const char    *log_name = "nr-worker";
         const char    *pipe = nullptr;          // full \\.\pipe\... name, or null for the pid form
         bool           prove = false;
+        bool           prove_frames = false;    // --prove, and then one real frame
         bool           serve = false;
         bool           protocol_only = false;
         unsigned       accept_seconds = 30;
@@ -95,6 +96,9 @@ namespace
             "                           lowest one that returns Success. Run once, then pass\n"
             "                           the answer with --ngx-version.\n"
             "  --prove                  run the lane and report the eight conditions, then exit\n"
+            "  --prove-frames            --prove, then evaluate ONE frame: four textures on the\n"
+            "                           RTX 4070, a known colour pattern in, the output read back\n"
+            "                           and hashed. The first neural frame this process produces.\n"
             "  --serve                  run the lane, then serve the control protocol\n"
             "  --protocol-only          serve WITHOUT touching NVAPI, NGX or D3D12\n"
             "  --pipe <name>            use this pipe name (default \\\\.\\pipe\\MGPU_NR_<pid>)\n"
@@ -122,6 +126,7 @@ namespace
                 if (!next_w(&a.nr_dll)) { err = "--nr-dll needs a path"; return false; }
             }
             else if (std::wcscmp(w, L"--prove") == 0)         a.prove = true;
+            else if (std::wcscmp(w, L"--prove-frames") == 0)  a.prove_frames = true;
             else if (std::wcscmp(w, L"--serve") == 0)         a.serve = true;
             else if (std::wcscmp(w, L"--protocol-only") == 0) a.protocol_only = true;
             else if (std::wcscmp(w, L"--help") == 0 || std::wcscmp(w, L"-h") == 0) a.help = true;
@@ -217,6 +222,364 @@ namespace
                    r.proven() ? "YES" : "NO", r.core_init, r.alloc, r.snip_init,
                    r.descriptor_status, r.cumodule_status, r.first_blob_size, r.feature,
                    r.feature_handle);
+    }
+
+    // ========================================================================
+    // --prove-frames: THE FRAME, not just the feature.
+    //
+    // WHAT THIS PROVES, AND WHAT IT DOES NOT. It proves that this process can
+    // turn a frame into a neural frame out of process: four textures are created
+    // on the RTX 4070, a known colour pattern is uploaded, lane_evaluate() is
+    // called with the same DLSSNR.* contract MGPU's own stream uses, and the
+    // output is read back and hashed. It does NOT prove image quality, it does
+    // NOT involve a game, and it does NOT exercise the transport - the transport
+    // is a separate thing with its own benchmark.
+    //
+    // THE FORMATS ARE THE ONES THE BRIDGE BINDS IN CYBERPUNK. The R71/R78 lines
+    // name them on every run: colour and output R8G8B8A8_UNORM, depth
+    // R32_FLOAT, motion vectors R16G16B16A16_FLOAT. A runtime build that wants
+    // different ones says so through its own log and through the evaluate
+    // result, which is why both are printed rather than asserted.
+    // ========================================================================
+    unsigned long long fnv1a_rows(const unsigned char *base, unsigned row_pitch,
+                                  unsigned row_bytes, unsigned h)
+    {
+        unsigned long long acc = 1469598103934665603ull;
+        for (unsigned y = 0; y < h; ++y)
+        {
+            const unsigned char *row = base + (std::size_t)y * row_pitch;
+            for (unsigned i = 0; i < row_bytes; ++i)
+            {
+                acc ^= (unsigned long long)row[i];
+                acc *= 1099511628211ull;
+            }
+        }
+        return acc;
+    }
+
+    unsigned test_bytes_per_pixel(DXGI_FORMAT f)
+    {
+        switch (f)
+        {
+        case DXGI_FORMAT_R8G8B8A8_UNORM:     return 4u;
+        case DXGI_FORMAT_R32_FLOAT:          return 4u;
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8u;
+        default:                             return 0u;
+        }
+    }
+
+    struct TestTexture
+    {
+        ID3D12Resource *res = nullptr;
+        DXGI_FORMAT     fmt = DXGI_FORMAT_UNKNOWN;
+        unsigned        w = 0u, h = 0u;
+        unsigned        row_pitch = 0u;    // the ALIGNED pitch the copy needs
+        unsigned        row_bytes = 0u;    // what a row of the image really is
+    };
+
+    bool make_test_texture(ID3D12Device *dev, DXGI_FORMAT fmt, unsigned w, unsigned h,
+                           bool uav, TestTexture &t, std::string &err)
+    {
+        const unsigned bpp = test_bytes_per_pixel(fmt);
+        if (bpp == 0u) { err = "a test format has no known bytes-per-pixel"; return false; }
+
+        D3D12_RESOURCE_DESC d = {};
+        d.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        d.Width            = w;
+        d.Height           = h;
+        d.DepthOrArraySize = 1;
+        d.MipLevels        = 1;
+        d.Format           = fmt;
+        d.SampleDesc.Count = 1;
+        d.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        const HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
+                                                        D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                        IID_PPV_ARGS(&t.res));
+        if (FAILED(hr)) { err = "CreateCommittedResource(TEXTURE2D) failed"; return false; }
+
+        t.fmt = fmt; t.w = w; t.h = h;
+        t.row_bytes = w * bpp;
+        t.row_pitch = (t.row_bytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) &
+                      ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+        return true;
+    }
+
+    bool make_test_buffer(ID3D12Device *dev, D3D12_HEAP_TYPE type,
+                          D3D12_RESOURCE_STATES state, unsigned long long bytes,
+                          ID3D12Resource **out, std::string &err)
+    {
+        D3D12_RESOURCE_DESC d = {};
+        d.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        d.Width            = bytes;
+        d.Height           = 1;
+        d.DepthOrArraySize = 1;
+        d.MipLevels        = 1;
+        d.Format           = DXGI_FORMAT_UNKNOWN;
+        d.SampleDesc.Count = 1;
+        d.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = type;
+
+        const HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, state,
+                                                        nullptr, IID_PPV_ARGS(out));
+        if (FAILED(hr)) { err = "CreateCommittedResource(BUFFER) failed"; return false; }
+        return true;
+    }
+
+    void copy_upload_to_texture(ID3D12GraphicsCommandList *list, ID3D12Resource *buf,
+                                const TestTexture &t)
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst = {};
+        dst.pResource        = t.res;
+        dst.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
+
+        D3D12_TEXTURE_COPY_LOCATION src = {};
+        src.pResource                           = buf;
+        src.Type                                = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Offset              = 0;
+        src.PlacedFootprint.Footprint.Format    = t.fmt;
+        src.PlacedFootprint.Footprint.Width     = t.w;
+        src.PlacedFootprint.Footprint.Height    = t.h;
+        src.PlacedFootprint.Footprint.Depth     = 1;
+        src.PlacedFootprint.Footprint.RowPitch  = t.row_pitch;
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+
+    void copy_texture_to_readback(ID3D12GraphicsCommandList *list, const TestTexture &t,
+                                  ID3D12Resource *buf)
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst = {};
+        dst.pResource                          = buf;
+        dst.Type                               = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Offset             = 0;
+        dst.PlacedFootprint.Footprint.Format   = t.fmt;
+        dst.PlacedFootprint.Footprint.Width    = t.w;
+        dst.PlacedFootprint.Footprint.Height   = t.h;
+        dst.PlacedFootprint.Footprint.Depth    = 1;
+        dst.PlacedFootprint.RowPitch           = t.row_pitch;
+
+        D3D12_TEXTURE_COPY_LOCATION src = {};
+        src.pResource        = t.res;
+        src.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+
+    void barrier_to(ID3D12GraphicsCommandList *list, ID3D12Resource *res,
+                    D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+    {
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Flags                  = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+        b.Transition.pResource   = res;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = before;
+        b.Transition.StateAfter  = after;
+        list->ResourceBarrier(1, &b);
+    }
+
+    bool prove_frames()
+    {
+        ID3D12Device *const dev = nr::lane_device();
+        ID3D12CommandQueue *const queue = nr::lane_queue();
+        if (dev == nullptr || queue == nullptr)
+        {
+            pcab::logf("FRAMES-RESULT ok=NO detail=\"the lane left no device or queue\"");
+            return false;
+        }
+
+        const unsigned W = nr::NR_CTRL_W;
+        const unsigned H = nr::NR_CTRL_H;
+        std::string err;
+
+        TestTexture color, depth, mvec, out;
+        if (!make_test_texture(dev, DXGI_FORMAT_R8G8B8A8_UNORM, W, H, false, color, err) ||
+            !make_test_texture(dev, DXGI_FORMAT_R32_FLOAT, W, H, false, depth, err) ||
+            !make_test_texture(dev, DXGI_FORMAT_R16G16B16A16_FLOAT, W, H, false, mvec, err) ||
+            !make_test_texture(dev, DXGI_FORMAT_R8G8B8A8_UNORM, W, H, true, out, err))
+        {
+            pcab::logf("FRAMES-RESULT ok=NO detail=\"%s\"", err.c_str());
+            return false;
+        }
+
+        ID3D12Resource *up_color = nullptr, *up_depth = nullptr, *up_mvec = nullptr;
+        ID3D12Resource *rb_out = nullptr;
+        if (!make_test_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
+                              (unsigned long long)color.row_pitch * H, &up_color, err) ||
+            !make_test_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
+                              (unsigned long long)depth.row_pitch * H, &up_depth, err) ||
+            !make_test_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
+                              (unsigned long long)mvec.row_pitch * H, &up_mvec, err) ||
+            !make_test_buffer(dev, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST,
+                              (unsigned long long)out.row_pitch * H, &rb_out, err))
+        {
+            pcab::logf("FRAMES-RESULT ok=NO detail=\"%s\"", err.c_str());
+            return false;
+        }
+
+        // ---- the pattern ----------------------------------------------------
+        // A gradient, not a flat field: a flat field cannot show that anything
+        // happened, and the model's output is compared against this hash.
+        unsigned long long color_hash = 0ull;
+        {
+            void *mapped = nullptr;
+            const D3D12_RANGE read_none = { 0, 0 };
+            if (FAILED(up_color->Map(0, &read_none, &mapped)) || mapped == nullptr)
+            {
+                pcab::logf("FRAMES-RESULT ok=NO detail=\"the colour upload buffer would not map\"");
+                return false;
+            }
+            unsigned char *base = (unsigned char *)mapped;
+            for (unsigned y = 0; y < H; ++y)
+            {
+                unsigned char *row = base + (std::size_t)y * color.row_pitch;
+                for (unsigned x = 0; x < W; ++x)
+                {
+                    row[x * 4 + 0] = (unsigned char)(x & 0xFFu);
+                    row[x * 4 + 1] = (unsigned char)(y & 0xFFu);
+                    row[x * 4 + 2] = (unsigned char)((x + y) & 0xFFu);
+                    row[x * 4 + 3] = 0xFFu;
+                }
+            }
+            color_hash = fnv1a_rows(base, color.row_pitch, color.row_bytes, H);
+            up_color->Unmap(0, nullptr);
+        }
+        {
+            void *mapped = nullptr;
+            const D3D12_RANGE read_none = { 0, 0 };
+            if (SUCCEEDED(up_depth->Map(0, &read_none, &mapped)) && mapped != nullptr)
+            {
+                float *base = (float *)mapped;
+                for (unsigned y = 0; y < H; ++y)
+                {
+                    float *row = (float *)((unsigned char *)base +
+                                           (std::size_t)y * depth.row_pitch);
+                    for (unsigned x = 0; x < W; ++x)
+                        row[x] = (float)x / (float)(W > 1u ? W - 1u : 1u);
+                }
+                up_depth->Unmap(0, nullptr);
+            }
+        }
+        {
+            void *mapped = nullptr;
+            const D3D12_RANGE read_none = { 0, 0 };
+            if (SUCCEEDED(up_mvec->Map(0, &read_none, &mapped)) && mapped != nullptr)
+            {
+                std::memset(mapped, 0, (std::size_t)mvec.row_pitch * H);
+                up_mvec->Unmap(0, nullptr);
+            }
+        }
+
+        // ---- the copy command list, separate from the lane's ------------------
+        ID3D12CommandAllocator *allocator = nullptr;
+        ID3D12GraphicsCommandList *list = nullptr;
+        ID3D12Fence *fence = nullptr;
+        HANDLE event = nullptr;
+        if (FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                               IID_PPV_ARGS(&allocator))) ||
+            FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr,
+                                          IID_PPV_ARGS(&list))) ||
+            FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))) ||
+            (event = CreateEventW(nullptr, FALSE, FALSE, nullptr)) == nullptr)
+        {
+            pcab::logf("FRAMES-RESULT ok=NO detail=\"the copy command objects would not be "
+                       "created\"");
+            return false;
+        }
+
+        unsigned long long value = 0ull;
+        bool ok = true;
+
+        // upload the three inputs, and hand them back in COMMON: lane_evaluate()
+        // documents that a frame arrives in COMMON, which is what a fresh upload
+        // leaves after this transition.
+        copy_upload_to_texture(list, up_color, color);
+        copy_upload_to_texture(list, up_depth, depth);
+        copy_upload_to_texture(list, up_mvec, mvec);
+        barrier_to(list, color.res, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        barrier_to(list, depth.res, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        barrier_to(list, mvec.res,  D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        if (FAILED(list->Close())) { ok = false; }
+        if (ok)
+        {
+            ID3D12CommandList *const lists[1] = { list };
+            queue->ExecuteCommandLists(1, lists);
+            if (FAILED(queue->Signal(fence, ++value)) ||
+                fence->SetEventOnCompletion(value, event) != S_OK ||
+                WaitForSingleObject(event, 20000) != WAIT_OBJECT_0)
+            { ok = false; }
+        }
+        if (!ok)
+        {
+            pcab::logf("FRAMES-RESULT ok=NO detail=\"the input upload did not drain\"");
+            return false;
+        }
+
+        // ---- the frame -------------------------------------------------------
+        nr::LaneFrame frame;
+        frame.color = color.res; frame.color_w = W; frame.color_h = H;
+        frame.depth = depth.res; frame.depth_w = W; frame.depth_h = H;
+        frame.depth_inverted = true;
+        frame.mvec  = mvec.res;  frame.mvec_w  = W; frame.mvec_h  = H;
+        frame.mvec_scale_x = 1.0f;
+        frame.mvec_scale_y = 1.0f;
+        frame.out = out.res;     frame.out_w = W; frame.out_h = H;
+        frame.intensity = 1.0f;
+        frame.reset = true;                  // this feature's first frame
+
+        unsigned eval_result = 0u;
+        const bool called = nr::lane_evaluate(frame, eval_result, err);
+        pcab::logf("[frames] colour pattern hash = 0x%016llX", color_hash);
+
+        // ---- read the output back -------------------------------------------
+        unsigned long long out_hash = 0ull;
+        if (called)
+        {
+            list->Reset(allocator, nullptr);
+            barrier_to(list, out.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                       D3D12_RESOURCE_STATE_COPY_SOURCE);
+            copy_texture_to_readback(list, out, rb_out);
+            if (FAILED(list->Close())) { ok = false; }
+            if (ok)
+            {
+                ID3D12CommandList *const lists[1] = { list };
+                queue->ExecuteCommandLists(1, lists);
+                if (FAILED(queue->Signal(fence, ++value)) ||
+                    fence->SetEventOnCompletion(value, event) != S_OK ||
+                    WaitForSingleObject(event, 20000) != WAIT_OBJECT_0)
+                { ok = false; }
+            }
+            if (ok)
+            {
+                void *mapped = nullptr;
+                const D3D12_RANGE written = { 0, (SIZE_T)out.row_pitch * H };
+                if (SUCCEEDED(rb_out->Map(0, &written, &mapped)) && mapped != nullptr)
+                {
+                    out_hash = fnv1a_rows((const unsigned char *)mapped, out.row_pitch,
+                                          out.row_bytes, H);
+                    const D3D12_RANGE read_none = { 0, 0 };
+                    rb_out->Unmap(0, &read_none);
+                }
+                else { ok = false; }
+            }
+        }
+
+        const bool same = called && ok && (out_hash == color_hash);
+        pcab::logf("[frames] output hash = 0x%016llX  pixels_changed=%s", out_hash,
+                   same ? "NO (identical to the input)" : "yes");
+        pcab::logf("FRAMES-RESULT ok=%s called=%s evaluate=0x%08X frames=1 %ux%u "
+                   "in_hash=0x%016llX out_hash=0x%016llX pixels_changed=%s",
+                   (called && ok) ? "YES" : "NO", called ? "YES" : "NO", eval_result, W, H,
+                   color_hash, out_hash, same ? "NO" : "YES");
+        if (!err.empty()) pcab::logf("[frames] detail: %s", err.c_str());
+
+        return called && ok;
     }
 
     //: The control loop. Returns the process exit code.
@@ -495,9 +858,9 @@ int main(int argc, char **argv)
         LocalFree(wargv);
         return 0;
     }
-    if (!args.prove && !args.serve)
+    if (!args.prove && !args.prove_frames && !args.serve)
     {
-        std::fprintf(stderr, "mgpu_nr_worker: choose --prove or --serve "
+        std::fprintf(stderr, "mgpu_nr_worker: choose --prove, --prove-frames or --serve "
                              "(or both: --serve runs the lane first)\n");
         usage();
         LocalFree(wargv);
@@ -510,6 +873,7 @@ int main(int argc, char **argv)
     // whose Reserved18 session does not exist.
     nr::LaneResult lane;
     bool lane_ran = false;
+    bool frames_ok = true;
     if (!args.protocol_only)
     {
         nr::LaneOptions opt;
@@ -542,6 +906,19 @@ int main(int argc, char **argv)
         // below is the evidence for the claim it just made.
         pcab::logf("WORKER_READY");
         print_lane_report(lane);
+
+        // The feature exists; --prove-frames is the ask to USE it. A failure here
+        // is reported and does not stop a --serve run, because the control
+        // channel is still worth serving and the exit code carries the verdict.
+        if (args.prove_frames)
+        {
+            pcab::logf("");
+            pcab::logf("[frames] --prove-frames: one frame through lane_evaluate()");
+            frames_ok = prove_frames();
+            pcab::logf("[frames] %s", frames_ok
+                       ? "the frame was produced and read back - see FRAMES-RESULT"
+                       : "NO frame was produced - the FRAMES-RESULT detail says why");
+        }
     }
     else
     {
@@ -558,7 +935,7 @@ int main(int argc, char **argv)
         if (lane_ran) nr::lane_note_shutdown();
         pcab::log_close();
         LocalFree(wargv);
-        return 0;
+        return frames_ok ? 0 : 2;
     }
 
     wchar_t pipe_name[256];
