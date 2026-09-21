@@ -745,14 +745,20 @@ jobs:
           test -f "$WORKER_ABS" || {
             echo "::error::the worker is not at $WORKER_ABS"; exit 1; }
 
-          # THE DEPLOYED LAYOUT, STAGED. The relay resolves the worker as
-          # <module dir>\mgpu\nvngx.dll_mgpu_nr_worker.exe - the rig's layout, and
-          # the nvngx.dll_ prefix is a caller-gate contract rather than a
-          # cosmetic name. Staging it here lets available() be tested for real
-          # instead of skipping the branch because the file is not deployed.
-          mkdir -p ../mgpu
-          cp "$WORKER_ABS" ../mgpu/nvngx.dll_mgpu_nr_worker.exe
-          ls -l ../mgpu/
+          # THE DEPLOYED LAYOUT, STAGED - BESIDE THE MODULE UNDER TEST, which is
+          # the test executable and NOT this working directory. available() takes
+          # no configuration: it resolves the worker as
+          # <this module's directory>\mgpu\nvngx.dll_mgpu_nr_worker.exe, exactly as
+          # the add-on does on the rig. The test executable lives in build-nr/bin,
+          # so staging into ../mgpu (the repository root, one level above _nr) put
+          # the file somewhere the module never looks and the check below failed
+          # with "the relay did not find the worker where it resolves it" - while
+          # the module was behaving correctly. The nvngx.dll_ prefix is a
+          # caller-gate contract rather than a cosmetic name.
+          RELAY_DIR=$(dirname "$RELAY_EXE")
+          mkdir -p "$RELAY_DIR/mgpu"
+          cp "$WORKER_ABS" "$RELAY_DIR/mgpu/nvngx.dll_mgpu_nr_worker.exe"
+          ls -l "$RELAY_DIR/mgpu/"
 
           set +e
           "$RELAY_EXE" --point-at-worker "$WORKER_ABS" --pipe '\\.\pipe\MGPU_NR_CI_RELAY' \
