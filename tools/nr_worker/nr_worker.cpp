@@ -263,6 +263,8 @@ namespace
         {
         case DXGI_FORMAT_R8G8B8A8_UNORM:     return 4u;
         case DXGI_FORMAT_R32_FLOAT:          return 4u;
+        case DXGI_FORMAT_D32_FLOAT:          return 4u;   // the protocol's depth class
+        case DXGI_FORMAT_R16G16_FLOAT:       return 4u;   // the protocol's mvec class
         case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8u;
         default:                             return 0u;
         }
@@ -584,11 +586,341 @@ namespace
         return called && ok;
     }
 
+    // ========================================================================
+    // THE HOST-STAGED FRAME PATH - what turns FRAME_SUBMIT into pixels.
+    //
+    // WHY HOST MEMORY AND NOT A SHARED D3D12 SURFACE. This hardware reports
+    // CrossNodeSharingTier = 0 on BOTH adapters and a copy INTO a shared
+    // cross-adapter surface carries nothing (transport-benchmark.json, ok=false).
+    // So the payload crosses through system memory: the game side copies its
+    // frame into a NAMED FILE MAPPING, the worker maps the same name, uploads the
+    // rows into a local texture on the RTX 4070, evaluates, reads the result back
+    // and writes it into the OUTPUT mapping. A memcpy cannot fail to carry bytes,
+    // so the only thing this design has to get right is the handshake.
+    //
+    // THE NAMES ARE THE CLIENT'S. CONFIG carries one name per input slot class
+    // and the layout; FRAME_SUBMIT says which frame in that layout and how big it
+    // is. Per-class row pitches come from CONFIG, never from a guess, because
+    // R16G16B16A16_FLOAT is twice the pitch of the other three at the same width.
+    // ========================================================================
+    struct HostSlot
+    {
+        bool           attached = false;
+        std::wstring   name;
+        unsigned       width = 0, height = 0, dxgi_format = 0;
+        unsigned       row_pitch = 0, slice_pitch = 0, resource_offset = 0;
+        unsigned       frame_slots = 0;
+        HANDLE         mapping = nullptr;
+        unsigned char *view = nullptr;
+        unsigned long long view_bytes = 0;
+    };
+
+    bool widen_name(const char *narrow, std::wstring &out)
+    {
+        if (narrow == nullptr || narrow[0] == '\0') return false;
+        const int need = MultiByteToWideChar(CP_UTF8, 0, narrow, -1, nullptr, 0);
+        if (need <= 1) return false;
+        std::wstring tmp((std::size_t)need, L'\0');
+        if (MultiByteToWideChar(CP_UTF8, 0, narrow, -1, &tmp[0], need) <= 0) return false;
+        out.assign(tmp.c_str());
+        return !out.empty();
+    }
+
+    //: How many bytes this slot must hold for the geometry it published.
+    unsigned long long host_slot_required_bytes(const HostSlot &s)
+    {
+        const unsigned long long stride = (s.slice_pitch != 0u)
+            ? (unsigned long long)s.slice_pitch
+            : (unsigned long long)s.row_pitch * s.height;
+        return (unsigned long long)s.resource_offset + stride;
+    }
+
+    bool host_slot_attach(HostSlot &s, std::string &err)
+    {
+        if (s.attached) return true;
+        if (s.name.empty()) { err = "the slot published no mapping name"; return false; }
+        if (s.width == 0u || s.height == 0u || s.row_pitch == 0u)
+        {
+            err = "the slot published no usable geometry";
+            return false;
+        }
+        if (test_bytes_per_pixel((DXGI_FORMAT)s.dxgi_format) == 0u)
+        {
+            err = "the slot's DXGI format has no known bytes-per-pixel in this build";
+            return false;
+        }
+
+        HANDLE m = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, s.name.c_str());
+        if (m == nullptr)
+        {
+            err = "OpenFileMappingW failed for the name the client published";
+            return false;
+        }
+        void *view = MapViewOfFile(m, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
+        if (view == nullptr)
+        {
+            err = "MapViewOfFile failed on the client's mapping";
+            CloseHandle(m);
+            return false;
+        }
+        MEMORY_BASIC_INFORMATION mbi = {};
+        unsigned long long bytes = 0ull;
+        if (VirtualQuery(view, &mbi, sizeof(mbi)) != 0)
+            bytes = (unsigned long long)mbi.RegionSize;
+
+        const unsigned long long need = host_slot_required_bytes(s);
+        if (bytes != 0ull && need > bytes)
+        {
+            pcab::logf("[slots]  REFUSED \"%ls\": the geometry needs %llu bytes and the mapping "
+                       "is only %llu", s.name.c_str(), need, bytes);
+            UnmapViewOfFile(view);
+            CloseHandle(m);
+            err = "the slot's geometry does not fit the mapping the client published";
+            return false;
+        }
+
+        s.mapping = m;
+        s.view = (unsigned char *)view;
+        s.view_bytes = bytes;
+        s.attached = true;
+        pcab::logf("[slots]  attached \"%ls\": %ux%u fmt=%u row_pitch=%u slice_pitch=%u "
+                   "offset=%u frame_slots=%u mapping_bytes=%llu needs=%llu",
+                   s.name.c_str(), s.width, s.height, s.dxgi_format, s.row_pitch,
+                   s.slice_pitch, s.resource_offset, s.frame_slots, bytes, need);
+        return true;
+    }
+
+    struct FramePipeline
+    {
+        bool ready = false;
+        unsigned w = 0, h = 0;
+        DXGI_FORMAT color_fmt = DXGI_FORMAT_UNKNOWN;
+        DXGI_FORMAT depth_fmt = DXGI_FORMAT_UNKNOWN;
+        DXGI_FORMAT mvec_fmt = DXGI_FORMAT_UNKNOWN;
+        TestTexture color, depth, mvec, out;
+        ID3D12Resource *up_color = nullptr, *up_depth = nullptr, *up_mvec = nullptr;
+        ID3D12Resource *rb_out = nullptr;
+        ID3D12CommandAllocator *allocator = nullptr;
+        ID3D12GraphicsCommandList *list = nullptr;
+        ID3D12Fence *fence = nullptr;
+        HANDLE event = nullptr;
+        unsigned long long fence_value = 0;
+    };
+
+    bool frame_pipeline_prepare(FramePipeline &p, unsigned w, unsigned h,
+                                const HostSlot *slots, std::string &err)
+    {
+        const DXGI_FORMAT cf = (DXGI_FORMAT)slots[(unsigned)InputSlot::COLOR].dxgi_format;
+        const DXGI_FORMAT df = (DXGI_FORMAT)slots[(unsigned)InputSlot::DEPTH].dxgi_format;
+        const DXGI_FORMAT mf = (DXGI_FORMAT)slots[(unsigned)InputSlot::MOTION_VECTORS].dxgi_format;
+        if (p.ready && p.w == w && p.h == h && p.color_fmt == cf && p.depth_fmt == df &&
+            p.mvec_fmt == mf)
+            return true;
+        if (p.ready)
+        {
+            err = "the frame geometry or one of the slot formats changed; this build does not "
+                  "resize the network mid-session";
+            return false;
+        }
+
+        ID3D12Device *const dev = nr::lane_device();
+        if (dev == nullptr) { err = "the lane left no device"; return false; }
+
+        if (!make_test_texture(dev, cf, w, h, false, p.color, err) ||
+            !make_test_texture(dev, df, w, h, false, p.depth, err) ||
+            !make_test_texture(dev, mf, w, h, false, p.mvec, err) ||
+            !make_test_texture(dev, cf, w, h, true, p.out, err))
+            return false;
+
+        if (!make_test_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
+                              (unsigned long long)p.color.row_pitch * h, &p.up_color, err) ||
+            !make_test_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
+                              (unsigned long long)p.depth.row_pitch * h, &p.up_depth, err) ||
+            !make_test_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
+                              (unsigned long long)p.mvec.row_pitch * h, &p.up_mvec, err) ||
+            !make_test_buffer(dev, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST,
+                              (unsigned long long)p.out.row_pitch * h, &p.rb_out, err))
+            return false;
+
+        if (FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                               IID_PPV_ARGS(&p.allocator))) ||
+            FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, p.allocator,
+                                          nullptr, IID_PPV_ARGS(&p.list))) ||
+            FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&p.fence))) ||
+            (p.event = CreateEventW(nullptr, FALSE, FALSE, nullptr)) == nullptr)
+        {
+            err = "the frame pipeline's command objects would not be created";
+            return false;
+        }
+
+        p.w = w; p.h = h;
+        p.color_fmt = cf; p.depth_fmt = df; p.mvec_fmt = mf;
+        p.ready = true;
+        pcab::logf("[frames] pipeline ready: %ux%u color_fmt=%u depth_fmt=%u mvec_fmt=%u "
+                   "out_fmt=%u uploads=%u/%u/%u bytes",
+                   w, h, (unsigned)cf, (unsigned)df, (unsigned)mf, (unsigned)cf,
+                   p.color.row_pitch * h, p.depth.row_pitch * h, p.mvec.row_pitch * h);
+        return true;
+    }
+
+    //: Copy one host slot's frame rows into an upload buffer, honouring both
+    //: pitches. Nothing here interprets the pixels; it moves them.
+    void stage_rows(const HostSlot &s, unsigned frame_offset, unsigned long long frame_bytes,
+                    ID3D12Resource *upload, unsigned upload_pitch, unsigned row_bytes,
+                    unsigned height, std::string &err)
+    {
+        (void)frame_bytes;
+        void *mapped = nullptr;
+        const D3D12_RANGE read_none = { 0, 0 };
+        if (FAILED(upload->Map(0, &read_none, &mapped)) || mapped == nullptr)
+        {
+            err = "an upload buffer would not map";
+            return;
+        }
+        const unsigned char *src = s.view + (std::size_t)frame_offset;
+        unsigned char *dst = (unsigned char *)mapped;
+        for (unsigned y = 0; y < height; ++y)
+        {
+            std::memcpy(dst + (std::size_t)y * upload_pitch,
+                        src + (std::size_t)y * s.row_pitch, row_bytes);
+        }
+        upload->Unmap(0, nullptr);
+    }
+
+    bool frame_pipeline_drain(FramePipeline &p, ID3D12CommandQueue *queue, std::string &err)
+    {
+        if (FAILED(p.list->Close())) { err = "command list Close failed"; return false; }
+        ID3D12CommandList *const lists[1] = { p.list };
+        queue->ExecuteCommandLists(1, lists);
+        const unsigned long long value = ++p.fence_value;
+        if (FAILED(queue->Signal(p.fence, value))) { err = "queue Signal failed"; return false; }
+        if (p.fence->SetEventOnCompletion(value, p.event) != S_OK)
+        {
+            err = "SetEventOnCompletion failed";
+            return false;
+        }
+        if (WaitForSingleObject(p.event, 20000) != WAIT_OBJECT_0)
+        {
+            err = "a frame did not drain inside 20 s";
+            return false;
+        }
+        return true;
+    }
+
+    //: One submitted frame, end to end. Returns false only when the frame could
+    //: not be PROCESSED; the runtime's own evaluate result comes back separately.
+    bool frame_pipeline_run(FramePipeline &p, HostSlot *slots, const nr::FrameSubmit &sub,
+                            unsigned &eval_result, unsigned long long &out_hash,
+                            unsigned long long &in_hash, std::string &err)
+    {
+        eval_result = 0u; out_hash = 0ull; in_hash = 0ull;
+
+        HostSlot &c = slots[(unsigned)InputSlot::COLOR];
+        HostSlot &d = slots[(unsigned)InputSlot::DEPTH];
+        HostSlot &m = slots[(unsigned)InputSlot::MOTION_VECTORS];
+        HostSlot &o = slots[(unsigned)InputSlot::OUTPUT];
+
+        if (!host_slot_attach(c, err) || !host_slot_attach(d, err) ||
+            !host_slot_attach(m, err) || !host_slot_attach(o, err))
+            return false;
+
+        const unsigned w = (sub.width != 0u) ? sub.width : c.width;
+        const unsigned h = (sub.height != 0u) ? sub.height : c.height;
+        if (!frame_pipeline_prepare(p, w, h, slots, err)) return false;
+
+        ID3D12CommandQueue *const queue = nr::lane_queue();
+        if (queue == nullptr) { err = "the lane left no queue"; return false; }
+
+        const unsigned offset = sub.resource_offset;
+        if (p.list->Reset(p.allocator, nullptr) != S_OK)
+        {
+            err = "command list Reset failed";
+            return false;
+        }
+
+        // The client's own layout decides the offset; the per-class pitch comes
+        // from CONFIG because it is a property of the class, not of the frame.
+        stage_rows(c, offset + c.resource_offset, 0, p.up_color, p.color.row_pitch,
+                   p.color.row_bytes, h, err);
+        if (!err.empty()) return false;
+        stage_rows(d, offset + d.resource_offset, 0, p.up_depth, p.depth.row_pitch,
+                   p.depth.row_bytes, h, err);
+        if (!err.empty()) return false;
+        stage_rows(m, offset + m.resource_offset, 0, p.up_mvec, p.mvec.row_pitch,
+                   p.mvec.row_bytes, h, err);
+        if (!err.empty()) return false;
+
+        in_hash = fnv1a_rows(c.view + offset + c.resource_offset, c.row_pitch, c.row_bytes, h);
+
+        copy_upload_to_texture(p.list, p.up_color, p.color);
+        copy_upload_to_texture(p.list, p.up_depth, p.depth);
+        copy_upload_to_texture(p.list, p.up_mvec, p.mvec);
+        barrier_to(p.list, p.color.res, D3D12_RESOURCE_STATE_COPY_DEST,
+                   D3D12_RESOURCE_STATE_COMMON);
+        barrier_to(p.list, p.depth.res, D3D12_RESOURCE_STATE_COPY_DEST,
+                   D3D12_RESOURCE_STATE_COMMON);
+        barrier_to(p.list, p.mvec.res, D3D12_RESOURCE_STATE_COPY_DEST,
+                   D3D12_RESOURCE_STATE_COMMON);
+        if (!frame_pipeline_drain(p, queue, err)) return false;
+
+        nr::LaneFrame frame;
+        frame.color = p.color.res; frame.color_w = w; frame.color_h = h;
+        frame.depth = p.depth.res; frame.depth_w = w; frame.depth_h = h;
+        frame.depth_inverted = true;
+        frame.mvec = p.mvec.res;   frame.mvec_w = w;  frame.mvec_h = h;
+        frame.mvec_scale_x = 1.0f;   // the client's vectors are already in frame units
+        frame.mvec_scale_y = 1.0f;
+        frame.out = p.out.res;     frame.out_w = w;   frame.out_h = h;
+        frame.intensity = 1.0f;
+        frame.reset = (sub.frame_id <= 1u);
+
+        if (!nr::lane_evaluate(frame, eval_result, err)) return false;
+
+        if (p.list->Reset(p.allocator, nullptr) != S_OK)
+        {
+            err = "command list Reset failed before the readback";
+            return false;
+        }
+        barrier_to(p.list, p.out.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+        copy_texture_to_readback(p.list, p.out, p.rb_out);
+        if (!frame_pipeline_drain(p, queue, err)) return false;
+
+        // Back into the client's OUTPUT mapping, row by row, both pitches.
+        {
+            void *mapped = nullptr;
+            const D3D12_RANGE written = { 0, (SIZE_T)p.out.row_pitch * h };
+            if (FAILED(p.rb_out->Map(0, &written, &mapped)) || mapped == nullptr)
+            {
+                err = "the readback buffer would not map";
+                return false;
+            }
+            const unsigned char *src = (const unsigned char *)mapped;
+            unsigned char *dst = o.view + offset + o.resource_offset;
+            for (unsigned y = 0; y < h; ++y)
+            {
+                std::memcpy(dst + (std::size_t)y * o.row_pitch,
+                            src + (std::size_t)y * p.out.row_pitch, p.out.row_bytes);
+            }
+            out_hash = fnv1a_rows(dst, o.row_pitch, o.row_bytes, h);
+            const D3D12_RANGE read_none = { 0, 0 };
+            p.rb_out->Unmap(0, &read_none);
+        }
+        return true;
+    }
+
     //: The control loop. Returns the process exit code.
     int serve(const Args &a, const wchar_t *pipe_name, const nr::LaneResult *lane)
     {
         nr::Pipe srv;
         std::string err;
+        // The host-staged slots the client publishes with CONFIG, and the frame
+        // pipeline they feed. Both live for the whole serving session: a slot is
+        // attached once and reused, and the pipeline is built from the first
+        // frame's geometry and format set.
+        HostSlot slots[(unsigned)InputSlot::COUNT];
+        FramePipeline pipe;
+        unsigned frames_served = 0;
         pcab::logf("[ipc]    listening on %ls (protocol version %u, one client)",
                    pipe_name, (unsigned)nr::PROTO_VERSION);
 
@@ -741,6 +1073,22 @@ namespace
                     rc = 4;
                     break;
                 }
+                // Remember the client's slot: its mapping name and its layout.
+                // FRAME_SUBMIT is what reads a frame out of it, and it needs both.
+                {
+                    HostSlot &hs = slots[(unsigned)which];
+                    hs.width = cfg.width;
+                    hs.height = cfg.height;
+                    hs.dxgi_format = cfg.dxgi_format;
+                    hs.row_pitch = cfg.row_pitch;
+                    hs.slice_pitch = cfg.slice_pitch;
+                    hs.resource_offset = cfg.resource_offset;
+                    hs.frame_slots = cfg.frame_slots;
+                    if (!widen_name(cfg.shared_name, hs.name))
+                        pcab::logf("[ipc]    CONFIG %s: the published name is empty or not UTF-8 - "
+                                   "no frame can be read out of this slot",
+                                   nr::input_slot_metadata_name(which));
+                }
                 pcab::logf("[ipc]    CONFIG %s: %ux%u format=%u row_pitch=%u slice_pitch=%u "
                            "offset=%u shared=\"%s\" frame_slots=%u",
                            nr::input_slot_metadata_name(which), cfg.width, cfg.height,
@@ -780,18 +1128,48 @@ namespace
                     ring.game_copy_done(sub.slot, sub.ingress_fence_value);
                     ring.worker_begin(sub.slot, sub.ingress_fence_value);
 
-                    // NO TRANSPORT YET, and the reply says so rather than
-                    // pretending the frame was processed.
-                    done.hr = (std::int32_t)0x80004001L;      // E_NOTIMPL
+                    unsigned eval_result = 0u;
+                    unsigned long long in_hash = 0ull, out_hash = 0ull;
+                    std::string ferr;
+
+                    if (!slots[(unsigned)nr::InputSlot::COLOR].attached ||
+                        !slots[(unsigned)nr::InputSlot::DEPTH].attached ||
+                        !slots[(unsigned)nr::InputSlot::MOTION_VECTORS].attached ||
+                        !slots[(unsigned)nr::InputSlot::OUTPUT].attached)
+                    {
+                        // The honest answer until the client has published all
+                        // four: there is nothing to read the frame out of.
+                        done.hr = (std::int32_t)0x80004001L;      // E_NOTIMPL
+                        pcab::logf("[ipc]    FRAME_SUBMIT frame_id=%u slot=%u -> E_NOTIMPL: the "
+                                   "client has not published all four input slots with CONFIG, so "
+                                   "no pixels moved and no fence was signalled",
+                                   sub.h.frame_id, sub.slot);
+                    }
+                    else if (!frame_pipeline_run(pipe, slots, sub, eval_result, out_hash,
+                                                 in_hash, ferr))
+                    {
+                        done.hr = (std::int32_t)0x80004005L;      // E_FAIL
+                        pcab::logf("[ipc]    FRAME_SUBMIT frame_id=%u slot=%u: the frame could not "
+                                   "be processed: %s", sub.h.frame_id, sub.slot, ferr.c_str());
+                    }
+                    else
+                    {
+                        // S_OK when the runtime evaluated the frame; E_FAIL when it
+                        // declined, because a caller must not read the OUTPUT
+                        // mapping as if the model had written it.
+                        done.hr = (eval_result == 0x1u) ? (std::int32_t)0 : (std::int32_t)0x80004005L;
+                        ++frames_served;
+                        pcab::logf("[ipc]    FRAME_SUBMIT frame_id=%u slot=%u %ux%u -> evaluate "
+                                   "0x%08X in_hash=0x%016llX out_hash=0x%016llX pixels_changed=%s "
+                                   "(frames served=%u)",
+                                   sub.h.frame_id, sub.slot, sub.width, sub.height, eval_result,
+                                   in_hash, out_hash,
+                                   (in_hash != out_hash) ? "yes" : "NO", frames_served);
+                    }
+
                     ring.worker_done(sub.slot, sub.ingress_fence_value);
                     ring.begin_game_copyback(sub.slot);
                     ring.release(sub.slot, sub.ingress_fence_value, sub.ingress_fence_value);
-
-                    pcab::logf("[ipc]    FRAME_SUBMIT frame_id=%u slot=%u %ux%u format=%u "
-                               "mask=0x%X -> E_NOTIMPL: the transport is not wired to the worker "
-                               "yet, so no pixels moved and no fence was signalled",
-                               sub.h.frame_id, sub.slot, sub.width, sub.height,
-                               sub.dxgi_format, sub.input_mask);
                 }
 
                 if (srv.write_message(done, 2000, err) != nr::IoResult::OK)
