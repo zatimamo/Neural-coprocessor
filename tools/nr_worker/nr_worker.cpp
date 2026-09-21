@@ -635,6 +635,13 @@ namespace
         return (unsigned long long)s.resource_offset + stride;
     }
 
+    //: The logical width of one row of this slot: its width times the bytes per
+    //: pixel of its own format. Never inferred from the pitch, which is aligned.
+    unsigned host_slot_row_bytes(const HostSlot &s)
+    {
+        return s.width * test_bytes_per_pixel((DXGI_FORMAT)s.dxgi_format);
+    }
+
     bool host_slot_attach(HostSlot &s, std::string &err)
     {
         if (s.attached) return true;
@@ -851,7 +858,8 @@ namespace
                    p.mvec.row_bytes, h, err);
         if (!err.empty()) return false;
 
-        in_hash = fnv1a_rows(c.view + offset + c.resource_offset, c.row_pitch, c.row_bytes, h);
+        in_hash = fnv1a_rows(c.view + offset + c.resource_offset, c.row_pitch,
+                             host_slot_row_bytes(c), h);
 
         copy_upload_to_texture(p.list, p.up_color, p.color);
         copy_upload_to_texture(p.list, p.up_depth, p.depth);
@@ -873,7 +881,7 @@ namespace
         frame.mvec_scale_y = 1.0f;
         frame.out = p.out.res;     frame.out_w = w;   frame.out_h = h;
         frame.intensity = 1.0f;
-        frame.reset = (sub.frame_id <= 1u);
+        frame.reset = (sub.h.frame_id <= 1u);
 
         if (!nr::lane_evaluate(frame, eval_result, err)) return false;
 
@@ -903,7 +911,7 @@ namespace
                 std::memcpy(dst + (std::size_t)y * o.row_pitch,
                             src + (std::size_t)y * p.out.row_pitch, p.out.row_bytes);
             }
-            out_hash = fnv1a_rows(dst, o.row_pitch, o.row_bytes, h);
+            out_hash = fnv1a_rows(dst, o.row_pitch, host_slot_row_bytes(o), h);
             const D3D12_RANGE read_none = { 0, 0 };
             p.rb_out->Unmap(0, &read_none);
         }
