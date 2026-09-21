@@ -502,13 +502,27 @@ jobs:
           grep -q 'out.width = s.width;' "$R" || {
             echo "::error::SlotInfo does not report the slot's own width"; exit 1; }
 
-          # (c) submit() checks the ROW COUNT, the ROW LENGTH and the STRIDE,
-          #     each per slot, and each as a returned refusal that names the slot.
-          for S in 'if (frame.height != s.height)' 'if (in.row_bytes != s.row_bytes)' \
-                   'if (in.stride < in.row_bytes)'; do
+          # (c) THE ROW COUNT, THE ROW LENGTH AND THE STRIDE, each per slot, each
+          #     a returned refusal that names the slot - and now each in
+          #     check_frame(), which is the function the selftest drives directly.
+          #     The gate follows the rule rather than the place it used to live: a
+          #     gate that pinned these lines inside submit() would forbid the very
+          #     refactor that made them testable without a device, and the rules
+          #     would go back to being exercised only on the rig.
+          grep -q 'bool check_frame(const FrameView &frame, const SlotGeometry inputs\[3\], std::string &why)' "$R" || {
+            echo "::error::the per-slot geometry contract is not a pure check_frame()"; exit 1; }
+          for S in 'if (frame.height != s.height)' 'if (rows[i] != s.row_bytes)' \
+                   'if (stride[i] < rows[i])'; do
             grep -qF "$S" "$R" || {
-              echo "::error::submit() does not perform [$S]"; exit 1; }
+              echo "::error::check_frame() does not perform [$S]"; exit 1; }
           done
+          # And submit() must CALL it, after its session guard: the live path runs
+          # the code the test drives, and a frame is not validated against a
+          # session that does not exist.
+          grep -q 'if (!check_frame(frame, geo, why))' "$R" || {
+            echo "::error::submit() does not call check_frame()"; exit 1; }
+          grep -q 'bool check_frame(const FrameView &frame, const SlotGeometry inputs\[3\], std::string &why);' "$H" || {
+            echo "::error::check_frame() is not declared in the header, so no test can call it"; exit 1; }
           # A row count that does not fit is not clamped: the loop that copies
           # rows runs to the SLOT's height and nothing adjusts it.
           grep -q 'for (unsigned y = 0u; y < s.height; ++y)' "$R" || {
@@ -525,12 +539,17 @@ jobs:
           #     the same frame at the published numbers must get past.
           T=tools/nr_worker/nr_relay_selftest.cpp
           test -f "$T" || { echo "::error::missing $T"; exit 1; }
-          grep -q 'submit() REFUSES a frame whose row count is not the slot' "$T" || {
+          grep -q 'check_frame() REFUSES a frame whose row count is not the slot' "$T" || {
             echo "::error::the selftest does not assert the row-count refusal"; exit 1; }
-          grep -q 'submit() REFUSES a row length that is not the format' "$T" || {
+          grep -q 'check_frame() REFUSES a row length that is not the format' "$T" || {
             echo "::error::the selftest does not assert the row-length refusal"; exit 1; }
-          grep -q 'submit() REFUSES a stride shorter than a row' "$T" || {
+          grep -q 'check_frame() REFUSES a stride shorter than a row' "$T" || {
             echo "::error::the selftest does not assert the stride refusal"; exit 1; }
+          # And it drives check_frame() DIRECTLY. Driving submit() alone would test
+          # nothing about the geometry: a --protocol-only worker has no session, so
+          # submit() refuses at the session guard before the contract is reached.
+          grep -q 'mgpu::relay::check_frame(fv, geo, gerr)' "$T" || {
+            echo "::error::the selftest does not drive check_frame() directly"; exit 1; }
           grep -q 'refused by the SESSION guard, not the geometry' "$T" || {
             echo "::error::the selftest does not assert that the correct geometry gets past"
             exit 1; }

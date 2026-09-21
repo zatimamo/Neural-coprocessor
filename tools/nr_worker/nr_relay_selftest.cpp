@@ -313,11 +313,24 @@ int main(int argc, char **argv)
     // Colour and motion vectors really do differ in every dimension the relay
     // checks: rows, row length, and (because 8 bpp against half the width) the
     // pitch. If those were equal, the mismatch test below would prove nothing.
+    //
+    // EXCEPT THE ROW LENGTH, AND THAT IS ARITHMETIC RATHER THAN AN OVERSIGHT.
+    // The game's velocity buffer is half the colour width in the 8-byte format,
+    // so 320 x 8 == 640 x 4: at the default 640x360 the motion-vector row length
+    // is EXACTLY the colour row length. The fixture therefore distinguishes the
+    // slots by row COUNT and by FORMAT, and it cannot distinguish them by row
+    // length at this extent - which is why case (b) below builds an explicit
+    // wrong row length instead of relying on the fixture to supply one. An
+    // assertion that the row lengths differ would be false here, and a check
+    // that is false by construction teaches the next reader the wrong thing.
     const bool geometry_is_distinguishable =
         (cfg.slots.motion_vectors.height != cfg.slots.color.height) &&
-        (cfg.slots.motion_vectors.width * 8u != cfg.slots.color.width * 4u);
+        (cfg.slots.motion_vectors.dxgi_format != cfg.slots.color.dxgi_format);
     check(geometry_is_distinguishable,
-          "the test's own slot set makes the four geometries distinguishable");
+          "the test's own slot set distinguishes the slots by row count and format");
+    check(cfg.slots.motion_vectors.width * 8u == cfg.slots.color.width * 4u,
+          "the half-width 8-byte vectors coincide with the colour row length at this extent, "
+          "which is why the row-length rule is tested with an explicit mismatch");
 
     std::string why;
     const mgpu::relay::Status st = mgpu::relay::start(cfg, why);
