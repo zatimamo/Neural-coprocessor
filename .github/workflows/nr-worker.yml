@@ -42,6 +42,11 @@ on:
       - 'tools/processcontext_ab/nv.h'
       - 'tools/processcontext_ab/observe.cpp'
       - 'tools/processcontext_ab/observe.hpp'
+      # The relay selftest compiles the add-on's relay module, so the two source
+      # files ARE part of this project's inputs: a change to either must rebuild
+      # this workflow rather than wait for an unrelated push.
+      - 'src/nr_relay.cpp'
+      - 'src/nr_relay.hpp'
       - '.github/workflows/nr-worker.yml'
 
 concurrency:
@@ -228,8 +233,41 @@ jobs:
           test -d src || { echo "::error::no src/ - the add-on sources are missing"; exit 1; }
 
           # Any reference at all, from the add-on's own tree or its build files.
-          H=$(grep -rnE 'nr_lane|nr_worker|nr_transport|mgpu_nr_worker|MGPU_NR_|tools/nr_worker' \
-                src CMakeLists.txt assets 2>/dev/null || true)
+          #
+          # COMMENTS ARE STRIPPED FIRST, and the gate says so rather than
+          # letting its own documentation count as evidence - the same discipline
+          # the host-bridge gate below uses with sed 's|//.*$||'. The relay's
+          # comments DO name the worker (they quote the deployed path
+          # mgpu\nvngx.dll_mgpu_nr_worker.exe, because the name is part of the
+          # caller-gate contract), and a gate that read its own prose as a
+          # dependency would fail on the explanation of why it must not.
+          # Line numbers survive the stripping, so a failure still points at the
+          # repository's own file and line.
+          #
+          # ONE NARROW EXCLUSION, AND ONLY THIS ONE: the relay module
+          # (src/nr_relay.{hpp,cpp}) and its build switch. It is the game-side
+          # half of the IPC channel to the worker and nothing else - no lane, no
+          # device, no NGX, no NVAPI, no Reserved18 reserve, no include of this
+          # tree - and it compiles to an empty translation unit unless
+          # MGPU_NR_RELAY is defined (see the option block in CMakeLists.txt and
+          # the nr-relay-ab workflow's gates). The exclusion is asserted
+          # positively below, so it cannot become a hole.
+          hits() {   # hits <comment-regex> <pattern> <file...>
+            local strip="$1"; shift
+            local pat="$1"; shift
+            local f
+            for f in "$@"; do
+              [ -f "$f" ] || continue
+              sed "$strip" "$f" | grep -nE "$pat" | sed "s|^|$f:|" || true
+            done
+          }
+          RAW=$(hits 's|//.*$||' \
+                    'nr_lane|nr_worker|nr_transport|mgpu_nr_worker|MGPU_NR_|tools/nr_worker' \
+                    src/*.cpp src/*.hpp)
+          RAW="$RAW$(hits 's/#.*$//' \
+                    'nr_lane|nr_worker|nr_transport|mgpu_nr_worker|MGPU_NR_|tools/nr_worker' \
+                    CMakeLists.txt assets/*.ini assets/*.txt)"
+          H=$(printf '%s\n' "$RAW" | grep -vE 'nr_relay|MGPU_NR_RELAY' || true)
           [ -z "$H" ] || {
             echo "$H"
             echo "::error::the game side references the worker. The worker owns neural "
@@ -237,8 +275,50 @@ jobs:
             exit 1
           }
 
+          # THE POSITIVE HALF OF THE EXCLUSION. The relay must not have grown a
+          # reference to the worker's lane code or to the NGX/NVAPI entry points
+          # that create a session. Two things the relay legitimately NAMES are
+          # allowed through, and both are quoted exactly:
+          #   * the deployed worker's file name, nvngx.dll_mgpu_nr_worker.exe,
+          #     which is a caller-gate contract and not a dependency (see
+          #     src/nr_relay.hpp), and
+          #   * the string src=worker in the fixed Reserved18 log line, which is
+          #     an ATTRIBUTION: it says the value came from the worker.
+          # "Reserved18" itself is not excluded either: naming the feature in a
+          # log line is the relay's whole job, and it is the CREATION of a
+          # session that must stay out of this process.
+          H=$(hits 's|//.*$||' \
+                   'nr_lane|nr_transport|mgpu_nr_worker|nvsdk_ngx|NVSDK_NGX|NvAPI_|nvapi64|CreateFeature|AllocateParameters|Init_Ext' \
+                   src/nr_relay.cpp src/nr_relay.hpp)
+          H=$(printf '%s\n' "$H" | grep -vF 'nvngx.dll_mgpu_nr_worker.exe' \
+                | grep -vF 'src=worker' || true)
+          # The quoted names must still be the ones the deployment uses, so the
+          # exclusion above cannot be kept alive by a stale string.
+          grep -qF 'nvngx.dll_mgpu_nr_worker.exe' src/nr_relay.cpp || {
+            echo "::error::the relay no longer names the deployed worker nvngx.dll_mgpu_nr_worker.exe"
+            exit 1; }
+          grep -qF 'src=worker' src/nr_relay.cpp || {
+            echo "::error::the relay no longer attributes its Reserved18 line to the worker"
+            exit 1; }
+          [ -z "$H" ] || {
+            echo "$H"
+            echo "::error::the relay module references the worker's lane. It must own the IPC"
+            echo "::error::channel only: no device, no NGX, no NVAPI, no Reserved18 session."
+            exit 1
+          }
+          # And the exclusion covers the relay's own files and the build switch -
+          # nothing else may be carrying these names.
+          EX=$(grep -rlE 'nr_relay|MGPU_NR_RELAY' src CMakeLists.txt 2>/dev/null | sort | tr '\n' ' ')
+          case "$EX" in
+            "CMakeLists.txt src/nr_relay.cpp src/nr_relay.hpp "|\
+            "CMakeLists.txt src/nr_relay.hpp "|"CMakeLists.txt src/nr_relay.cpp ") ;;
+            *) echo "::error::the relay exclusion covers [$EX], which is not the relay's own files"
+               exit 1 ;;
+          esac
+
           # The worker's target must not be added to the add-on's build either.
-          H=$(grep -nE 'add_subdirectory[[:space:]]*\(.*nr_worker|tools/nr_worker' CMakeLists.txt 2>/dev/null || true)
+          # Comments stripped, because this step's own comments name the tree.
+          H=$(sed 's/#.*$//' CMakeLists.txt | grep -nE 'add_subdirectory[[:space:]]*\(.*nr_worker|tools/nr_worker' || true)
           [ -z "$H" ] || { echo "$H"; echo "::error::the add-on's CMakeLists pulls in the worker"; exit 1; }
 
           # And the positive half: exactly one place defines the worker target.
@@ -253,6 +333,7 @@ jobs:
           H=$(grep -rnE '#include[[:space:]]*["<][.][.]/' src 2>/dev/null | grep -i nr || true)
           [ -z "$H" ] || { echo "$H"; echo "::error::src/ includes the worker's headers"; exit 1; }
           echo "architecture rule verified: no path from the game side to the worker's initialization."
+          echo "excluded, and asserted to be only this: the relay's IPC channel ($EX)"
 
       # ---------------------------------------------------------------------
       # 5. THE TRANSPORT DOES NOT CAPTURE AND DOES NOT USE THE CPU FOR PIXELS.
@@ -410,7 +491,7 @@ jobs:
           set +e
           : > build-nr.log
           RC=0
-          for T in mgpu_nr_worker nr_selftest nr_ipc_probe nr_transport_bench nr_host_bridge_bench nr_slot_client; do
+          for T in mgpu_nr_worker nr_selftest nr_ipc_probe nr_transport_bench nr_host_bridge_bench nr_slot_client nr_relay_selftest; do
             echo "=== $T ===" | tee -a build-nr.log
             cmake --build build-nr --config Release --target "$T" 2>&1 | tee -a build-nr.log
             TRC=${PIPESTATUS[0]}
@@ -432,12 +513,12 @@ jobs:
             tail -n 40 build-nr.log
             exit 1
           fi
-          echo "all six targets built"
+          echo "all seven targets built"
 
-      - name: Verify the six binaries
+      - name: Verify the seven binaries
         shell: bash
         run: |
-          for B in mgpu_nr_worker nr_selftest nr_ipc_probe nr_transport_bench nr_host_bridge_bench nr_slot_client; do
+          for B in mgpu_nr_worker nr_selftest nr_ipc_probe nr_transport_bench nr_host_bridge_bench nr_slot_client nr_relay_selftest; do
             F=$(find build-nr -name "$B.exe" -type f | head -n1)
             [ -n "$F" ] || { echo "::error::$B.exe was not produced"; exit 1; }
             echo "$B: $F"
@@ -448,12 +529,14 @@ jobs:
           PROBE=$(find build-nr -name 'nr_ipc_probe.exe' -type f | head -n1)
           BRIDGE=$(find build-nr -name 'nr_host_bridge_bench.exe' -type f | head -n1)
           SLOT=$(find build-nr -name 'nr_slot_client.exe' -type f | head -n1)
+          RELAY=$(find build-nr -name 'nr_relay_selftest.exe' -type f | head -n1)
           echo "WORKER=$WORKER" >> "$GITHUB_ENV"
           echo "BENCH=$BENCH"   >> "$GITHUB_ENV"
           echo "SELF=$SELF"     >> "$GITHUB_ENV"
           echo "PROBE=$PROBE"   >> "$GITHUB_ENV"
           echo "BRIDGE=$BRIDGE" >> "$GITHUB_ENV"
           echo "SLOT=$SLOT"     >> "$GITHUB_ENV"
+          echo "RELAY=$RELAY"   >> "$GITHUB_ENV"
 
           # THE HOST-BRIDGE BENCHMARK MUST NOT REACH FOR WHAT WAS REJECTED. Mode A
           # is a file mapping opened as a heap on both devices; mode B is an
@@ -638,6 +721,84 @@ jobs:
             echo "::error::the slot client's worker never printed WORKER_READY"; exit 1; }
           echo "slot client ok: four mappings published, HELLO answered, Reserved18 gate honoured."
 
+      # ---------------------------------------------------------------------
+      # THE RELAY MODULE ITSELF. This is the same src/nr_relay.cpp the add-on
+      # compiles, built into its own GPU-free executable and driven against a
+      # REAL worker process. What it proves here: the module resolves the
+      # deployed worker path, LAUNCHES it (CreateProcessW, no console), connects,
+      # HELLO, reads WORKER_READY, publishes the four mappings and sends the four
+      # CONFIG messages. What it also proves, and this is the reason the step
+      # exists at all: the module reports a --protocol-only worker's reserved18
+      # == -1 EXACTLY, does not call it a success, and refuses to submit a frame
+      # to a worker that has no session.
+      # ---------------------------------------------------------------------
+      - name: The relay module, against a real protocol-only worker
+        shell: bash
+        run: |
+          cd _nr
+          RELAY_EXE=../"$RELAY"
+
+          # THE DEPLOYED LAYOUT, STAGED. The relay resolves the worker as
+          # <module dir>\mgpu\nvngx.dll_mgpu_nr_worker.exe - the rig's layout, and
+          # the nvngx.dll_ prefix is a caller-gate contract rather than a
+          # cosmetic name. Staging it here lets available() be tested for real
+          # instead of skipping the branch because the file is not deployed.
+          mkdir -p ../mgpu
+          cp "$WORKER" ../mgpu/nvngx.dll_mgpu_nr_worker.exe
+          ls -l ../mgpu/
+
+          set +e
+          "$RELAY_EXE" --point-at-worker "$WORKER" --pipe '\\.\pipe\MGPU_NR_CI_RELAY' \
+            --log-name nr-worker-ci-relay > relay-selftest.txt 2>&1
+          RRC=$?
+          set -e
+          cat relay-selftest.txt
+          [ "$RRC" -eq 0 ] || { echo "::error::nr_relay_selftest exited $RRC"; exit 1; }
+          grep -q 'RELAY-SELFTEST-RESULT ok=YES' relay-selftest.txt || {
+            echo "::error::the relay selftest did not report ok=YES"; exit 1; }
+
+          # The four published slots, with the arithmetic the worker validates.
+          # row_pitch = align_up(640 * 4, 256) = 2560; slice_pitch = 2560 * 360.
+          grep -q 'slot 0      = published' relay-selftest.txt || {
+            echo "::error::the relay never published slot 0"; exit 1; }
+          grep -q 'row_pitch=2560 slice_pitch=921600 bytes=2764800' relay-selftest.txt || {
+            echo "::error::the published geometry is not the derived one"; exit 1; }
+          grep -q 'available() = yes' relay-selftest.txt || {
+            echo "::error::the relay did not find the worker where it resolves it"; exit 1; }
+
+          # THE HONESTY GATE, on the module's own output. It must carry the exact
+          # fixed line, with the worker's value, and it must not claim Success.
+          grep -qF '[MGPU][RELAY] CreateFeature(Reserved18) result=0xFFFFFFFF (not-a-session) src=worker' \
+            relay-selftest.txt || {
+            echo "::error::the relay's Reserved18 line is not the fixed honest one"; exit 1; }
+          if grep -a 'Reserved18' relay-selftest.txt | grep -q 'Success'; then
+            echo "::error::the relay claims Reserved18 Success for a worker that has no session"
+            exit 1
+          fi
+          grep -q 'src=worker' relay-selftest.txt || {
+            echo "::error::the relay did not attribute its Reserved18 line to the worker"; exit 1; }
+
+          # And the WORKER's own log, after it exited: the CONFIG metadata the
+          # relay sent, read back out of the peer. The mapping names are derived
+          # from the pipe, so their presence is evidence the messages arrived and
+          # named the same sections this side published.
+          WLOG=context-nr-worker-ci-relay.log
+          test -f "$WLOG" || { echo "::error::the worker wrote no log"; exit 1; }
+          grep -q 'WORKER_READY' "$WLOG" || { echo "::error::no WORKER_READY"; exit 1; }
+          grep -q 'reserved18=-1' "$WLOG" || {
+            echo "::error::the protocol-only worker did not report reserved18=-1"; exit 1; }
+          for S in 'CONFIG COLOR' 'CONFIG DEPTH' 'CONFIG MOTION_VECTORS' 'CONFIG OUTPUT' \
+                   'MGPU_NR_CI_RELAY' '640x360' 'row_pitch=2560'; do
+            grep -q -- "$S" "$WLOG" || {
+              echo "::error::the worker's log never shows '$S' - the relay's CONFIG did not arrive"
+              exit 1; }
+          done
+          if grep -a 'Reserved18' "$WLOG" | grep -q 'Success'; then
+            echo "::error::the WORKER's log claims Reserved18 Success in protocol-only mode"
+            exit 1
+          fi
+          echo "relay module ok: launched, handshaked, four slots published, honesty rule held."
+
       - name: The benchmark refuses to invent an adapter
         shell: bash
         run: |
@@ -654,7 +815,7 @@ jobs:
           echo "adapter selection ok: exit $RC, and it named what it did not find."
 
       # ---------------------------------------------------------------------
-      # 10. The artifact: six binaries, the runner and the README.
+      # 10. The artifact: SEVEN binaries, the runner and the README.
       # ---------------------------------------------------------------------
       - name: Stage and hash the artifact
         shell: bash
@@ -666,17 +827,18 @@ jobs:
           cp "$BENCH"  _nrworker/nr_transport_bench.exe
           cp "$BRIDGE" _nrworker/nr_host_bridge_bench.exe
           cp "$SLOT"   _nrworker/nr_slot_client.exe
+          cp "$RELAY"  _nrworker/nr_relay_selftest.exe
           cp tools/nr_worker/RUN-NR-WORKER.cmd _nrworker/
           cp tools/nr_worker/README.txt       _nrworker/
 
           ( cd _nrworker && sha256sum mgpu_nr_worker.exe nr_selftest.exe nr_ipc_probe.exe \
               nr_transport_bench.exe nr_host_bridge_bench.exe nr_slot_client.exe \
-              RUN-NR-WORKER.cmd README.txt ) \
+              nr_relay_selftest.exe RUN-NR-WORKER.cmd README.txt ) \
             > _nrworker/SHA256SUMS.txt
           cat _nrworker/SHA256SUMS.txt
 
           COUNT=$(find _nrworker -type f | wc -l)
-          [ "$COUNT" -eq 9 ] || { echo "::error::the artifact holds $COUNT files, expected 9"; find _nrworker -type f | sort; exit 1; }
+          [ "$COUNT" -eq 10 ] || { echo "::error::the artifact holds $COUNT files, expected 10"; find _nrworker -type f | sort; exit 1; }
 
           {
             echo "variant   = nr-worker"
@@ -695,8 +857,13 @@ jobs:
             echo "                        handshake"
             echo "nr_ipc_probe.exe        the client half of the protocol"
             echo "nr_slot_client.exe      a client that moves four frames through"
-            echo "                        the worker and hashes what comes back -"
-            echo "                        the shape the game-side add-on will copy"
+            echo "                        the worker and hashes what comes back"
+            echo "nr_relay_selftest.exe   the ADD-ON's relay module (src/nr_relay.cpp)"
+            echo "                        built GPU-free and driven against a real"
+            echo "                        --protocol-only worker. It proves the module"
+            echo "                        launches, handshakes, publishes the four"
+            echo "                        mappings, and reports the worker's reserved18"
+            echo "                        == -1 WITHOUT calling it a success."
             echo "nr_transport_bench.exe  the two-GPU cross-adapter round trip. It"
             echo "                        loads no NGX and no NVAPI, on purpose."
             echo
@@ -707,6 +874,11 @@ jobs:
             echo "pins:"
             echo "  NVIDIA/DLSS        ${NGX_SHA}"
             echo "  TsudaKageyu/minhook ${MINHOOK_SHA}"
+            echo
+            echo "WHAT CI DID NOT PROVE: not one pixel crossed. The frame round trip"
+            echo "needs four surfaces on the RTX 4070 and a neural runtime, and a"
+            echo "GitHub runner has neither. nr_slot_client.exe on the rig is that"
+            echo "proof; this artifact is the control path and the honesty rules."
             echo
             echo "Run it on the real machine with RUN-NR-WORKER.cmd. It never launches"
             echo "Cyberpunk and it deploys nothing."

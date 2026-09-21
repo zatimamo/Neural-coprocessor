@@ -98,6 +98,17 @@ add_library(mgpu_bridge SHARED
     # writing a literal, so the id a session is initialised with and the id the
     # log states cannot drift apart.
     src/appid_ns.cpp
+    # NR_RELAY: the game-side half of the OUT-OF-PROCESS neural lane. The whole
+    # file is inside #ifdef MGPU_NR_RELAY, so without the definition it is an
+    # empty translation unit and the add-on is byte-for-byte the build it was
+    # before this file existed. It owns the IPC half and nothing of D3D12:
+    # frames arrive as plain host pointers, four named file mappings carry them
+    # to mgpu_nr_worker.exe, and the worker's own Reserved18 result is quoted
+    # rather than interpreted. See the MGPU_NR_RELAY option block below, and
+    # src/nr_relay.hpp for why the carrier is host memory and not a shared
+    # surface. Nothing calls it yet; the frame-pipeline call site is a separate
+    # piece of work written against that header.
+    src/nr_relay.cpp
 )
 
 target_include_directories(mgpu_bridge PRIVATE
@@ -437,6 +448,50 @@ if(MGPU_APPID_NS)
     message(STATUS "MGPU: APPID_NS = ON (Reserved18 app id 0x1000000)")
 else()
     message(STATUS "MGPU: APPID_NS = OFF (Reserved18 app id 0, control)")
+endif()
+
+# ---------------------------------------------------------------------------
+# NR_RELAY. The game-side half of the out-of-process neural lane.
+#
+#   MGPU_NR_RELAY absent  ->  src/nr_relay.cpp is compiled to NOTHING. Every
+#                             line of it is inside #ifdef MGPU_NR_RELAY, so the
+#                             translation unit is empty, it links nothing new
+#                             and it cannot touch any other unit's behaviour.
+#   MGPU_NR_RELAY defined ->  the same file is a working module: it launches
+#                             mgpu_nr_worker.exe, speaks control protocol v1 to
+#                             it over a named pipe and publishes the four
+#                             host-staged frame mappings.
+#
+# WHY IT IS ALWAYS IN THE SOURCE LIST RATHER THAN CONDITIONAL
+#   "Compiled into the add-on but inert unless MGPU_NR_RELAY is defined" is
+#   exactly what an empty-at-preprocessing translation unit gives, and it is
+#   also what lets the GPU-free selftest (tools/nr_worker/nr_relay_selftest.cpp)
+#   build the SAME file with the definition ON, in CI, with no GPU. Two
+#   different source lists would be two different modules.
+#
+# WHAT IT DELIBERATELY DOES NOT GET
+#   No include directory and no link library. The relay is self-contained on
+#   purpose: it reproduces the v1 wire layout with the same static_asserts
+#   nr_proto.h uses, instead of reaching into tools/nr_worker/ for the header.
+#   The add-on must not gain a build-time path into the worker's tree - that
+#   tree owns the RTX 4070 device, the NGX core and the Reserved18 session, and
+#   the architecture exists precisely to keep them out of this process. The
+#   nr-worker workflow's architecture gate checks the same thing from the other
+#   side, and the nr-relay-ab workflow diffs the reproduced layout against
+#   nr_proto.h so the separation cannot drift.
+#
+# NOTHING CALLS IT YET. The frame-pipeline call site is a separate, later
+# piece of work written against src/nr_relay.hpp. The compiled-in relay is
+# inert until that exists.
+# ---------------------------------------------------------------------------
+option(MGPU_NR_RELAY
+       "NR_RELAY: compile the out-of-process relay module (inert until something calls it)"
+       OFF)
+if(MGPU_NR_RELAY)
+    target_compile_definitions(mgpu_bridge PRIVATE MGPU_NR_RELAY=1)
+    message(STATUS "MGPU: NR_RELAY = ON (src/nr_relay.cpp compiled; no caller yet, so no behaviour change)")
+else()
+    message(STATUS "MGPU: NR_RELAY = OFF (src/nr_relay.cpp compiles to an empty translation unit)")
 endif()
 
 option(MGPU_BUILD_TESTS "Build CPU-only adapter policy tests" OFF)

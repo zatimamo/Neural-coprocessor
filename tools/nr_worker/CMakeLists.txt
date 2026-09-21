@@ -6,7 +6,7 @@
 #         -DPCAB_NGX_DIR=<ext/ngx> -DPCAB_MINHOOK_DIR=<ext/minhook>
 #   cmake --build build-nr --config Release
 #
-# FOUR TARGETS
+# SEVEN TARGETS
 #   mgpu_nr_worker.exe      the RTX 4070 lane, in its own process. The game side
 #                           must never create that device, that NGX session or
 #                           that Reserved18 feature.
@@ -16,6 +16,14 @@
 #                           the real worker and later by the game side.
 #   nr_transport_bench.exe  the standalone two-GPU round trip. Standalone: it
 #                           loads no NGX and no NVAPI.
+#   nr_slot_client.exe      the client that moves real frames through the worker
+#                           over host-staged mappings, and hashes the output.
+#   nr_relay_selftest.exe   the ADD-ON's relay module (../../src/nr_relay.cpp),
+#                           GPU-free, driven against a real --protocol-only
+#                           worker. This is where the relay's honesty rules are
+#                           tested, because testing them in the add-on would
+#                           mean launching the game.
+#   nr_host_bridge_bench.exe  the existing-heap vs CPU-staging comparison.
 #
 # WHY THE PROCESSCONTEXT SOURCES ARE COMPILED IN HERE
 #   The worker's lane must BE the proven lane, not a second interpretation of it.
@@ -104,6 +112,41 @@ add_executable(nr_slot_client
   nr_pipe.cpp
   nr_slots.cpp)
 
+# ------------------------------------------------------ the ON-DEVICE relay test
+# src/nr_relay.cpp is the add-on's own relay module: the code that will launch
+# this worker, publish the four host-staged mappings and submit real frames from
+# inside Cyberpunk.exe. Testing it inside the add-on would mean launching the
+# game on the rig, so the SAME translation unit is compiled here, GPU-free, and
+# driven against a real --protocol-only worker process (no D3D12, no NGX, no
+# NVAPI). It links the CRT and kernel32 only, like nr_slot_client.
+#
+# HOW THE MODULE GETS INTO THIS TARGET, AND WHY NOT THE OBVIOUS WAY.
+# The module's whole body lives inside `#ifdef MGPU_NR_RELAY`, which is what
+# makes it an empty translation unit in the add-on by default. The obvious
+# formulation - put ../../src/nr_relay.cpp in add_executable and give this target
+# MGPU_NR_RELAY=1 - would define the macro on the SOURCE FILE, and CMake's
+# set_source_files_properties(DIRECTORY) is scoped to this directory AND ITS
+# SUBDIRECTORIES, i.e. it would also reach the add-on target that is defined in
+# the parent directory. The add-on would then compile the relay ON in a build
+# whose option says OFF. So the macro is set on the TARGET and the selftest
+# includes the module itself; a compile definition on this target cannot travel
+# anywhere else.
+add_executable(nr_relay_selftest
+  nr_relay_selftest.cpp
+  nr_proto.cpp
+  nr_pipe.cpp
+  nr_slots.cpp)
+
+# MGPU_NR_RELAY=1 IS THE MODULE'S OWN GUARD. nr_relay_selftest.cpp sets it before
+# it includes ../../src/nr_relay.cpp, and this definition is what makes that
+# include compile the module instead of nothing.
+target_compile_definitions(nr_relay_selftest PRIVATE MGPU_NR_RELAY=1)
+
+# One path, used by the module include and by #include "nr_relay.hpp", which is
+# also relative to the including file.
+target_include_directories(nr_relay_selftest PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../src")
+
 # --------------------------------------------------------- the transport bench
 add_executable(nr_transport_bench
   nr_bench.cpp
@@ -121,7 +164,7 @@ add_executable(nr_host_bridge_bench
   nr_json.cpp)
 
 foreach(TARGET mgpu_nr_worker nr_selftest nr_ipc_probe nr_slot_client nr_transport_bench
-               nr_host_bridge_bench)
+               nr_host_bridge_bench nr_relay_selftest)
   target_include_directories(${TARGET} PRIVATE
     "${NR_PROVEN_DIR}"
     "${PCAB_NGX_DIR}"
@@ -154,4 +197,5 @@ target_link_libraries(nr_host_bridge_bench PRIVATE
 
 message(STATUS "NR-WORKER: proven layer from ${NR_PROVEN_DIR}")
 message(STATUS "NR-WORKER: NGX headers from ${PCAB_NGX_DIR}")
-message(STATUS "NR-WORKER: output ${CMAKE_BINARY_DIR}/bin/mgpu_nr_worker.exe and three tools")
+message(STATUS "NR-WORKER: output ${CMAKE_BINARY_DIR}/bin/mgpu_nr_worker.exe and six tools")
+message(STATUS "NR-WORKER: nr_relay_selftest compiles ../../src/nr_relay.cpp with MGPU_NR_RELAY=1")
