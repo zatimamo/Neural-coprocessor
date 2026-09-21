@@ -834,6 +834,36 @@ namespace
 
         const unsigned w = (sub.width != 0u) ? sub.width : c.width;
         const unsigned h = (sub.height != 0u) ? sub.height : c.height;
+
+        // THE FEATURE HAS ONE GEOMETRY, AND IT IS NOT NEGOTIABLE PER FRAME.
+        //
+        // The lane created Reserved18 at NR_CTRL_W x NR_CTRL_H and told NGX that
+        // size in the parameter block (nr_lane.cpp:110-121); the upload textures
+        // this function fills are that size too. A frame at any other extent
+        // therefore cannot be evaluated by it. Copying the top h rows of a
+        // larger frame would upload a partial picture and still come back with
+        // the runtime's own result - hr=0 on a frame the model never saw - which
+        // is exactly the kind of green line this worker exists to refuse. So the
+        // extent is checked against the CREATION geometry, and a mismatch is an
+        // E_FAIL with both numbers in the reason.
+        //
+        // WHEN THE WORKER GAINS A GEOMETRY OVERRIDE this comparison must move to
+        // the configured extent rather than the constants, or the override would
+        // be refused by its own guard. It does not exist yet: the geometry is
+        // the proven control size on purpose (the CI gate pins both constants,
+        // and the frozen lane's contract is asserted against them).
+        if (w != nr::NR_CTRL_W || h != nr::NR_CTRL_H)
+        {
+            char buf[224];
+            std::snprintf(buf, sizeof buf,
+                          "the frame is %ux%u and the Reserved18 feature was created at %ux%u - a "
+                          "frame at another extent cannot be evaluated by it, so nothing was "
+                          "uploaded and no pixel was read",
+                          w, h, nr::NR_CTRL_W, nr::NR_CTRL_H);
+            err = buf;
+            return false;
+        }
+
         if (!frame_pipeline_prepare(p, w, h, slots, err)) return false;
 
         ID3D12CommandQueue *const queue = nr::lane_queue();
