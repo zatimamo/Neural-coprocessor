@@ -50,6 +50,11 @@
 #include "../../src/nr_relay.cpp"
 
 #include <windows.h>
+// CommandLineToArgvW lives in shellapi.h, which windows.h does NOT pull in.
+// Declared here rather than in the relay: this is a property of the TEST's
+// argument parsing, not of the module under test, and the module itself must
+// stay on windows.h + the CRT (its own gate asserts the include count).
+#include <shellapi.h>
 
 #include <cstdio>
 #include <cstring>
@@ -57,6 +62,11 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+// CommandLineToArgvW's implementation is in Shell32. Declared as a pragma so a
+// build made from this file alone still links, the way gpu1_context.cpp does
+// for dcomp and d3d11.
+#pragma comment(lib, "shell32.lib")
 
 namespace
 {

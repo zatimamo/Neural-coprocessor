@@ -1344,8 +1344,13 @@ namespace mgpu::relay
         // Snapshot the OUTPUT slice as the game left it. "The worker wrote the
         // output" is then a fact about memory, and it is reported as a fact
         // rather than as a verdict about the image.
+        //
+        // NON-CONST on purpose: `fill` is this slot's own snapshot buffer and
+        // assign() writes into it. Taking the slot through a const reference
+        // (as the first draft did) makes the call ill-formed - C2662 - because
+        // the snapshot is state the relay keeps, not something it reads.
         {
-            const Slot &o = g.slots[(unsigned)wire::InputSlot::OUTPUT];
+            Slot &o = g.slots[(unsigned)wire::InputSlot::OUTPUT];
             if (!o.published || o.view == nullptr)
             {
                 why = "the OUTPUT slot was never published";
