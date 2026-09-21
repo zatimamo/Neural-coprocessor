@@ -1427,12 +1427,23 @@ namespace mgpu::relay
             }
             if (frame.height != s.height)
             {
-                char b[256];
+                char b[416];
+                // THE WORKER'S OWN RULE IS SAID AT THE POINT OF REFUSAL, because
+                // it is the reason a rig run at a larger R sees a refusal and the
+                // reader must not have to go looking for it: the worker's frame
+                // path refuses an extent that is not the one its Reserved18
+                // feature was created at, and that extent is the worker's own
+                // pinned 640x360. Naming it here is the difference between "the
+                // relay is broken" and "the geometry has to be raised on the
+                // worker side first".
                 std::snprintf(b, sizeof b,
                               "the frame has %u rows and the %s slot was published with %u; the "
                               "worker takes its row count from the slot's own height, so this "
                               "frame would be truncated or over-read. The relay does not "
-                              "resample or crop - reduce the frame to the published size first.",
+                              "resample or crop - reduce the frame to the published size first; "
+                              "and note that the worker separately refuses any extent other "
+                              "than the one its Reserved18 feature was created at (640x360 in "
+                              "this build).",
                               frame.height, slot_name(classes[i]), s.height);
                 why = b;
                 g.last_error = why;

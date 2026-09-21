@@ -546,6 +546,17 @@ jobs:
             echo "::error::the header does not state that the relay never resamples"; exit 1; }
           grep -q 'NEURAL SIZE R' "$H" || {
             echo "::error::the header does not name the neural size R"; exit 1; }
+          # The worker's own limit is stated on this side too, because it bounds
+          # what the relay can be asked to do at all: the worker refuses a frame
+          # whose extent is not the one its Reserved18 feature was created at.
+          # This is documentation at the point of refusal, not a second copy of
+          # the worker's constants - the value named here must be updated when
+          # that pin moves, and the gate keeps the sentence alive to force it.
+          grep -q 'the one its Reserved18 feature was created at' "$R" || {
+            echo "::error::the relay's refusals no longer state the worker's own geometry limit"
+            exit 1; }
+          grep -q "frame path refuses a frame whose extent is" "$H" || {
+            echo "::error::the header does not document the worker's geometry limit"; exit 1; }
 
           echo "geometry verified: per-slot contract, per-slot CONFIG, three refusals, tested."
 

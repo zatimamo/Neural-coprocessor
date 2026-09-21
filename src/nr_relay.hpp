@@ -210,6 +210,17 @@ namespace mgpu::relay
         //: the GPU-free selftest publishes so that test stays a two-line setup.
         //: It is NOT a claim about what a real frame is - the rig geometry is
         //: the caller's R, and these four lines are what it overwrites.
+        //:
+        //: AND RIGHT NOW IT IS ALSO A CEILING, WHICH IS THE WORKER'S RULE, NOT
+        //: THIS MODULE'S. The worker's frame path refuses a frame whose extent is
+        //: not the extent its Reserved18 feature was created at, and that extent
+        //: is its own pinned 640x360 (nr_worker.cpp frame_pipeline_run, and the
+        //: NR_CTRL_W/NR_CTRL_H constants a CI gate pins). So today the relay
+        //: publishes these numbers, the worker refuses anything else, and the
+        //: refusal is the honest answer rather than a truncated frame. Raising R
+        //: is the worker's change to make - the comment at that check says which
+        //: line must move when it gains a geometry override - and this default is
+        //: the one place on this side that follows it.
         SlotSet slots = {
             { 640u, 360u, 28u },   // COLOR          R8G8B8A8_UNORM
             { 640u, 360u, 41u },   // DEPTH          R32_FLOAT
