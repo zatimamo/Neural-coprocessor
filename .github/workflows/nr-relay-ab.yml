@@ -83,6 +83,12 @@ on:
       - 'src/nr_relay.hpp'
       - 'CMakeLists.txt'
       - 'tools/nr_worker/nr_relay_selftest.cpp'
+      # PHASE 2. This job builds the add-on WITH MGPU_NR_RELAY=ON and greps the
+      # produced artifact, so the file that CALLS the relay is as much an input
+      # as the relay itself. Without this line the one workflow that would catch
+      # a call site that does not compile - or that puts the relay's strings
+      # somewhere they must not be - would not run on the change that does it.
+      - 'src/gpu1_context.cpp'
       - '.github/workflows/nr-relay-ab.yml'
 
 concurrency:

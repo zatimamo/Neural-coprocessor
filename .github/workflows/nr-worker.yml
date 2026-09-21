@@ -47,6 +47,12 @@ on:
       # this workflow rather than wait for an unrelated push.
       - 'src/nr_relay.cpp'
       - 'src/nr_relay.hpp'
+      # PHASE 2. The architecture gate below enumerates the files allowed to
+      # carry the relay's names, and src/gpu1_context.cpp is one of them because
+      # it is the frame-path call site. A change to it is therefore a change to
+      # what this workflow is the check ON: without this line a phase-2 edit
+      # would land with the gate that governs it never having run.
+      - 'src/gpu1_context.cpp'
       - '.github/workflows/nr-worker.yml'
 
 concurrency:
