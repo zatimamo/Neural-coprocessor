@@ -736,7 +736,14 @@ jobs:
         shell: bash
         run: |
           cd _nr
+          # THE EARLIER STEP RESOLVED THESE RELATIVE TO THE REPOSITORY ROOT, and
+          # this step works from _nr. "../$VAR" is therefore the path, and it is
+          # needed in BOTH places below - the copy and --point-at-worker - which
+          # is why it is computed once here rather than written twice.
+          WORKER_ABS=../"$WORKER"
           RELAY_EXE=../"$RELAY"
+          test -f "$WORKER_ABS" || {
+            echo "::error::the worker is not at $WORKER_ABS"; exit 1; }
 
           # THE DEPLOYED LAYOUT, STAGED. The relay resolves the worker as
           # <module dir>\mgpu\nvngx.dll_mgpu_nr_worker.exe - the rig's layout, and
@@ -744,11 +751,11 @@ jobs:
           # cosmetic name. Staging it here lets available() be tested for real
           # instead of skipping the branch because the file is not deployed.
           mkdir -p ../mgpu
-          cp "$WORKER" ../mgpu/nvngx.dll_mgpu_nr_worker.exe
+          cp "$WORKER_ABS" ../mgpu/nvngx.dll_mgpu_nr_worker.exe
           ls -l ../mgpu/
 
           set +e
-          "$RELAY_EXE" --point-at-worker "$WORKER" --pipe '\\.\pipe\MGPU_NR_CI_RELAY' \
+          "$RELAY_EXE" --point-at-worker "$WORKER_ABS" --pipe '\\.\pipe\MGPU_NR_CI_RELAY' \
             --log-name nr-worker-ci-relay > relay-selftest.txt 2>&1
           RRC=$?
           set -e
@@ -757,14 +764,44 @@ jobs:
           grep -q 'RELAY-SELFTEST-RESULT ok=YES' relay-selftest.txt || {
             echo "::error::the relay selftest did not report ok=YES"; exit 1; }
 
-          # The four published slots, with the arithmetic the worker validates.
-          # row_pitch = align_up(640 * 4, 256) = 2560; slice_pitch = 2560 * 360.
-          grep -q 'slot 0      = published' relay-selftest.txt || {
-            echo "::error::the relay never published slot 0"; exit 1; }
-          grep -q 'row_pitch=2560 slice_pitch=921600 bytes=2764800' relay-selftest.txt || {
-            echo "::error::the published geometry is not the derived one"; exit 1; }
+          # The four published slots, each with ITS OWN geometry. The relay
+          # publishes what the caller gave it per slot, so the numbers are not
+          # one repeated set any more: this test's frame is colour and depth at
+          # the requested extent (4 bpp) and motion vectors at HALF it with the
+          # game's fmt=10, which is EIGHT bytes per pixel.
+          #   colour/depth 640x360 4bpp -> row_bytes 2560, row_pitch 2560
+          #   motion       320x180 8bpp -> row_bytes 2560, row_pitch 2560
+          #     slice_pitch = 2560 * 180 = 460800, bytes = 460800 * 3 = 1382400
+          # If the module had published one geometry four times, the motion line
+          # would read 640x360 and this step would fail.
+          grep -q 'slot 2 MOTION_VECTORS  published 320x180' relay-selftest.txt || {
+            echo "::error::the relay did not publish the motion-vector slot at its own geometry"
+            exit 1; }
+          grep -q 'slot 2 MOTION_VECTORS  published 320x180 row_pitch=2560 slice_pitch=460800 bytes=1382400' \
+            relay-selftest.txt || {
+            echo "::error::the motion-vector slot's own pitches are not the derived ones"; exit 1; }
+          grep -q 'slot 0 COLOR           published 640x360 row_pitch=2560 slice_pitch=921600 bytes=2764800' \
+            relay-selftest.txt || {
+            echo "::error::the colour slot's own pitches are not the derived ones"; exit 1; }
           grep -q 'available() = yes' relay-selftest.txt || {
             echo "::error::the relay did not find the worker where it resolves it"; exit 1; }
+
+          # THE GEOMETRY CONTRACT. Each of these is a mismatch that is otherwise
+          # a well-formed frame, and each must be a REFUSAL naming the slot - not
+          # a clamp, not a warning. Without them the worker would read a
+          # motion-vector buffer as if it were colour-shaped and still answer
+          # hr == 0 with a changed output, so every honesty rule would pass on a
+          # truncated frame.
+          grep -q 'geometry  = refused' relay-selftest.txt || {
+            echo "::error::a frame whose row count is not its slot's was not refused"; exit 1; }
+          grep -q 'rowbytes  = refused' relay-selftest.txt || {
+            echo "::error::a row length that is not the format's bytes-per-pixel times the width "
+            echo "::error::was not refused"; exit 1; }
+          grep -q 'stride    = refused' relay-selftest.txt || {
+            echo "::error::a stride shorter than a row was not refused"; exit 1; }
+          grep -q 'the correct-geometry frame was refused by the SESSION guard' relay-selftest.txt || {
+            echo "::error::the same frame at the published numbers was not accepted by the "
+            echo "::error::geometry contract"; exit 1; }
 
           # THE HONESTY GATE, on the module's own output. It must carry the exact
           # fixed line, with the worker's value, and it must not claim Success.
@@ -781,23 +818,32 @@ jobs:
           # And the WORKER's own log, after it exited: the CONFIG metadata the
           # relay sent, read back out of the peer. The mapping names are derived
           # from the pipe, so their presence is evidence the messages arrived and
-          # named the same sections this side published.
+          # named the same sections this side published - and the two different
+          # geometries below are evidence that each slot carried its OWN numbers
+          # rather than one repeated set.
           WLOG=context-nr-worker-ci-relay.log
           test -f "$WLOG" || { echo "::error::the worker wrote no log"; exit 1; }
           grep -q 'WORKER_READY' "$WLOG" || { echo "::error::no WORKER_READY"; exit 1; }
           grep -q 'reserved18=-1' "$WLOG" || {
             echo "::error::the protocol-only worker did not report reserved18=-1"; exit 1; }
           for S in 'CONFIG COLOR' 'CONFIG DEPTH' 'CONFIG MOTION_VECTORS' 'CONFIG OUTPUT' \
-                   'MGPU_NR_CI_RELAY' '640x360' 'row_pitch=2560'; do
+                   'MGPU_NR_CI_RELAY'; do
             grep -q -- "$S" "$WLOG" || {
               echo "::error::the worker's log never shows '$S' - the relay's CONFIG did not arrive"
               exit 1; }
           done
+          # The motion-vector slot at 320x180 with the format that is 8 bytes per
+          # pixel, and the colour slot at 640x360: two different geometries in one
+          # session, which a single published geometry could not produce.
+          grep -q 'CONFIG MOTION_VECTORS: 320x180 format=10' "$WLOG" || {
+            echo "::error::the worker did not receive the motion-vector slot's own geometry"; exit 1; }
+          grep -q 'CONFIG COLOR: 640x360 format=28' "$WLOG" || {
+            echo "::error::the worker did not receive the colour slot's own geometry"; exit 1; }
           if grep -a 'Reserved18' "$WLOG" | grep -q 'Success'; then
             echo "::error::the WORKER's log claims Reserved18 Success in protocol-only mode"
             exit 1
           fi
-          echo "relay module ok: launched, handshaked, four slots published, honesty rule held."
+          echo "relay module ok: launched, handshaked, per-slot geometry published, honesty held."
 
       - name: The benchmark refuses to invent an adapter
         shell: bash
@@ -861,9 +907,14 @@ jobs:
             echo "nr_relay_selftest.exe   the ADD-ON's relay module (src/nr_relay.cpp)"
             echo "                        built GPU-free and driven against a real"
             echo "                        --protocol-only worker. It proves the module"
-            echo "                        launches, handshakes, publishes the four"
-            echo "                        mappings, and reports the worker's reserved18"
-            echo "                        == -1 WITHOUT calling it a success."
+            echo "                        launches, handshakes, publishes EACH slot at"
+            echo "                        its OWN geometry and format, and reports the"
+            echo "                        worker's reserved18 == -1 WITHOUT calling it a"
+            echo "                        success. It also proves the geometry contract:"
+            echo "                        a frame whose row count, row length or stride"
+            echo "                        does not match its slot is REFUSED, because a"
+            echo "                        truncated frame would otherwise still come"
+            echo "                        back hr == 0 with a changed output."
             echo "nr_transport_bench.exe  the two-GPU cross-adapter round trip. It"
             echo "                        loads no NGX and no NVAPI, on purpose."
             echo

@@ -272,6 +272,12 @@ namespace mgpu::relay
             wire::InputSlot which = wire::InputSlot::COLOR;
             std::string    name;              // the mapping name, narrow
             std::wstring   wname;             // the same, wide
+            //: THIS SLOT's published geometry, format and derived pitches. Kept
+            //: so submit() can check a frame against the slot it is handing it
+            //: to; the four slots do not share any of these numbers.
+            unsigned       width = 0u;
+            unsigned       height = 0u;
+            unsigned       row_bytes = 0u;    // bpp * width, the LOGICAL row
             unsigned       dxgi_format = 0u;
             unsigned       bpp = 0u;
             unsigned       row_pitch = 0u;
@@ -396,14 +402,38 @@ namespace mgpu::relay
             return (double)GetTickCount64();
         }
 
+        //: Bytes per pixel for the formats the lane actually carries. The set is
+        //: the worker's own table (tools/nr_worker/nr_worker.cpp,
+        //: test_bytes_per_pixel) rather than a guess, because the worker refuses
+        //: a CONFIG whose format has no known bytes per pixel and the two sides
+        //: must therefore agree about which formats are usable. 10 is in here
+        //: and 34 is too: Cyberpunk's motion vectors are fmt=10
+        //: (R16G16B16A16_FLOAT, EIGHT bytes per pixel), while the proven control
+        //: lane's are fmt=34 (R16G16_FLOAT, four). Publishing one pitch for both
+        //: would halve the rows the worker reads.
         unsigned bpp_of(unsigned dxgi_format)
         {
             switch (dxgi_format)
             {
-            case 28u: return 4u;   // DXGI_FORMAT_R8G8B8A8_UNORM   - COLOR and OUTPUT
-            case 40u: return 4u;   // DXGI_FORMAT_D32_FLOAT         - DEPTH
-            case 34u: return 4u;   // DXGI_FORMAT_R16G16_FLOAT      - MOTION_VECTORS
+            case 28u: return 4u;   // DXGI_FORMAT_R8G8B8A8_UNORM     - COLOR and OUTPUT
+            case 40u: return 4u;   // DXGI_FORMAT_D32_FLOAT           - DEPTH
+            case 41u: return 4u;   // DXGI_FORMAT_R32_FLOAT           - DEPTH, the game's
+            case 34u: return 4u;   // DXGI_FORMAT_R16G16_FLOAT        - MOTION_VECTORS
+            case 10u: return 8u;   // DXGI_FORMAT_R16G16B16A16_FLOAT  - MOTION_VECTORS, the game's
             default:  return 0u;
+            }
+        }
+
+        //: The published slot descriptor for an index, in InputSlot order.
+        const SlotConfig *config_slot(const Config &cfg, unsigned i)
+        {
+            switch (i)
+            {
+            case 0u: return &cfg.slots.color;
+            case 1u: return &cfg.slots.depth;
+            case 2u: return &cfg.slots.motion_vectors;
+            case 3u: return &cfg.slots.output;
+            default: return nullptr;
             }
         }
 
@@ -711,11 +741,31 @@ namespace mgpu::relay
                           unsigned h, unsigned dxgi_format, std::string &err)
         {
             s.which = which;
+            // THE PUBLISHED NUMBERS ARE KEPT, per slot, because submit() checks
+            // every frame against them. One geometry for all four slots is what
+            // would let a 1920x1080 motion-vector buffer be read as if it were
+            // 3840x2160 and still come back hr == 0 with a changed output.
+            s.width = w;
+            s.height = h;
             s.dxgi_format = dxgi_format;
             s.bpp = bpp_of(dxgi_format);
-            if (s.bpp == 0u) { err = "no bytes-per-pixel for a slot format"; return false; }
+            if (s.bpp == 0u)
+            {
+                char b[160];
+                std::snprintf(b, sizeof b,
+                              "format %u has no bytes-per-pixel in this build, so its pitch "
+                              "cannot be derived", dxgi_format);
+                err = b;
+                return false;
+            }
+            if (w == 0u || h == 0u)
+            {
+                err = "a slot was published with width 0 or height 0";
+                return false;
+            }
 
-            s.row_pitch = (unsigned)((((unsigned long long)w * s.bpp) + 255ull) & ~255ull);
+            s.row_bytes = w * s.bpp;
+            s.row_pitch = (unsigned)((((unsigned long long)s.row_bytes) + 255ull) & ~255ull);
             s.slice_pitch = s.row_pitch * h;
             s.bytes = (unsigned long long)s.slice_pitch * (unsigned long long)wire::FRAME_SLOT_COUNT;
             s.name = mapping_name_for(pipe, slot_name(which));
@@ -748,13 +798,17 @@ namespace mgpu::relay
             return true;
         }
 
-        bool send_config(const Slot &s, const Config &cfg, std::string &err)
+        //: CONFIG carries THIS SLOT's geometry, format and both pitches. That is
+        //: the whole reason the protocol has them per message rather than once
+        //: per session, and the worker stores them per slot and reads each
+        //: frame out of the slot it names.
+        bool send_config(const Slot &s, std::string &err)
         {
             wire::Config c;
             wire::init(c, wire::Kind::CONFIG, 0u);
             c.input_slot = (std::uint32_t)s.which;
-            c.width = cfg.width;
-            c.height = cfg.height;
+            c.width = s.width;
+            c.height = s.height;
             c.dxgi_format = s.dxgi_format;
             c.row_pitch = s.row_pitch;
             c.slice_pitch = s.slice_pitch;
@@ -765,6 +819,11 @@ namespace mgpu::relay
             return write_msg(c, 4000u, err);
         }
     }   // namespace
+
+    const SlotConfig *slot_config(const Config &cfg, unsigned slot_index)
+    {
+        return config_slot(cfg, slot_index);
+    }
 
     // ================================================================ honesty
 
@@ -911,11 +970,20 @@ namespace mgpu::relay
         g.last_error.clear();
         g.evidence.clear();
 
-        if (cfg.width == 0u || cfg.height == 0u)
+        // EVERY slot's geometry is the caller's, so every slot's is checked.
+        // There is no "the" geometry any more: a frame's colour and its motion
+        // vectors are different sizes, and each is published from its own
+        // numbers in the loop below.
+        for (unsigned i = 0u; i < 4u; ++i)
         {
-            why = "width and height must both be non-zero";
-            g.last_error = why;
-            return Status::BAD_CONFIG;
+            const SlotConfig *sc = config_slot(cfg, i);
+            if (sc == nullptr || sc->width == 0u || sc->height == 0u || sc->dxgi_format == 0u)
+            {
+                why = "every one of the four slots needs a non-zero width, height and format; "
+                      "the relay publishes what it is given and refuses what it cannot carry";
+                g.last_error = why;
+                return Status::BAD_CONFIG;
+            }
         }
         const std::wstring dir = effective_module_dir(cfg.module_dir);
         if (dir.empty())
@@ -1112,8 +1180,9 @@ namespace mgpu::relay
         log_line(0, "[MGPU][RELAY] worker name=\"%s\" worker_pid=%lu client_pid=%lu",
                  ready.worker_name, (unsigned long)g.pi.dwProcessId,
                  (unsigned long)GetCurrentProcessId());
-        log_line(0, "[MGPU][RELAY] geometry=%ux%u frame_slots=%u pitch_align=256",
-                 cfg.width, cfg.height, (unsigned)wire::FRAME_SLOT_COUNT);
+        log_line(0, "[MGPU][RELAY] frame_slots=%u pitch_align=256 "
+                    "geometry per slot is logged once, below",
+                 (unsigned)wire::FRAME_SLOT_COUNT);
 
         // ---- the four slots, and the four CONFIG messages ------------------
         // PUBLISHED EVEN WHEN reserved18 IS NOT A SESSION. The worker has
@@ -1122,18 +1191,42 @@ namespace mgpu::relay
         // four names, the geometry, the pitches - with no GPU at all, which is
         // what the CI selftest is. Nothing is submitted to a worker that has no
         // session: submit() refuses.
+        //
+        // EACH SLOT IS PUBLISHED FROM ITS OWN NUMBERS. There is no shared
+        // geometry here on purpose: the lane's colour is 3840x2160 fmt=28 while
+        // its motion vectors are 1920x1080 fmt=10 in the same frame, and a
+        // single published geometry would make the worker read the wrong number
+        // of rows and still answer hr == 0.
         {
-            struct Spec { wire::InputSlot which; unsigned fmt; };
-            const Spec spec[4] = {
-                { wire::InputSlot::COLOR,          28u },   // R8G8B8A8_UNORM
-                { wire::InputSlot::DEPTH,          40u },   // D32_FLOAT
-                { wire::InputSlot::MOTION_VECTORS, 34u },   // R16G16_FLOAT
-                { wire::InputSlot::OUTPUT,         28u },   // R8G8B8A8_UNORM
-            };
+            const wire::InputSlot order[4] = { wire::InputSlot::COLOR, wire::InputSlot::DEPTH,
+                                               wire::InputSlot::MOTION_VECTORS,
+                                               wire::InputSlot::OUTPUT };
             for (unsigned i = 0u; i < 4u; ++i)
             {
-                Slot &s = g.slots[(unsigned)spec[i].which];
-                if (!slot_publish(s, spec[i].which, g.pipe, cfg.width, cfg.height, spec[i].fmt,
+                const SlotConfig *sc = config_slot(cfg, i);
+                if (sc == nullptr)
+                {
+                    why = "an input slot has no configuration";
+                    g.last_error = why;
+                    shutdown();
+                    return Status::BAD_CONFIG;
+                }
+                if (sc->width == 0u || sc->height == 0u || sc->dxgi_format == 0u)
+                {
+                    char b[192];
+                    std::snprintf(b, sizeof b,
+                                  "the %s slot has no usable geometry or format "
+                                  "(width=%u height=%u fmt=%u)",
+                                  slot_name(order[i]), sc->width, sc->height, sc->dxgi_format);
+                    why = b;
+                    g.last_error = why;
+                    log_line(2, "[MGPU][RELAY] %s", why.c_str());
+                    shutdown();
+                    return Status::BAD_CONFIG;
+                }
+
+                Slot &s = g.slots[(unsigned)order[i]];
+                if (!slot_publish(s, order[i], g.pipe, sc->width, sc->height, sc->dxgi_format,
                                   why))
                 {
                     g.last_error = why;
@@ -1141,16 +1234,18 @@ namespace mgpu::relay
                     shutdown();
                     return Status::SLOT_FAILED;
                 }
-                log_line(0, "[MGPU][RELAY] slot %-14s %s %ux%u fmt=%u row_pitch=%u "
-                            "slice_pitch=%u bytes=%llu",
-                         slot_name(spec[i].which), s.name.c_str(), cfg.width, cfg.height,
-                         s.dxgi_format, s.row_pitch, s.slice_pitch,
+                // ONE LINE PER SLOT, AT START. A rig log then shows what each
+                // slot actually carries - which is the fact a truncated-frame
+                // report would otherwise have to be reconstructed from.
+                log_line(0, "[MGPU][RELAY] slot %-14s %s %ux%u fmt=%u bpp=%u row_bytes=%u "
+                            "row_pitch=%u slice_pitch=%u bytes=%llu",
+                         slot_name(order[i]), s.name.c_str(), s.width, s.height, s.dxgi_format,
+                         s.bpp, s.row_bytes, s.row_pitch, s.slice_pitch,
                          (unsigned long long)s.bytes);
-                if (!send_config(s, cfg, why))
+                if (!send_config(s, why))
                 {
                     g.last_error = why;
-                    log_line(2, "[MGPU][RELAY] CONFIG %s: %s", slot_name(spec[i].which),
-                             why.c_str());
+                    log_line(2, "[MGPU][RELAY] CONFIG %s: %s", slot_name(order[i]), why.c_str());
                     shutdown();
                     return Status::SLOT_FAILED;
                 }
@@ -1236,8 +1331,9 @@ namespace mgpu::relay
         if (slot_index >= (unsigned)wire::InputSlot::COUNT) return false;
         const Slot &s = g.slots[slot_index];
         if (!s.published) return false;
-        out.width = g.cfg.width;
-        out.height = g.cfg.height;
+        // THIS slot's numbers, not a session-wide geometry: the four differ.
+        out.width = s.width;
+        out.height = s.height;
         out.dxgi_format = s.dxgi_format;
         out.row_pitch = s.row_pitch;
         out.slice_pitch = s.slice_pitch;
@@ -1259,9 +1355,16 @@ namespace mgpu::relay
             return false;
         }
         if (frame.color == nullptr || frame.depth == nullptr ||
-            frame.motion_vectors == nullptr || frame.out == nullptr)
+            frame.motion_vectors == nullptr)
         {
-            why = "a frame pointer is null";
+            why = "a frame input pointer is null";
+            g.last_error = why;
+            return false;
+        }
+        if (frame.height == 0u)
+        {
+            why = "the frame declares 0 rows; the worker would read one row of the slot's data "
+                  "and answer about a frame that was never there";
             g.last_error = why;
             return false;
         }
@@ -1297,6 +1400,70 @@ namespace mgpu::relay
         const wire::InputSlot classes[3] = { wire::InputSlot::COLOR, wire::InputSlot::DEPTH,
                                              wire::InputSlot::MOTION_VECTORS };
 
+        // ---- THE GEOMETRY CONTRACT, CHECKED PER SLOT ----------------------
+        //
+        // THIS IS THE CHECK THAT MAKES "hr == 0" MEAN SOMETHING. A frame whose
+        // motion vectors are 1920x1080 handed to a slot published at 3840x2160
+        // would otherwise be read by the worker as the top half of the wrong
+        // buffer, evaluated, and returned with hr == 0 and a changed OUTPUT -
+        // every rule this module has would pass on a frame that was never fully
+        // used. So: the row count must be the slot's, the row LENGTH must be
+        // exactly the slot's (bpp * width, not merely something that fits under
+        // the pitch), and the stride must not be shorter than the row. Three
+        // separate refusals, each naming the slot and both geometries, and each
+        // a returned failure rather than a clamp.
+        for (unsigned i = 0u; i < 3u; ++i)
+        {
+            const Slot &s = g.slots[(unsigned)classes[i]];
+            const Input &in = inputs[i];
+            if (!s.published || s.view == nullptr)
+            {
+                char b[160];
+                std::snprintf(b, sizeof b, "the %s slot was never published",
+                              slot_name(classes[i]));
+                why = b;
+                g.last_error = why;
+                return false;
+            }
+            if (frame.height != s.height)
+            {
+                char b[256];
+                std::snprintf(b, sizeof b,
+                              "the frame has %u rows and the %s slot was published with %u; the "
+                              "worker takes its row count from the slot's own height, so this "
+                              "frame would be truncated or over-read. The relay does not "
+                              "resample or crop - reduce the frame to the published size first.",
+                              frame.height, slot_name(classes[i]), s.height);
+                why = b;
+                g.last_error = why;
+                return false;
+            }
+            if (in.row_bytes != s.row_bytes)
+            {
+                char b[288];
+                std::snprintf(b, sizeof b,
+                              "the %s rows are %u bytes and the slot was published at %u bytes "
+                              "(%ux%u fmt=%u, %u bytes per pixel); this is not the geometry the "
+                              "slot was configured for",
+                              slot_name(classes[i]), in.row_bytes, s.row_bytes, s.width, s.height,
+                              s.dxgi_format, s.bpp);
+                why = b;
+                g.last_error = why;
+                return false;
+            }
+            if (in.stride < in.row_bytes)
+            {
+                char b[256];
+                std::snprintf(b, sizeof b,
+                              "the %s stride is %u bytes and a row is %u; the relay would read "
+                              "past the end of each row",
+                              slot_name(classes[i]), in.stride, in.row_bytes);
+                why = b;
+                g.last_error = why;
+                return false;
+            }
+        }
+
         // The frame slot is chosen by the relay: the worker releases a slot as
         // soon as it answers FRAME_COMPLETE, and this client is strictly
         // request/response, so a three-deep ring in submit order can never
@@ -1307,26 +1474,9 @@ namespace mgpu::relay
         {
             const Slot &s = g.slots[(unsigned)classes[i]];
             const Input &in = inputs[i];
-            if (!s.published || s.view == nullptr)
-            {
-                why = "an input slot was never published";
-                g.last_error = why;
-                return false;
-            }
-            if (in.row_bytes > s.row_pitch)
-            {
-                char b[224];
-                std::snprintf(b, sizeof b,
-                              "the %s rows are %u bytes and the slot's row pitch is %u; the "
-                              "worker would read past the row",
-                              slot_name(classes[i]), in.row_bytes, s.row_pitch);
-                why = b;
-                g.last_error = why;
-                return false;
-            }
             const unsigned char *src = (const unsigned char *)in.src;
             unsigned char *dst = s.view + (std::size_t)slot * s.slice_pitch;
-            for (unsigned y = 0u; y < g.cfg.height; ++y)
+            for (unsigned y = 0u; y < s.height; ++y)
             {
                 std::memcpy(dst + (std::size_t)y * s.row_pitch,
                             src + (std::size_t)y * in.stride, in.row_bytes);
@@ -1368,8 +1518,11 @@ namespace mgpu::relay
             const Slot &c = g.slots[(unsigned)wire::InputSlot::COLOR];
             sub.slot = slot;
             sub.input_mask = 0x7u;   // COLOR | DEPTH | MOTION_VECTORS; OUTPUT is the result
-            sub.width = g.cfg.width;
-            sub.height = g.cfg.height;
+            // The COLOUR slot's numbers, which is what the worker records on the
+            // ring for this frame. The per-class numbers it actually reads with
+            // come from each slot's own CONFIG, which is why they can differ.
+            sub.width = c.width;
+            sub.height = c.height;
             sub.dxgi_format = c.dxgi_format;
             sub.row_pitch = c.row_pitch;
             sub.slice_pitch = c.slice_pitch;

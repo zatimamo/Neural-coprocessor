@@ -399,12 +399,14 @@ jobs:
           done
 
           # The MAPPING SIZE ARITHMETIC, which the worker validates on
-          # OpenFileMappingW: row_pitch = align_up(width * bpp, 256),
-          # slice_pitch = row_pitch * height, and the mapping is sized for ALL
-          # FRAME_SLOT_COUNT slots. A slip here is refused by the worker on the
-          # rig, so it is pinned here.
-          grep -qE 's\.row_pitch = \(unsigned\)\(\(\(\(unsigned long long\)w \* s\.bpp\) \+ 255ull\) & ~255ull\);' "$R" || {
-            echo "::error::the relay's row_pitch is not align_up(width * bpp, 256)"; exit 1; }
+          # OpenFileMappingW: row_bytes = width * bpp, row_pitch =
+          # align_up(row_bytes, 256), slice_pitch = row_pitch * height, and the
+          # mapping is sized for ALL FRAME_SLOT_COUNT slots. A slip here is
+          # refused by the worker on the rig, so it is pinned here.
+          grep -qE 's\.row_bytes = w \* s\.bpp;' "$R" || {
+            echo "::error::the relay's row_bytes is not width * bytes-per-pixel"; exit 1; }
+          grep -qE 's\.row_pitch = \(unsigned\)\(\(\(\(unsigned long long\)s\.row_bytes\) \+ 255ull\) & ~255ull\);' "$R" || {
+            echo "::error::the relay's row_pitch is not align_up(row_bytes, 256)"; exit 1; }
           grep -qE 's\.slice_pitch = s\.row_pitch \* h;' "$R" || {
             echo "::error::the relay's slice_pitch is not row_pitch * height"; exit 1; }
           grep -qE 's\.bytes = \(unsigned long long\)s\.slice_pitch \* \(unsigned long long\)wire::FRAME_SLOT_COUNT;' "$R" || {
@@ -413,6 +415,139 @@ jobs:
             echo "::error::CONFIG does not carry frame_slots"; exit 1; }
 
           echo "wire layout verified: every constant, size, offset and pitch rule matches."
+
+      # ---------------------------------------------------------------------
+      # 3b. THE GEOMETRY CONTRACT IS PER SLOT, AND submit() REFUSES A MISMATCH.
+      #
+      #     This is the gate for the defect that would have made every other
+      #     honesty rule meaningless. The lane's real frame is colour 3840x2160
+      #     fmt=28 with motion vectors 1920x1080 fmt=10 in the SAME frame. A
+      #     relay with one geometry for all four slots would tell the worker to
+      #     read the top `height` rows of a taller buffer and the result would
+      #     still come back hr == 0 with a changed OUTPUT - a PASS on a truncated
+      #     frame. So: the contract is per slot, CONFIG carries it per slot, and
+      #     submit() compares the frame against the slot it is handed to.
+      # ---------------------------------------------------------------------
+      - name: The geometry contract is per slot and a mismatch is refused
+        shell: bash
+        run: |
+          R=src/nr_relay.cpp
+          H=src/nr_relay.hpp
+
+          # (a) The contract is per slot in the API, not one geometry in Config.
+          grep -q 'struct SlotConfig' "$H" || {
+            echo "::error::there is no per-slot descriptor in the relay's API"; exit 1; }
+          grep -q 'SlotSet slots' "$H" || {
+            echo "::error::Config does not carry a set of per-slot descriptors"; exit 1; }
+          # THE Config BODY ITSELF, extracted by brace depth from its opening
+          # brace, because a whole-file grep cannot tell "Config has no width"
+          # from "no struct here has a width" - and SlotConfig and the relay's
+          # own slot record both legitimately have one.
+          awk '
+            /struct Config$/ { in_cfg = 1 }
+            in_cfg {
+              line = $0
+              print line
+              o = gsub(/\{/, "{", line)
+              c = gsub(/\}/, "}", line)
+              if (o > 0) started = 1
+              depth += o - c
+              if (started && depth <= 0) exit
+            }
+          ' "$H" > /tmp/nr_relay_config_body.txt
+          test -s /tmp/nr_relay_config_body.txt || {
+            echo "::error::could not extract the Config body from $H"; exit 1; }
+          H_OLD=$(grep -nE '^[[:space:]]*unsigned (width|height)[[:space:]]*=' \
+                    /tmp/nr_relay_config_body.txt || true)
+          [ -z "$H_OLD" ] || {
+            echo "$H_OLD"
+            echo "::error::Config still carries ONE geometry for all four slots"; exit 1; }
+          grep -q 'SlotSet slots' /tmp/nr_relay_config_body.txt || {
+            echo "::error::the SlotSet is not inside Config"; exit 1; }
+          # All four descriptors are initialised, so a caller cannot forget one.
+          N=$(grep -cE '^[[:space:]]*\{ [0-9]+u, [0-9]+u, [0-9]+u \},' \
+                /tmp/nr_relay_config_body.txt || true)
+          [ "$N" -eq 4 ] || {
+            echo "::error::Config initialises $N of the four slots, expected 4"; exit 1; }
+          echo "--- the four default slot descriptors ---"
+          grep -E '^[[:space:]]*\{ [0-9]+u, [0-9]+u, [0-9]+u \},' /tmp/nr_relay_config_body.txt
+          # Four named descriptors, addressed by a lookup that cannot go wrong.
+          grep -q 'const SlotConfig \*slot_config(const Config &cfg, unsigned slot_index);' "$H" || {
+            echo "::error::there is no slot_config() accessor"; exit 1; }
+          # And the module never takes Config BY VALUE, so it cannot be copying a
+          # session-wide geometry around: every use is a reference or a pointer.
+          BYVAL=$(grep -nE 'Config[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[,)]' "$R" || true)
+          [ -z "$BYVAL" ] || {
+            echo "$BYVAL"
+            echo "::error::the relay takes Config by value somewhere"; exit 1; }
+
+          # (b) Each slot is published and configured from ITS OWN numbers.
+          grep -q 'c.width = s.width;' "$R" || {
+            echo "::error::CONFIG does not carry the slot's own width"; exit 1; }
+          grep -q 'c.height = s.height;' "$R" || {
+            echo "::error::CONFIG does not carry the slot's own height"; exit 1; }
+          grep -q 'c.dxgi_format = s.dxgi_format;' "$R" || {
+            echo "::error::CONFIG does not carry the slot's own format"; exit 1; }
+          grep -q 'slot_publish(s, order\[i\], g.pipe, sc->width, sc->height, sc->dxgi_format,' "$R" || {
+            echo "::error::slot_publish is not called with the per-slot geometry"; exit 1; }
+          # And the published numbers are KEPT, because submit() checks against
+          # them rather than against a session-wide value. The relay's own Slot
+          # record carries them, and SlotInfo reports them.
+          grep -qE 'unsigned[[:space:]]+width[[:space:]]*=[[:space:]]*0u;' "$H" || {
+            echo "::error::the per-slot descriptor does not carry a width"; exit 1; }
+          grep -q 's.width = w;' "$R" || {
+            echo "::error::the Slot record does not keep the published width"; exit 1; }
+          grep -q 's.height = h;' "$R" || {
+            echo "::error::the Slot record does not keep the published height"; exit 1; }
+          grep -q 'out.width = s.width;' "$R" || {
+            echo "::error::SlotInfo does not report the slot's own width"; exit 1; }
+
+          # (c) submit() checks the ROW COUNT, the ROW LENGTH and the STRIDE,
+          #     each per slot, and each as a returned refusal that names the slot.
+          for S in 'if (frame.height != s.height)' 'if (in.row_bytes != s.row_bytes)' \
+                   'if (in.stride < in.row_bytes)'; do
+            grep -qF "$S" "$R" || {
+              echo "::error::submit() does not perform [$S]"; exit 1; }
+          done
+          # A row count that does not fit is not clamped: the loop that copies
+          # rows runs to the SLOT's height and nothing adjusts it.
+          grep -q 'for (unsigned y = 0u; y < s.height; ++y)' "$R" || {
+            echo "::error::the row copy does not count rows from the slot's own height"; exit 1; }
+          # The refusals quote both geometries and name the slot.
+          grep -q 'the frame has %u rows and the %s slot was published with %u' "$R" || {
+            echo "::error::the row-count refusal does not quote both geometries"; exit 1; }
+          grep -q '%u bytes per pixel' "$R" || {
+            echo "::error::the row-length refusal does not explain bytes per pixel"; exit 1; }
+          grep -q 'the %s stride is %u bytes and a row is %u' "$R" || {
+            echo "::error::the stride refusal does not quote both numbers"; exit 1; }
+
+          # (d) And the test that exercises it: the mismatch must be REFUSED and
+          #     the same frame at the published numbers must get past.
+          T=tools/nr_worker/nr_relay_selftest.cpp
+          test -f "$T" || { echo "::error::missing $T"; exit 1; }
+          grep -q 'submit() REFUSES a frame whose row count is not the slot' "$T" || {
+            echo "::error::the selftest does not assert the row-count refusal"; exit 1; }
+          grep -q 'submit() REFUSES a row length that is not the format' "$T" || {
+            echo "::error::the selftest does not assert the row-length refusal"; exit 1; }
+          grep -q 'submit() REFUSES a stride shorter than a row' "$T" || {
+            echo "::error::the selftest does not assert the stride refusal"; exit 1; }
+          grep -q 'refused by the SESSION guard, not the geometry' "$T" || {
+            echo "::error::the selftest does not assert that the correct geometry gets past"
+            exit 1; }
+          # The test must publish DIFFERENT geometries per slot, or those
+          # refusals would be untested assertions.
+          grep -q 'cfg.slots.motion_vectors = { mv_width, mv_height, 10u }' "$T" || {
+            echo "::error::the selftest publishes the same geometry for every slot"; exit 1; }
+
+          # (e) AND THE CALLER OWNS THE REDUCTION TO R. The relay never resamples,
+          #     and the header has to say so, because the implication runs the
+          #     other way otherwise.
+          grep -q 'THE RELAY DOES NOT RESAMPLE' "$H" || {
+            echo "::error::the header does not state that the relay never resamples"; exit 1; }
+          grep -q 'NEURAL SIZE R' "$H" || {
+            echo "::error::the header does not name the neural size R"; exit 1; }
+
+          echo "geometry verified: per-slot contract, per-slot CONFIG, three refusals, tested."
 
       # ---------------------------------------------------------------------
       # 4. Structural substitutes for a compiler. The relay is the one file
@@ -588,37 +723,77 @@ jobs:
           echo "Output verified: $ADDON"
 
       # ---------------------------------------------------------------------
-      # 5. THE HONEST DESIGN IS IN THE BINARY THAT SHIPS. The source gates above
-      #    are about the source; these are about the artifact.
+      # 5. THE HONEST DESIGN, AND WHETHER IT IS EVEN VISIBLE IN THE ARTIFACT.
+      #
+      #    TWO STATES, AND THE GATE SAYS WHICH ONE IT IS IN rather than assuming.
+      #
+      #    NO CALLER YET (today). Nothing calls the relay, so the Release linker
+      #    is entitled to drop the module's unreferenced COMDATs - and with them
+      #    the string literals only those functions referenced. A string search in
+      #    the DLL therefore CANNOT tell "compiled in and linked away" from
+      #    "never compiled", and asserting it would be a gate that passes for the
+      #    wrong reason or fails for one. What is checked instead is that the
+      #    translation unit really was compiled in this configuration: its object
+      #    file exists in the build tree.
+      #
+      #    A CALLER EXISTS (the frame-pipeline phase). Then the module is
+      #    referenced, its strings survive into the binary, and the string checks
+      #    become meaningful - so they tighten automatically, from the same
+      #    workflow, the moment a caller appears.
+      #
+      #    NOT "FIXED" BY MAKING THE ADD-ON REFERENCE THE MODULE ARTIFICIALLY.
+      #    A fake reference to keep a gate green would be worse than the green.
       # ---------------------------------------------------------------------
-      - name: Verify the relay is in the binary
+      - name: Verify the relay is in the build, and in the binary once it is called
         shell: bash
         run: |
-          # The strings the relay always carries, whatever the run does.
-          for S in '[MGPU][RELAY]' 'CreateFeature(Reserved18) result=' 'MGPU_NR_' 'Reserved18' \
-                   'nvngx.dll_mgpu_nr_worker.exe' 'mgpu\nvngx_dlssnr.dll' 'not-a-session' ; do
-            if ! grep -qa -- "$S" "$ADDON_PATH"; then
-              echo "::error::'$S' is not present in $ADDON_PATH - the relay was compiled out"
-              exit 1
-            fi
-          done
-
-          # The pipe-name prefix, as the protocol defines it: the relay builds
-          # \\.\pipe\MGPU_NR_<pid>. The format string is the evidence, because the
-          # pid is only known at run time.
-          if ! grep -qa 'pipe\\MGPU_NR_' "$ADDON_PATH"; then
-            echo "::error::the pipe-name prefix is not in the binary"
+          OBJ=$(find build -type f \( -name 'nr_relay.obj' -o -name 'nr_relay.cpp.obj' \) | head -n1)
+          [ -n "$OBJ" ] || {
+            echo "::error::no nr_relay object in the build tree: the module was NOT compiled,"
+            echo "::error::whatever the option said"
+            find build -name '*.obj' -type f | head -20 || true
             exit 1
-          fi
+          }
+          echo "the module was compiled in this configuration: $OBJ"
 
-          # AND THE HONESTY SHAPE, in the shipped strip: the name the module
-          # gives the -1 answer must still be there. This is deliberately coarse;
-          # the precise check is the source gate above, because a gate over
-          # compiler output that tried to prove "only one Success" would be
-          # counting a word the runtime and the CRT also contain.
-          grep -qa 'not-a-session' "$ADDON_PATH" || {
-            echo "::error::the -1 answer is no longer named not-a-session in the binary"; exit 1; }
-          echo "relay strings present in the artifact."
+          # The strings the relay carries, whatever the run does. -F: these are
+          # FIXED strings. As a regex, "[MGPU][RELAY]" is a character class that
+          # matches any single one of those letters, so the check would pass on
+          # any binary at all and hide the question it is asking.
+          STRINGS='[MGPU][RELAY]|CreateFeature(Reserved18) result=|MGPU_NR_|Reserved18|nvngx.dll_mgpu_nr_worker.exe|mgpu\nvngx_dlssnr.dll|not-a-session'
+
+          # Is there a caller? Anything in src/ that is not the module itself and
+          # that names one of its entry points.
+          CALLERS=$(grep -rlE 'relay::(start|submit|available)\(' src 2>/dev/null \
+                    | grep -v '^src/nr_relay\.' | sort | tr '\n' ' ')
+          echo "callers of the relay in src/: [${CALLERS:-none}]"
+
+          if [ -z "$CALLERS" ]; then
+            echo "STATE: no caller yet, so the linker may legitimately have dropped the"
+            echo "module's unreferenced code and its string literals. A string check on"
+            echo "$ADDON_PATH would be meaningless here and is NOT performed."
+            echo "THE EVIDENCE FOR THIS PHASE IS: the object file above exists (the module"
+            echo "compiled), the four source gates above hold, and nr-worker.yml's"
+            echo "nr_relay_selftest links this same file with MGPU_NR_RELAY and drives it"
+            echo "against a real worker process."
+            echo "This gate tightens to the string checks below as soon as a caller appears."
+          else
+            echo "STATE: the relay IS called from [$CALLERS], so its strings must survive"
+            echo "into the artifact. Checking them with -F (fixed strings)."
+            IFS='|' read -ra WANT <<< "$STRINGS"
+            for S in "${WANT[@]}"; do
+              if ! grep -qaF -- "$S" "$ADDON_PATH"; then
+                echo "::error::'$S' is not present in $ADDON_PATH even though the relay is called"
+                exit 1
+              fi
+            done
+            # The pipe-name prefix: the relay builds \\.\pipe\MGPU_NR_<pid>, and
+            # the pid is only known at run time, so the format string is the
+            # evidence.
+            grep -qaF 'pipe\MGPU_NR_' "$ADDON_PATH" || {
+              echo "::error::the pipe-name prefix is not in the binary"; exit 1; }
+            echo "relay strings present in the artifact."
+          fi
 
       - name: Verify shipped presets are empty
         shell: bash
@@ -707,6 +882,18 @@ jobs:
             echo "  * the relay's reproduced v1 layout equals tools/nr_worker/nr_proto.h"
             echo "    constant for constant, size for size, offset for offset, and its"
             echo "    pitch arithmetic is pinned;"
+            echo "  * THE GEOMETRY CONTRACT IS PER SLOT, and submit() REFUSES a frame that"
+            echo "    does not match the slot it is handed to. This is the one that makes"
+            echo "    the rest mean anything: the lane's real frame is colour 3840x2160"
+            echo "    fmt=28 with motion vectors 1920x1080 fmt=10 in the SAME frame, and a"
+            echo "    relay that published one geometry four times would have the worker"
+            echo "    read the top rows of a taller buffer and still answer hr == 0 with a"
+            echo "    changed output - a PASS on a truncated frame. The refusals are the"
+            echo "    row count, the row length (bpp * width, not merely fits the pitch)"
+            echo "    and the stride, each naming the slot and both geometries;"
+            echo "  * the caller owns the reduction to R. The relay does NOT resample,"
+            echo "    crop or pad - the add-on's stream lane already produces its neural"
+            echo "    inputs at R, and the relay refuses anything that is not R;"
             echo "  * the strings above are present in the SHIPPED add-on."
             echo
             echo "WHAT THIS DOES NOT CLAIM: NOT A RIG RESULT. GitHub's runners have no"

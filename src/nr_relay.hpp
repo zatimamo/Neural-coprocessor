@@ -121,6 +121,46 @@ namespace mgpu::relay
         bool         pin_hash = true;
     };
 
+    //: THE PER-SLOT GEOMETRY AND FORMAT CONTRACT.
+    //:
+    //: WHY IT IS PER SLOT AND NOT ONE GEOMETRY FOR ALL FOUR. The four slots do
+    //: not share a size, a format or a pitch in a real frame, and that is not an
+    //: edge case - it is the measured shape of the lane. Cyberpunk's own log
+    //: shows, in the SAME frame:
+    //:     [P4.0] stream arm source=3840x2160 fmt=28 rowPitch=15360
+    //:     [R78]  MVEC ARM: mode=3 REAL, region 1920x1080 fmt=10 pitch=15360
+    //: colour at 3840x2160 fmt=28 (R8G8B8A8_UNORM), motion vectors at 1920x1080
+    //: fmt=10 (R16G16B16A16_FLOAT, 8 bytes per pixel), depth at fmt=41.
+    //:
+    //: A module that published ONE geometry four times would tell the worker to
+    //: read the top `height` rows of a taller buffer, and the evaluated result
+    //: would still come back hr == 0 with a changed OUTPUT - so EVERY honesty
+    //: rule this module has would pass on a truncated frame. That is the failure
+    //: this structure exists to make impossible: CONFIG already carries geometry
+    //: and format per slot, the worker already stores and uses them per slot, and
+    //: submit() refuses a frame whose numbers are not its slot's numbers.
+    struct SlotConfig
+    {
+        unsigned width = 0u;
+        unsigned height = 0u;
+        //: DXGI_FORMAT. The relay needs it only for its bytes per pixel, which
+        //: is what the pitch and the row-length check are derived from, so a
+        //: format whose bytes per pixel this build does not know is refused at
+        //: publish time rather than guessed at.
+        unsigned dxgi_format = 0u;
+    };
+
+    //: The four slots, named rather than an array: a caller cannot silently
+    //: leave one unset in a positional list, and slot_config() is then a lookup
+    //: instead of an index the caller had to keep in step.
+    struct SlotSet
+    {
+        SlotConfig color;
+        SlotConfig depth;
+        SlotConfig motion_vectors;
+        SlotConfig output;
+    };
+
     struct Config
     {
         //: The worker executable. Empty means <module dir>\mgpu\
@@ -150,10 +190,32 @@ namespace mgpu::relay
         //: \\.\pipe\MGPU_NR_<pid>. Empty means \\.\pipe\MGPU_NR_<worker pid>.
         std::wstring pipe_name;
 
-        //: The frame geometry. 640x360 is the proven control size; the pipeline
-        //: call site will pass the real resolution.
-        unsigned width  = 640u;
-        unsigned height = 360u;
+        //: THE NEURAL SIZE R, PER SLOT, AND WHAT R IS.
+        //:
+        //: The relay publishes each slot at these numbers and the caller is
+        //: responsible for having REDUCED a frame to them. The add-on's stream
+        //: lane already produces its three neural inputs at a reduced size:
+        //: stream_state::sr_color is "R, tone-mapped, NR input", sr_depth is
+        //: "R, point-reduced", and the motion vectors live at mvec_w x mvec_h.
+        //: R is the GAME'S OWN DECLARED RENDER EXTENT, not the display extent
+        //: (measured 1280x720 in one Cyberpunk run).
+        //:
+        //: THE RELAY DOES NOT RESAMPLE, CROP OR PAD ANYTHING, and must not be
+        //: read as if it did. It copies rows into a mapping and copies them back
+        //: out. A frame whose numbers are not the published numbers is REFUSED
+        //: with the slot named and both geometries quoted.
+        //:
+        //: WHY THE DEFAULTS ARE 640x360: that is the proven CONTROL geometry,
+        //: the one the worker's Reserved18 session is created at, and the one
+        //: the GPU-free selftest publishes so that test stays a two-line setup.
+        //: It is NOT a claim about what a real frame is - the rig geometry is
+        //: the caller's R, and these four lines are what it overwrites.
+        SlotSet slots = {
+            { 640u, 360u, 28u },   // COLOR          R8G8B8A8_UNORM
+            { 640u, 360u, 41u },   // DEPTH          R32_FLOAT
+            { 640u, 360u, 10u },   // MOTION_VECTORS R16G16B16A16_FLOAT
+            { 640u, 360u, 28u },   // OUTPUT         R8G8B8A8_UNORM
+        };
 
         //: true  -> the relay builds the worker's runtime flags from `runtime`
         //:          and launches a worker that runs the neural lane.
@@ -184,32 +246,49 @@ namespace mgpu::relay
         std::wstring worker_log_name = L"nr-worker-relay";
     };
 
-    //: One frame, as plain host memory. Every pointer is the START of the
-    //: frame's own data, never a base of a larger surface: the relay copies
-    //: `height` rows of `*_row_bytes` bytes from each input pointer using that
-    //: input's own stride, so a game-side readback buffer that has been
-    //: sub-rectangled is described correctly.
+    //: The slot descriptor for an InputSlot index (0..3), or null when the
+    //: index does not name one of the four.
+    const SlotConfig *slot_config(const Config &cfg, unsigned slot_index);
+
+    //: One frame, as plain host memory.
     //:
-    //: The strides are the HOST strides of each buffer and may differ from the
-    //: D3D12 pitches: a readback buffer's row pitch is D3D12-aligned (256), and
-    //: that is exactly what a caller should pass. `out` is where the worker's
-    //: result lands; it is not read.
+    //: EVERY INPUT CARRIES ITS OWN NUMBERS, because the four slots do not share
+    //: them (see SlotConfig). Each pointer is the START of that input's frame
+    //: data, never the base of a larger surface, and the relay copies
+    //: `height` rows of `*_row_bytes` bytes using that input's own stride - so a
+    //: sub-rectangled readback buffer is described correctly. Nothing is ever
+    //: scaled, cropped or padded: a mismatch against the published slot is a
+    //: returned failure.
+    //:
+    //: There is deliberately no output buffer here. The OUTPUT mapping is the
+    //: result and it lives in the relay; out_row_bytes and out_stride were in an
+    //: earlier draft and were never read, which would have implied an input that
+    //: does not exist.
     struct FrameView
     {
         const void *color = nullptr;
         const void *depth = nullptr;
         const void *motion_vectors = nullptr;
-        void       *out = nullptr;
 
-        unsigned color_row_bytes = 0u;          // 4 * width for R8G8B8A8_UNORM
-        unsigned depth_row_bytes = 0u;          // 4 * width for R32_FLOAT
-        unsigned motion_row_bytes = 0u;         // 4 * width for R16G16_FLOAT
-        unsigned out_row_bytes = 0u;            // 4 * width for R8G8B8A8_UNORM
+        //: Rows in this frame. Checked against the published height of EVERY
+        //: input slot, because the worker takes each slot's row count from the
+        //: height CONFIG carried for that slot.
+        unsigned height = 0u;
 
-        unsigned color_stride = 0u;             // bytes between rows, host side
+        //: The LOGICAL length of one row of each input, in bytes. Checked to be
+        //: exactly bytes_per_pixel(format) * width of that slot, not merely to
+        //: fit inside the pitch.
+        unsigned color_row_bytes = 0u;
+        unsigned depth_row_bytes = 0u;
+        unsigned motion_row_bytes = 0u;
+
+        //: The HOST stride of each input: bytes between the starts of two rows.
+        //: A D3D12 readback buffer's row pitch is 256-aligned and that is exactly
+        //: what a caller passes here. Zero means tightly packed, and the relay
+        //: derives it from that slot's row_bytes rather than refusing.
+        unsigned color_stride = 0u;
         unsigned depth_stride = 0u;
         unsigned motion_stride = 0u;
-        unsigned out_stride = 0u;
     };
 
     //: What the worker said about a submitted frame, quoted, never inferred.

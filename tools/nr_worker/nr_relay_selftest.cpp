@@ -288,8 +288,6 @@ int main(int argc, char **argv)
     cfg.worker_exe = a.worker;
     cfg.module_dir = dir;
     cfg.pipe_name = a.pipe;
-    cfg.width = a.width;
-    cfg.height = a.height;
     cfg.auto_launch = true;
     // The whole point: no GPU, no NGX, no NVAPI. The relay must not build the
     // runtime flags, and nothing here may mention a rasterizer.
@@ -299,6 +297,27 @@ int main(int argc, char **argv)
     cfg.connect_ms = 20000u;
     cfg.handshake_ms = 20000u;
     cfg.shutdown_ms = 3000u;
+
+    // THE FOUR SLOTS ARE NOT ALL THE SAME SHAPE, so the test publishes them as
+    // the lane really is: colour and depth at the requested extent, motion
+    // vectors at HALF it with the game's 8-byte format (fmt=10). Rows of the
+    // same width but a different format give a different pitch, which is the
+    // other half of the same point. At the default 640x360 this is a realistic
+    // per-slot set with no extra test scaffolding.
+    const unsigned mv_width = (a.width + 1u) / 2u;
+    const unsigned mv_height = (a.height + 1u) / 2u;
+    cfg.slots.color          = { a.width, a.height, 28u };   // R8G8B8A8_UNORM, 4 bpp
+    cfg.slots.depth          = { a.width, a.height, 41u };   // R32_FLOAT, 4 bpp
+    cfg.slots.motion_vectors = { mv_width, mv_height, 10u }; // R16G16B16A16_FLOAT, 8 bpp
+    cfg.slots.output         = { a.width, a.height, 28u };
+    // Colour and motion vectors really do differ in every dimension the relay
+    // checks: rows, row length, and (because 8 bpp against half the width) the
+    // pitch. If those were equal, the mismatch test below would prove nothing.
+    const bool geometry_is_distinguishable =
+        (cfg.slots.motion_vectors.height != cfg.slots.color.height) &&
+        (cfg.slots.motion_vectors.width * 8u != cfg.slots.color.width * 4u);
+    check(geometry_is_distinguishable,
+          "the test's own slot set makes the four geometries distinguishable");
 
     std::string why;
     const mgpu::relay::Status st = mgpu::relay::start(cfg, why);
@@ -318,31 +337,46 @@ int main(int argc, char **argv)
 
     // ---- the four published slots, with the arithmetic spelled out -------
     // EXPECTED VALUES, DERIVED IN THE TEST rather than read back from the
-    // module: row_pitch = align_up(width * bpp, 256), slice_pitch = row_pitch *
-    // height, bytes = slice_pitch * 3. All four slots are 4 bytes per pixel at
-    // this geometry, so they must all agree - and if the module ever publishes a
-    // pitch its own CONFIG did not describe, the worker would refuse the mapping
-    // on the rig. Here the numbers are checked against the rule itself.
+    // module, and derived PER SLOT because the four slots do not share a
+    // geometry:
+    //     row_bytes  = width * bytes_per_pixel(format)
+    //     row_pitch  = align_up(row_bytes, 256)     (256 = the D3D12 pitch align)
+    //     slice_pitch = row_pitch * height
+    //     bytes      = slice_pitch * 3              (FRAME_SLOT_COUNT)
+    // All four must agree with THAT slot's numbers, so a module that published
+    // one geometry four times fails here even though it would look plausible.
     {
-        const unsigned expected_row = (unsigned)((((unsigned long long)a.width * 4ull) + 255ull) &
-                                                 ~255ull);
-        const unsigned expected_slice = expected_row * a.height;
-        const unsigned long long expected_bytes =
-            (unsigned long long)expected_slice * 3ull;
+        struct Expect { unsigned w; unsigned h; unsigned bpp; const char *name; };
+        const Expect exp[4] = {
+            { cfg.slots.color.width,          cfg.slots.color.height,          4u, "COLOR" },
+            { cfg.slots.depth.width,          cfg.slots.depth.height,          4u, "DEPTH" },
+            { cfg.slots.motion_vectors.width, cfg.slots.motion_vectors.height, 8u, "MOTION_VECTORS" },
+            { cfg.slots.output.width,         cfg.slots.output.height,         4u, "OUTPUT" },
+        };
         bool all_ok = true;
         for (unsigned i = 0u; i < 4u; ++i)
         {
+            const unsigned expected_row_bytes = exp[i].w * exp[i].bpp;
+            const unsigned expected_row =
+                (unsigned)((((unsigned long long)expected_row_bytes) + 255ull) & ~255ull);
+            const unsigned expected_slice = expected_row * exp[i].h;
+            const unsigned long long expected_bytes = (unsigned long long)expected_slice * 3ull;
             mgpu::relay::SlotInfo si;
             const bool got = mgpu::relay::slot_info(i, si);
-            const bool match = got && si.row_pitch == expected_row &&
-                               si.slice_pitch == expected_slice && si.bytes == expected_bytes &&
-                               si.width == a.width && si.height == a.height;
+            const bool match = got && si.width == exp[i].w && si.height == exp[i].h &&
+                               si.row_pitch == expected_row && si.slice_pitch == expected_slice &&
+                               si.bytes == expected_bytes;
             if (!match) all_ok = false;
-            std::printf("  slot %u      = %s name=%s row_pitch=%u slice_pitch=%u bytes=%llu\n",
-                        i, got ? "published" : "MISSING", si.mapping_name.c_str(),
-                        si.row_pitch, si.slice_pitch, (unsigned long long)si.bytes);
+            std::printf("  slot %u %-15s %s %ux%u row_pitch=%u slice_pitch=%u bytes=%llu "
+                        "expected_row_pitch=%u\n",
+                        i, exp[i].name, got ? "published" : "MISSING", si.width, si.height,
+                        si.row_pitch, si.slice_pitch, (unsigned long long)si.bytes,
+                        expected_row);
         }
-        check(all_ok, "all four slots are published with the derived geometry and pitches");
+        check(all_ok, "each slot is published with ITS OWN derived geometry and pitches");
+        // And the point of the whole exercise: they are not all the same.
+        check(cfg.slots.motion_vectors.height != cfg.slots.color.height,
+              "the test published different heights per slot, so per-slot geometry is exercised");
     }
 
     // ---- 3a. THE HONESTY RULE: report it, never round it up --------------
@@ -365,38 +399,124 @@ int main(int argc, char **argv)
               "the module still recognises the worker's own 1 as Success");
     }
 
-    // ---- 3b. no frame may be submitted to a worker with no session -------
-    // Recorded, not assumed: the summary line below reports what actually
-    // happened rather than what the test intended to happen.
+    // ---- 3b. A FRAME THAT DOES NOT MATCH ITS SLOT IS REFUSED -------------
+    //
+    // THE DEFECT THIS EXISTS TO CATCH. All four slots used to be published with
+    // ONE geometry, and submit() checked only that a row FIT under the pitch.
+    // The lane's real frame is colour 3840x2160 fmt=28 with motion vectors
+    // 1920x1080 fmt=10, so a motion-vector buffer handed to a colour-shaped slot
+    // would be read as the top half of the wrong buffer - and the worker would
+    // still answer hr == 0 with a changed OUTPUT, so every honesty rule the
+    // module has would have PASSED on a truncated frame.
+    //
+    // Three refusals are asserted, each of them a mismatch that is otherwise a
+    // perfectly well-formed frame: the row count, the row length, and the stride.
+    // The same frame at the published numbers must then get PAST the geometry
+    // checks - which in this protocol-only session means the next guard (no
+    // neural session) is the one that refuses it, and that is the assertion
+    // below.
     bool submit_returned = false;
     std::int32_t submit_hr = 0;
     bool submit_output_changed = false;
     std::string submit_err;
     {
-        mgpu::relay::SubmitResult sr;
-        std::string ferr;
-        // Buffers for a tightly packed 640x360 frame, but they are never read:
-        // the guard must refuse before anything is copied or sent.
-        std::vector<unsigned char> color((std::size_t)a.width * 4u * a.height, 0x11);
-        std::vector<unsigned char> depth((std::size_t)a.width * 4u * a.height, 0x22);
-        std::vector<unsigned char> mvec((std::size_t)a.width * 4u * a.height, 0x33);
-        std::vector<unsigned char> out((std::size_t)a.width * 4u * a.height, 0x44);
-        mgpu::relay::FrameView fv;
-        fv.color = color.data();  fv.color_row_bytes = a.width * 4u;
-        fv.depth = depth.data();  fv.depth_row_bytes = a.width * 4u;
-        fv.motion_vectors = mvec.data(); fv.motion_row_bytes = a.width * 4u;
-        fv.out = out.data();      fv.out_row_bytes = a.width * 4u;
+        // Big enough for every case below, so nothing is ever read out of bounds
+        // even if a guard failed.
+        const unsigned rows = cfg.slots.color.height + 8u;
+        const unsigned wide_row = cfg.slots.color.width * 4u + 256u;
+        std::vector<unsigned char> color((std::size_t)wide_row * rows, 0x11);
+        std::vector<unsigned char> depth((std::size_t)wide_row * rows, 0x22);
+        std::vector<unsigned char> mvec((std::size_t)wide_row * rows, 0x33);
 
-        const bool sent = mgpu::relay::submit(fv, 1u, sr, ferr);
-        submit_returned = sent;
-        submit_hr = sr.worker_hr;
-        submit_output_changed = sr.output_changed;
-        submit_err = ferr;
-        std::printf("  submit()  = %s (%s)\n", sent ? "accepted" : "refused", ferr.c_str());
-        check(!sent, "submit() REFUSES while the worker has no Reserved18 session");
-        check(!sr.completed, "no FRAME_COMPLETE was reported for a refused submit");
-        check(contains(ferr, "no neural session"),
-              "the refusal names the reason: the worker has no neural session");
+        mgpu::relay::FrameView fv;
+        fv.color = color.data();
+        fv.depth = depth.data();
+        fv.motion_vectors = mvec.data();
+        // The published numbers of the colour slot: 4 bpp, so its row is
+        // exactly width * 4. Stride and row length agree, tightly packed.
+        fv.height = cfg.slots.color.height;
+        fv.color_row_bytes = cfg.slots.color.width * 4u;
+        fv.depth_row_bytes = cfg.slots.depth.width * 4u;
+        fv.motion_row_bytes = cfg.slots.motion_vectors.width * 8u;
+        fv.color_stride = fv.color_row_bytes;
+        fv.depth_stride = fv.depth_row_bytes;
+        fv.motion_stride = fv.motion_row_bytes;
+
+        // (a) A MOTION-VECTOR GEOMETRY THAT DOES NOT MATCH ITS SLOT. Everything
+        //     else about this frame is correct: the pointers, the strides, the
+        //     colour and depth rows, the format-consistent row length. Only the
+        //     row count is the colour slot's instead of the motion slot's - the
+        //     exact shape of the truncation this guards against.
+        {
+            mgpu::relay::SubmitResult sr;
+            std::string ferr;
+            bool sent = mgpu::relay::submit(fv, 1u, sr, ferr);
+            std::printf("  geometry  = %s (%s)\n", sent ? "ACCEPTED" : "refused", ferr.c_str());
+            check(!sent, "submit() REFUSES a frame whose row count is not the slot's");
+            check(contains(ferr, "MOTION_VECTORS"),
+                  "the refusal names the slot that did not match");
+            check(contains(ferr, "MOTION_VECTORS") &&
+                      contains(ferr, std::to_string(cfg.slots.motion_vectors.height)),
+                  "the refusal quotes the geometry the slot was published with");
+            check(contains(ferr, std::to_string(fv.height)),
+                  "the refusal quotes the geometry the frame claimed");
+        }
+
+        // (b) A ROW LENGTH THAT IS NOT width * bytes_per_pixel. Same height, so
+        //     the row-count check passes and this one has to catch it.
+        {
+            mgpu::relay::SubmitResult sr;
+            std::string ferr;
+            const unsigned rows_for_mvec = cfg.slots.motion_vectors.height;
+            mgpu::relay::FrameView fv2 = fv;
+            fv2.height = rows_for_mvec;
+            fv2.motion_row_bytes = cfg.slots.motion_vectors.width * 4u;   // 4, not 8, bpp
+            fv2.motion_stride = fv2.motion_row_bytes;
+            const bool sent = mgpu::relay::submit(fv2, 1u, sr, ferr);
+            std::printf("  rowbytes  = %s (%s)\n", sent ? "ACCEPTED" : "refused", ferr.c_str());
+            check(!sent, "submit() REFUSES a row length that is not the format's bytes-per-pixel "
+                         "times the width");
+            check(contains(ferr, "bytes per pixel"),
+                  "the refusal explains the row length in terms of bytes per pixel");
+        }
+
+        // (c) A STRIDE SHORTER THAN THE ROW. The relay would read past the end of
+        //     every row, so this must not be clamped to the row length.
+        {
+            mgpu::relay::SubmitResult sr;
+            std::string ferr;
+            mgpu::relay::FrameView fv3 = fv;
+            fv3.height = cfg.slots.motion_vectors.height;
+            fv3.color_stride = fv3.color_row_bytes - 4u;
+            const bool sent = mgpu::relay::submit(fv3, 1u, sr, ferr);
+            std::printf("  stride    = %s (%s)\n", sent ? "ACCEPTED" : "refused", ferr.c_str());
+            check(!sent, "submit() REFUSES a stride shorter than a row");
+            check(contains(ferr, "stride"), "the refusal names the stride");
+        }
+
+        // (d) THE SAME FRAME AT THE PUBLISHED NUMBERS. It must now get past the
+        //     geometry contract; what refuses it is the session guard, because a
+        //     --protocol-only worker has no Reserved18 session at all. That the
+        //     reason CHANGED is the evidence the geometry was accepted.
+        {
+            mgpu::relay::SubmitResult sr;
+            std::string ferr;
+            mgpu::relay::FrameView fv4 = fv;
+            fv4.height = cfg.slots.motion_vectors.height;
+            const bool sent = mgpu::relay::submit(fv4, 1u, sr, ferr);
+            submit_returned = sent;
+            submit_hr = sr.worker_hr;
+            submit_output_changed = sr.output_changed;
+            submit_err = ferr;
+            std::printf("  submit()  = %s (%s)\n", sent ? "accepted" : "refused", ferr.c_str());
+            check(!sent, "submit() REFUSES while the worker has no Reserved18 session");
+            check(!sr.completed, "no FRAME_COMPLETE was reported for a refused submit");
+            check(contains(ferr, "no neural session"),
+                  "the correct-geometry frame was refused by the SESSION guard, not the geometry "
+                  "one - so the geometry was accepted");
+            check(!contains(ferr, "rows and the"),
+                  "the correct-geometry frame was NOT refused for its row count");
+        }
     }
 
     // ---- 4. shutdown is clean, and idempotent ---------------------------
