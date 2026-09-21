@@ -811,11 +811,22 @@ jobs:
 
           # THE HONESTY GATE, on the module's own output. It must carry the exact
           # fixed line, with the worker's value, and it must not claim Success.
+          #
+          # ANCHORED TO THE MODULE'S OWN LINE, and that is not fussiness: the
+          # selftest PRINTED a check whose description is "the module's Reserved18
+          # line does not contain the word Success", so the first draft of this
+          # gate - grep 'Reserved18' | grep -q 'Success' - matched the description
+          # of the check asserting the absence and failed a passing run. A gate
+          # over test output must name the line it is judging, or it ends up
+          # reading the test's own prose as evidence. Same discipline as the
+          # comment-stripping gates above.
           grep -qF '[MGPU][RELAY] CreateFeature(Reserved18) result=0xFFFFFFFF (not-a-session) src=worker' \
             relay-selftest.txt || {
             echo "::error::the relay's Reserved18 line is not the fixed honest one"; exit 1; }
-          if grep -a 'Reserved18' relay-selftest.txt | grep -q 'Success'; then
-            echo "::error::the relay claims Reserved18 Success for a worker that has no session"
+          if grep -aE '^\[MGPU\]\[RELAY\] CreateFeature\(Reserved18\)' relay-selftest.txt \
+               | grep -q 'Success'; then
+            echo "::error::the relay's own Reserved18 line claims Success for a worker that has "
+            echo "::error::no session"
             exit 1
           fi
           grep -q 'src=worker' relay-selftest.txt || {
@@ -845,8 +856,13 @@ jobs:
             echo "::error::the worker did not receive the motion-vector slot's own geometry"; exit 1; }
           grep -q 'CONFIG COLOR: 640x360 format=28' "$WLOG" || {
             echo "::error::the worker did not receive the colour slot's own geometry"; exit 1; }
-          if grep -a 'Reserved18' "$WLOG" | grep -q 'Success'; then
-            echo "::error::the WORKER's log claims Reserved18 Success in protocol-only mode"
+          # The worker's OWN Reserved18 line, anchored, and judged by its VALUE
+          # rather than by the word: 0x00000001 is the only thing that means a
+          # session, and a --protocol-only worker must not be carrying one. The
+          # unanchored form matched any line mentioning both words - including a
+          # test description that says the opposite.
+          if grep -aE '^\[worker\] Reserved18' "$WLOG" | grep -q '0x00000001'; then
+            echo "::error::the WORKER's log carries a Reserved18 Success in protocol-only mode"
             exit 1
           fi
           echo "relay module ok: launched, handshaked, per-slot geometry published, honesty held."
