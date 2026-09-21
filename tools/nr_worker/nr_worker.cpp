@@ -362,7 +362,7 @@ namespace
         dst.PlacedFootprint.Footprint.Width    = t.w;
         dst.PlacedFootprint.Footprint.Height   = t.h;
         dst.PlacedFootprint.Footprint.Depth    = 1;
-        dst.PlacedFootprint.RowPitch           = t.row_pitch;
+        dst.PlacedFootprint.Footprint.RowPitch = t.row_pitch;
 
         D3D12_TEXTURE_COPY_LOCATION src = {};
         src.pResource        = t.res;
