@@ -753,6 +753,23 @@ void stream_mvec_copy(void *cmd_list, unsigned long long mvec_handle);
 // stopped and drained.
 void stream_poll();
 
+// PHASE 2, MGPU_NR_RELAY only. Bridge thread, called IMMEDIATELY AFTER
+// stream_poll and BEFORE stream_present_gate. It drains the frame the previous
+// poll's reduce produced, hands it to the out-of-process worker through
+// mgpu::relay::submit(), and stages the returned OUTPUT into the texture
+// stream_present_source hands the presenter.
+//
+// WHY IT IS HERE AND NOT INSIDE stream_poll: submit() is synchronous with a
+// sixty-second pipe deadline, and stream_poll holds the stream mutex for its
+// whole body - the mutex the GAME'S RENDER THREAD takes every frame. This call
+// is the one per-frame point where that lock is gone and the frame's GPU work
+// has already been waited on. Moving it inside stream_poll is a hang, not a
+// tidy-up.
+//
+// Always defined, so the bridge loop's call needs no #ifdef of its own; without
+// MGPU_NR_RELAY it is an empty function and the add-on is unchanged.
+void stream_relay_tick();
+
 // P5.1. Bridge thread, called immediately before present_frame. Returns true
 // when the bridge should put a frame on screen.
 //

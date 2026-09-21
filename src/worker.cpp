@@ -1174,6 +1174,25 @@ namespace
                 // T5 shipped it. The gate does the waiting itself, so a false
                 // return means "nothing new, and we have already slept".
                 mgpu::gpu1::stream_poll();
+                // PHASE 2: THE RELAY LANE'S ONE BLOCKING CALL SITE.
+                //
+                // relay::submit() is synchronous - it writes the frame, sends
+                // FRAME_SUBMIT and reads until FRAME_COMPLETE or a sixty-second
+                // pipe deadline - so it lives here and NOT inside stream_poll.
+                // stream_poll holds the stream mutex for its whole body, that
+                // mutex is the one the GAME'S RENDER THREAD takes every frame in
+                // stream_on_finish_effects, and a lock that thread waits on is a
+                // lock that reaches the application (DEFECT E: 60 -> 49.8 fps).
+                // This line is the only per-frame point in the add-on where the
+                // lock is gone and the frame's GPU work has already been waited
+                // on, which is exactly what the call needs.
+                //
+                // NO #ifdef HERE, on purpose: stream_relay_tick() is an empty
+                // function without MGPU_NR_RELAY, so this call site does not have
+                // to spell the relay's switch - which keeps that switch in the
+                // three files the architecture gate enumerates rather than
+                // spreading it. See the note on the definition.
+                mgpu::gpu1::stream_relay_tick();
                 if (!mgpu::gpu1::stream_present_gate(4))
                     continue;
 

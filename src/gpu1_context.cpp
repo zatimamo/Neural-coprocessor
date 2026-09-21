@@ -47,6 +47,23 @@
 #include "reshade_native.hpp"   // RESHADENATIVE: the P1.0c NGX lane on the unwrapped device
 #include "appid_ns.hpp"         // APPID_NS: the NGX ApplicationId for the Reserved18 sessions
 
+// ---- PHASE 2: THE OUT-OF-PROCESS NEURAL LANE, game-side half ----
+//
+// The include is UNCONDITIONAL and the module is not. nr_relay.hpp is a
+// declarations-only header - <cstdint> and <string>, no device, no NGX, no
+// NVAPI - so including it costs a build with MGPU_NR_RELAY off exactly nothing,
+// and every CALL SITE below is inside #ifdef MGPU_NR_RELAY. Two builds from one
+// source: the default build has no relay symbols to call and no relay objects
+// to leak.
+//
+// WHY THIS FILE MAY NAME IT AT ALL: the architecture gate in nr-worker.yml
+// enumerates the files allowed to carry the relay's names, and this one is on
+// that list precisely because it is the frame-pipeline call site. Nothing here
+// reaches the worker's tree: no include of tools/nr_worker, no lane, no
+// transport, no NGX reservation. The pixels go out as plain host memory and the
+// worker's own numbers come back and are quoted, never interpreted.
+#include "nr_relay.hpp"
+
 // R111. DXGI_STATUS_OCCLUDED comes from dxgi.h by way of <dxgi1_4.h> above.
 // Guarded because it is a SUCCESS code and a build where it went missing
 // would fail silently in the worst way: the occlusion branch would simply
@@ -9069,6 +9086,100 @@ namespace
         bool nr_first = true;
         unsigned long long resync = 0;   // seals rejected, next gap check suppressed
         bool skip_next_gap = false;
+
+        // ================= PHASE 2: THE HOST-STAGED LANE, GAME SIDE =========
+        //
+        // WHAT THIS IS. The measured state of this rig is that the GPU-side
+        // cross-adapter transport carries nothing (CrossNodeSharingTier = 0 on
+        // both adapters, and a copy into a shared cross-adapter surface arrives
+        // empty - transport-benchmark.json, ok=false). The only carrier that
+        // cannot fail to carry bytes is system memory. So the frame goes: the
+        // game's device reduces the three neural inputs to the size the worker
+        // publishes, copies them into READBACK buffers, the CPU memcpys them
+        // into the relay's named mappings, the worker evaluates on the 4070 and
+        // memcpys the OUTPUT mapping back, and this side uploads that into a
+        // texture the bridge already knows how to present.
+        //
+        // WHY THE REDUCE IS ON THE GAME'S DEVICE AND NOT GPU 1. The pixels are
+        // here, at their source geometry. Reducing here means one 640x360
+        // readback per input instead of a 3840x2160 one plus a cross-device
+        // copy of the full frame - and it is the only version of this that has
+        // no cross-adapter pixel movement in it at all.
+        //
+        // R IS 640x360 AND THAT IS THE WORKER'S PIN, NOT A CHOICE MADE HERE.
+        // nr_worker.cpp refuses any frame whose extent is not the extent its
+        // Reserved18 feature was created at, and that extent is its own pinned
+        // 640x360. Raising it is the worker's change to make. The consequence
+        // is stated rather than hidden: the picture is a 640x360 neural result
+        // enlarged to the display extent, so it is SOFT, and the log says so on
+        // every run that uses this lane.
+        static const unsigned RELAY_SLOTS = 3;   // == the relay's FRAME_SLOT_COUNT
+        static const unsigned RELAY_REPORT_EVERY = 300;
+
+        // ---- the lane's own state ----
+        bool     relay_requested = false;   // decoded in stream_request
+        bool     relay_on        = false;   // start() returned OK and the reduce came up
+        bool     relay_bringup_done = false;
+        unsigned relay_w = 0, relay_h = 0;
+        unsigned long long relay_submitted = 0, relay_eval_ok = 0, relay_eval_fail = 0;
+        unsigned long long relay_nocomplete = 0, relay_unchanged = 0;
+        unsigned long long relay_frames = 0, relay_reduce_fail = 0;
+        unsigned long long relay_superseded = 0;
+        unsigned long long relay_report_at = 0;
+
+        // ---- GPU 0: where the pixels are put down for the CPU to read ----
+        ID3D12Resource      *relay_rb[RELAY_SLOTS][3] = {};
+        unsigned char       *relay_cpu[RELAY_SLOTS][3] = {};
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT relay_fp[RELAY_SLOTS][3] = {};
+        ID3D12Fence         *relay_f = nullptr;    // game's device, value = frame index
+        HANDLE               relay_ev = nullptr;
+        unsigned long long   relay_f_value = 0;    // last signalled frame
+        unsigned long long   relay_f_seen = 0;     // last waited frame
+
+        // ---- GPU 1: the reduced inputs, and the result staged for presenting ----
+        ID3D12PipelineState *relay_pso[2] = {};      // 0 = reduce, 1 = enlarge
+        ID3D12Resource      *relay_in[3] = {};       // R, the reduced inputs
+        ID3D12Resource      *relay_show = nullptr;   // display extent, what we present
+        bool                 relay_show_valid = false;
+        bool                 relay_pipeline_ready = false;
+        // The C2-SR reduce owns descriptors 0..7 (4 per parity, and its
+        // sr_write_descriptors indexes them as ii*4). The relay lane gets its
+        // OWN eight - parity's four for the reduce, then the enlarge pair - so
+        // neither lane can overwrite the other's descriptor while its dispatch
+        // is in the command list. The heap is grown to 16 in sr_build_reduce,
+        // which is a count, not a behaviour.
+        static const unsigned RELAY_DESC_BASE = 8;
+        static const unsigned RELAY_ENLARGE_DESC = 14;
+
+        // ---- The OUTPUT mapping, written by the worker and read by us ----
+        // Opened BY NAME from SlotInfo::mapping_name (see stream_relay_objects):
+        // the module publishes the name and deliberately not the view, and a
+        // FRAME_COMPLETE has been read off the pipe before anything here reads
+        // it, so the worker is done writing.
+        HANDLE               relay_out_map = nullptr;
+        unsigned char       *relay_out_cpu = nullptr;
+
+        // ---- GPU 1: the bridge from host memory to a presentable texture ----
+        ID3D12Resource      *relay_up = nullptr;      // UPLOAD, one 640x360 frame
+        unsigned char       *relay_up_cpu = nullptr;  // mapped
+        unsigned             relay_up_pitch = 0;      // its D3D12 row pitch
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT relay_up_fp{};
+
+        // ---- The one frame that is in flight inside this lane ----
+        // ONE frame, not a pipeline: the reduce is recorded in a poll, tick
+        // submits it between polls, and the next poll shows what came back. So
+        // there is exactly one "f whose reduce has been recorded and not yet
+        // submitted", and relay_stage_f is the fence value that says its readback
+        // is safe to read.
+        bool                 relay_stage_pending = false;   // f's reduce was recorded
+        unsigned long long   relay_stage_f = 0;             // which frame that was
+        unsigned             relay_stage_slot = 0;
+        bool                 relay_submit_pending = false;  // submitted, output not yet shown
+        std::uint32_t        relay_frame_id = 0;
+        std::uint32_t        relay_last_frame_id = 0;
+        int                  relay_why = 0;                 // relay::Status, for the line
+        std::string          relay_evidence;                // the worker's own words
+        std::string          relay_reason;
     };
 
     // The rungs, largest R first. 67% is roughly DLSS Quality, 50% Performance,
@@ -9109,6 +9220,29 @@ namespace
         std::lock_guard<std::mutex> lk(s.cs);
         if (!s.nr_ok || s.profile) return nullptr;
         w = s.width; h = s.height; fmt = s.format;
+
+#ifdef MGPU_NR_RELAY
+        // ==== PHASE 2: THE WORKER'S OUTPUT, AT THE DISPLAY EXTENT ====
+        //
+        // Checked BEFORE the Present=in discriminator on purpose. Present=in
+        // answers "did we hand the model a wrong frame?", which is a question
+        // about the IN-PROCESS stage; with the relay lane on, the model is in
+        // another process and the useful comparison is worker output against the
+        // input. The relay texture therefore wins, and the two modes are not
+        // blended - a reader who wants Present=in for the in-process lane turns
+        // the relay lane off, which is what MGPU_NR_RELAY being a build option
+        // already means.
+        //
+        // relay_show is at s.width/s.height by construction (stream_relay_objects),
+        // so the size and format reported here describe the texture that is
+        // actually returned - the present path's copy is 1:1 and a mismatched
+        // pair there would be an out-of-bounds source box, not a black picture.
+        if (s.relay_show_valid && s.relay_show != nullptr)
+        {
+            rest = D3D12_RESOURCE_STATE_COMMON;   // where the enlarge leaves it
+            return s.relay_show;
+        }
+#endif
 
         // P5.3, the discriminator. Present=in shows the frame we HANDED to
         // DLSS-NR instead of the frame it produced - same adapter, same
@@ -10282,6 +10416,19 @@ namespace
         if (s.gxfer != nullptr) { s.gxfer->Release(); s.gxfer = nullptr; }
         if (s.gheap != nullptr) { s.gheap->Release(); s.gheap = nullptr; }
         if (s.gshare!= nullptr) { CloseHandle(s.gshare); s.gshare = nullptr; }
+
+#ifdef MGPU_NR_RELAY
+        // ==== PHASE 2: THE LANE'S OWN OBJECTS, LAST, AND AFTER THE DRAIN ABOVE ====
+        //
+        // The reduce and the enlarge are recorded into s.nl, whose last
+        // submission was waited on above (and by the consume loop before that),
+        // so nothing here is freed under the GPU. relay::shutdown() - the pipe
+        // and the worker process - is deliberately NOT here: it waits on a
+        // process, and this function runs with s.cs held. It is in
+        // stream_shutdown, outside the lock, before this.
+        if (s.relay_requested || s.relay_on) stream_relay_release(s);
+#endif
+
         s.gdev = nullptr;
         s.ndev_b = nullptr;   // borrowed
         s.armed = false;
@@ -10290,6 +10437,953 @@ namespace
 
 namespace
 {
+    // ========================================================================
+    // PHASE 2: THE HOST-STAGED RELAY LANE. Everything below is inside
+    // #ifdef MGPU_NR_RELAY, so a build with the option off contains none of it,
+    // calls none of it and behaves exactly as it did before this block existed.
+    //
+    // THE SHAPE, IN ONE PARAGRAPH. The frame's three neural inputs already
+    // exist on GPU 1 at R (the add-on's stream has been producing them since
+    // C2-SR: sr_color is "R, tone-mapped", sr_depth is "R, point-reduced", and
+    // the real motion vectors live at the game's own extent). The worker's
+    // Reserved18 feature is pinned to 640x360 and REFUSES any other extent, so
+    // this lane reduces the three inputs to 640x360 with one compute pass on
+    // GPU 1, copies them into three READBACK buffers on GPU 1, memcpys them
+    // into the relay's named mappings, submits, and enlarges the returned
+    // OUTPUT back to the display extent so the present path already in this
+    // file can show it unchanged.
+    //
+    // WHY THE READBACK IS ON GPU 1 AND NOT ON THE GAME'S DEVICE. The inputs are
+    // already there. Reducing them again on GPU 0 would mean transporting the
+    // full-size frame to GPU 1 first - which is the transport this whole phase
+    // exists to remove.
+    // ========================================================================
+
+#ifdef MGPU_NR_RELAY
+
+    // The add-on's log, in the relay's shape. Install with set_log_sink() BEFORE
+    // start(): every line the module writes during the handshake - the reserved18
+    // evidence line the rig verification greps for included - then lands in
+    // ReShade's log next to this file's own lines instead of on stdout.
+    void stream_relay_log(int level, const char *line)
+    {
+        if (line == nullptr) return;
+        if      (level >= 2) mgpu::diag::error(line);
+        else if (level == 1) mgpu::diag::warn(line);
+        else                 mgpu::diag::info(line);
+    }
+
+    // <addon dir>\mgpu\<name>. The add-on's own module handle, not the game's:
+    // GetModuleHandle(nullptr) would hand us Cyberpunk2077.exe.
+    bool stream_relay_deploy_path(const wchar_t *name, wchar_t *out, size_t cap)
+    {
+        if (name == nullptr || out == nullptr || cap < 8u) return false;
+        HMODULE self = mgpu::module_handle();
+        if (self == nullptr) return false;
+        wchar_t exe[MAX_PATH] = {};
+        const DWORD n = GetModuleFileNameW(self, exe, (DWORD)(sizeof exe / sizeof exe[0]));
+        if (n == 0 || n >= (DWORD)(sizeof exe / sizeof exe[0])) return false;
+        size_t cut = (size_t)-1;
+        for (size_t i = 0; i + 1 < (size_t)n; ++i)
+            if (exe[i] == L'\\' || exe[i] == L'/') cut = i;
+        if (cut == (size_t)-1 || cut + 1 >= cap) return false;
+        // snwprintf, not snprintf: the path is wide and a narrow buffer here
+        // would silently mangle a directory name with a non-ASCII character.
+        _snwprintf_s(out, cap, _TRUNCATE, L"%.*lsmgpu\\%ls", (int)(cut + 1), exe, name);
+        return out[0] != L'\0';
+    }
+
+    // One shot, on the caller's thread, before any D3D12 object exists for this
+    // lane. Everything it can fail at is a REASON the lane stays transport-only,
+    // never a guess and never a retry: the worker's Reserved18 result is quoted
+    // and the add-on does not try to conjure a session into existence.
+    void stream_relay_begin(stream_state &s)
+    {
+        s.relay_bringup_done = true;
+        s.relay_w = 640u;   // the worker's pinned creation extent. See RELAY_SLOTS.
+        s.relay_h = 360u;
+
+        mgpu::relay::Config cfg;
+        wchar_t worker[MAX_PATH] = {};
+        wchar_t runtime[MAX_PATH] = {};
+        const bool worker_ok  = stream_relay_deploy_path(L"nvngx.dll_mgpu_nr_worker.exe",
+                                                         worker, sizeof worker / sizeof worker[0]);
+        const bool runtime_ok = stream_relay_deploy_path(L"nvngx_dlssnr.dll",
+                                                         runtime, sizeof runtime / sizeof runtime[0]);
+        if (worker_ok)  cfg.worker_exe = worker;
+        if (runtime_ok) cfg.runtime.path = runtime;
+
+        // THE HASH IS THE GAME'S RUNTIME AND IT IS PINNED ON PURPOSE. The
+        // worker's own default names a DIFFERENT build (NeuralScreen v2.0.1,
+        // dcc0dc24...), so leaving it on its default would run the lane against
+        // a runtime this game never loads and then report the difference as a
+        // neural result. This hash is the DLL the add-on's own ngx modules line
+        // resolves on this rig.
+        static const char RUNTIME_SHA256[] =
+            "4B8D19BC3EFF58A084F5ECA7489C921501C203450169FB82FF4F649A4482BA05";
+        for (unsigned i = 0; i < 64u; ++i) cfg.runtime.hash[i] = RUNTIME_SHA256[i];
+        cfg.runtime.hash[64] = '\0';
+        cfg.runtime.pin_hash = true;
+
+        // PER SLOT, and the formats are the ones the worker's proven control
+        // lane carries (R8G8B8A8_UNORM / R32_FLOAT / R16G16_FLOAT / R8G8B8A8_UNORM).
+        // DEPTH IS fmt=41 (R32_FLOAT) and not the protocol's fmt=40 (D32_FLOAT)
+        // deliberately: the worker creates its depth texture in the format its
+        // CONFIG named and binds it as DLSSNR.Depth, and the game's own depth is
+        // R32_FLOAT, so the D32 sibling with its UNKNOWN read semantics is not
+        // worth the uncertainty.
+        cfg.slots.color          = { s.relay_w, s.relay_h, 28u };   // R8G8B8A8_UNORM
+        cfg.slots.depth          = { s.relay_w, s.relay_h, 41u };   // R32_FLOAT
+        cfg.slots.motion_vectors = { s.relay_w, s.relay_h, 34u };   // R16G16_FLOAT
+        cfg.slots.output         = { s.relay_w, s.relay_h, 28u };   // R8G8B8A8_UNORM
+
+        // A REAL worker: the whole point of the lane is a Reserved18 session,
+        // and start() checks the runtime DLL is there before launching.
+        cfg.protocol_only = false;
+        cfg.auto_launch   = true;
+        // DllMain teardown reaches relay::shutdown(). One second is the same
+        // order as every other bounded wait this file takes on a teardown path.
+        cfg.shutdown_ms   = 1000u;
+
+        mgpu::relay::set_log_sink(&stream_relay_log);
+        std::string why;
+        const mgpu::relay::Status st = mgpu::relay::start(cfg, why);
+        s.relay_why = (int)st;
+        s.relay_reason = why;
+        s.relay_evidence = mgpu::relay::reserved18_evidence();
+        if (st != mgpu::relay::Status::OK)
+        {
+            char l[1200];
+            snprintf(l, sizeof l,
+                     "[MGPU][P4.1] RELAY did not start: status=%d (%s) - %s. THE NEURAL LANE IS "
+                     "TRANSPORT-ONLY for this launch: the game's own colour/depth/MVec transport "
+                     "runs exactly as it always has and NO frame is submitted anywhere. Nothing "
+                     "was retried and no session was substituted; the reason above is the "
+                     "worker's or the deployment's own words.",
+                     (int)st, mgpu::relay::status_name(st), why.c_str());
+            mgpu::diag::error(l);
+            return;
+        }
+
+        // THE WORKER'S OWN ANSWER, QUOTED, AND THE FACT THAT IT IS THE SOURCE.
+        // reserved18() == 1 is Success and nothing else is. -1 means that run
+        // created no session on purpose (a --protocol-only worker).
+        s.relay_on = mgpu::relay::reserved18_is_success(mgpu::relay::reserved18());
+        {
+            char l[1200];
+            snprintf(l, sizeof l,
+                     "[MGPU][P4.1] CreateFeature(Reserved18) result=0x%08X (%s) src=worker "
+                     "worker_pid=%lu - %s",
+                     (unsigned)mgpu::relay::reserved18(),
+                     mgpu::relay::reserved18_name(mgpu::relay::reserved18()),
+                     (unsigned long)mgpu::relay::worker_pid(),
+                     s.relay_on
+                         ? "the session exists, so frames will be submitted to it. The add-on "
+                           "did not create it, did not load NGX and cannot report its result "
+                           "from anywhere but this quoted value."
+                         : "THE WORKER HAS NO SESSION. The lane is TRANSPORT-ONLY: no frame is "
+                           "submitted and no output is claimed. The value above is the worker's "
+                           "own, quoted; this add-on has not interpreted it.");
+            if (s.relay_on) mgpu::diag::info(l); else mgpu::diag::warn(l);
+        }
+        if (!s.relay_on)
+        {
+            char l[900];
+            snprintf(l, sizeof l,
+                     "[MGPU][P4.1] RELAY lane TRANSPORT-ONLY: the worker is up (pid=%lu) and the "
+                     "control channel is live, but Reserved18=0x%08X (%s). No FRAME_SUBMIT is "
+                     "sent, so no output is claimed and the neural stage is NOT running.",
+                     (unsigned long)mgpu::relay::worker_pid(),
+                     (unsigned)mgpu::relay::reserved18(),
+                     mgpu::relay::reserved18_name(mgpu::relay::reserved18()));
+            mgpu::diag::warn(l);
+        }
+
+        {
+            char g[900];
+            snprintf(g, sizeof g,
+                     "[MGPU][P4.1] RELAY geometry: the model runs at %ux%u (the worker's own "
+                     "pinned creation extent - it REFUSES any other, so this is not a choice made "
+                     "here) with colour=R8G8B8A8_UNORM, depth=R32_FLOAT from the game's own depth "
+                     "plane, motion vectors=R16G16_FLOAT converted from the game's "
+                     "R16G16B16A16_FLOAT (two of four channels kept, and the vector VALUES are "
+                     "not rescaled - the worker binds MVScale 1.0). The returned frame is "
+                     "enlarged to the source extent for presentation, so THE PICTURE IS SOFT BY "
+                     "CONSTRUCTION. Raising R is a change to the worker, not to this file.",
+                     s.relay_w, s.relay_h);
+            mgpu::diag::warn(g);
+        }
+    }
+
+    // The two compute passes. Both use the SAME root signature and descriptor
+    // heap the C2-SR reduce already builds (s.ds_rs / s.ds_heap / s.ds_inc), so
+    // this lane adds one PSO and no new binding model - but it is built even
+    // when SRUpscale is off, because the relay lane does not depend on it.
+    //
+    // PASS 0, "relay_reduce": one dispatch, up to two outputs.
+    //   t0 = colour or motion source (linear sampled), t1 = the depth source
+    //   (LOADed, never filtered - averaging depth across an edge invents a
+    //   surface that is not there, which is C2-SR's own note), u0/u1 = the
+    //   destination pair.
+    //   The colour path passes the motion texture and the motion destination;
+    //   the depth path passes the depth destination in u1. Both bind their
+    //   target's format, so one shader serves all three inputs.
+    // PASS 1, "relay_enlarge": the returned 640x360 OUTPUT, linearly enlarged
+    //   to the display extent. It is a resize and nothing else - the model's
+    //   pixels are not re-synthesised here and the picture is SOFT because the
+    //   model ran at 640x360. That is the worker's geometry pin, not a claim
+    //   about image quality.
+    static const char *kRelayReduceHLSL =
+        "Texture2D<float4> gS0 : register(t0);\n"
+        "Texture2D<float>  gS1 : register(t1);\n"
+        "RWTexture2D<float4> gD0 : register(u0);\n"
+        "RWTexture2D<float>  gD1 : register(u1);\n"
+        "SamplerState gLin : register(s0);\n"
+        "cbuffer C : register(b0) { uint2 gSrc; uint2 gDst; };\n"
+        "[numthreads(8,8,1)]\n"
+        "void main(uint3 id : SV_DispatchThreadID)\n"
+        "{\n"
+        "  if (id.x >= gDst.x || id.y >= gDst.y) return;\n"
+        "  float2 uv = (float2(id.xy) + 0.5f) / float2(gDst);\n"
+        "  gD0[id.xy] = gS0.SampleLevel(gLin, uv, 0);\n"
+        "  int2 sp = int2(uv * float2(gSrc));\n"
+        "  sp = clamp(sp, int2(0,0), int2(gSrc) - int2(1,1));\n"
+        "  gD1[id.xy] = gS1.Load(int3(sp, 0));\n"
+        "}\n";
+
+    static const char *kRelayEnlargeHLSL =
+        "Texture2D<float4> gSrc : register(t0);\n"
+        "RWTexture2D<float4> gDst : register(u0);\n"
+        "SamplerState gLin : register(s0);\n"
+        "cbuffer C : register(b0) { uint2 gSrcDim; uint2 gDstDim; };\n"
+        "[numthreads(8,8,1)]\n"
+        "void main(uint3 id : SV_DispatchThreadID)\n"
+        "{\n"
+        "  if (id.x >= gDstDim.x || id.y >= gDstDim.y) return;\n"
+        "  float2 uv = (float2(id.xy) + 0.5f) / float2(gDstDim);\n"
+        "  gDst[id.xy] = gSrc.SampleLevel(gLin, uv, 0);\n"
+        "}\n";
+
+    static bool stream_relay_pipeline(stream_state &s, ID3D12Device *ndev)
+    {
+        if (s.relay_pipeline_ready) return true;
+        if (ndev == nullptr) return false;
+        if (s.ds_rs == nullptr)
+        {
+            // The relay lane does not require SRUpscale; it requires the two
+            // objects that carry the descriptor model. If SR built them, reuse.
+            mgpu::diag::error("[MGPU][P4.1] RELAY: the compute root signature is not up, so the "
+                              "reduce and enlarge passes cannot be built. The lane stays "
+                              "TRANSPORT-ONLY. (Build order: the C2-SR reduce is built before "
+                              "this lane and shares its root signature.)");
+            return false;
+        }
+
+        HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+        if (dc == nullptr)
+        {
+            mgpu::diag::error("[MGPU][P4.1] RELAY: d3dcompiler_47.dll is not loadable, so the two "
+                              "60-line compute passes cannot be compiled. The lane stays "
+                              "TRANSPORT-ONLY - said here rather than discovered as a black "
+                              "picture.");
+            return false;
+        }
+        pfn_d3dcompile p_compile = (pfn_d3dcompile)GetProcAddress(dc, "D3DCompile");
+        if (p_compile == nullptr)
+        {
+            mgpu::diag::error("[MGPU][P4.1] RELAY: D3DCompile is not exported by "
+                              "d3dcompiler_47.dll. The lane stays TRANSPORT-ONLY.");
+            return false;
+        }
+
+        const char *srcs[2] = { kRelayReduceHLSL, kRelayEnlargeHLSL };
+        for (unsigned p = 0; p < 2u; ++p)
+        {
+            ID3DBlob *cs = nullptr, *err = nullptr;
+            const HRESULT hr = p_compile(srcs[p], strlen(srcs[p]), "relay", nullptr, nullptr,
+                                         "main", "cs_5_1", 0, 0, &cs, &err);
+            if (FAILED(hr) || cs == nullptr)
+            {
+                char l[700];
+                snprintf(l, sizeof l, "[MGPU][P4.1] RELAY pass %u failed to compile: 0x%08X %s",
+                         p, (unsigned)hr,
+                         (err != nullptr) ? (const char *)err->GetBufferPointer() : "");
+                mgpu::diag::error(l);
+                if (err != nullptr) err->Release();
+                // Pass 0 is the reduce and pass 1 the enlarge: without both
+                // there is no frame to submit and no picture to present, so a
+                // half-built pair is a refusal, not a degraded lane.
+                if (s.relay_pso[0] != nullptr) { s.relay_pso[0]->Release(); s.relay_pso[0] = nullptr; }
+                if (s.relay_pso[1] != nullptr) { s.relay_pso[1]->Release(); s.relay_pso[1] = nullptr; }
+                return false;
+            }
+            if (err != nullptr) { err->Release(); err = nullptr; }
+
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+            pd.pRootSignature = s.ds_rs;
+            pd.CS.pShaderBytecode = cs->GetBufferPointer();
+            pd.CS.BytecodeLength  = cs->GetBufferSize();
+            const HRESULT phr = ndev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&s.relay_pso[p]));
+            cs->Release();
+            if (FAILED(phr) || s.relay_pso[p] == nullptr)
+            {
+                char l[400];
+                snprintf(l, sizeof l, "[MGPU][P4.1] RELAY pass %u PSO failed 0x%08X", p,
+                         (unsigned)phr);
+                mgpu::diag::error(l);
+                if (s.relay_pso[0] != nullptr) { s.relay_pso[0]->Release(); s.relay_pso[0] = nullptr; }
+                if (s.relay_pso[1] != nullptr) { s.relay_pso[1]->Release(); s.relay_pso[1] = nullptr; }
+                return false;
+            }
+        }
+        s.relay_pipeline_ready = (s.relay_pso[0] != nullptr && s.relay_pso[1] != nullptr);
+        return s.relay_pipeline_ready;
+    }
+
+    // The relay lane's own objects. Created once the geometry is real (the
+    // first seal has crossed), released by stream_relay_release().
+    static bool stream_relay_objects(stream_state &s, ID3D12Device *ndev)
+    {
+        if (s.relay_in[0] != nullptr) return true;
+        if (ndev == nullptr) return false;
+
+        const unsigned w = s.relay_w, h = s.relay_h;
+        const DXGI_FORMAT cf = DXGI_FORMAT_R8G8B8A8_UNORM;
+        HRESULT h2 = make_tex(ndev, w, h, cf, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.relay_in[0]);
+        if (SUCCEEDED(h2))
+            h2 = make_tex(ndev, w, h, DXGI_FORMAT_R32_FLOAT,
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.relay_in[1]);
+        if (SUCCEEDED(h2))
+            h2 = make_tex(ndev, w, h, DXGI_FORMAT_R16G16_FLOAT,
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.relay_in[2]);
+        // The presented result is at the DISPLAY extent on purpose: it reaches
+        // the surface present_frame already copies into, and a 640x360 texture
+        // with s.width/height attached would be an out-of-bounds source box on
+        // 3840x2160 - a device removal, not a black picture.
+        if (SUCCEEDED(h2))
+            h2 = make_tex(ndev, s.width, s.height, nr_linear_format(s.format),
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_COMMON, &s.relay_show);
+        if (FAILED(h2))
+        {
+            char l[300];
+            snprintf(l, sizeof l, "[MGPU][P4.1] RELAY texture creation hr=0x%08X - the lane stays "
+                                  "TRANSPORT-ONLY", (unsigned)h2);
+            mgpu::diag::error(l);
+            return false;
+        }
+
+        const D3D12_RESOURCE_DESC cdesc = s.relay_in[0]->GetDesc();
+        const D3D12_RESOURCE_DESC ddesc = s.relay_in[1]->GetDesc();
+        const D3D12_RESOURCE_DESC mdesc = s.relay_in[2]->GetDesc();
+        ID3D12Device *gdev = s.gdev;
+        if (gdev == nullptr) return false;
+
+        // The UPLOAD buffer that carries the returned frame from the mapping into
+        // a texture. Its pitch is the 256-byte placement alignment, computed the
+        // same way the relay computes its own (row_pitch = align_up(row_bytes,
+        // 256)) so the two cannot disagree about what a row is.
+        s.relay_up_pitch = (unsigned)((((unsigned long long)s.relay_w * 4ull) + 255ull) & ~255ull);
+        if (FAILED(make_buf(ndev, (UINT64)s.relay_up_pitch * s.relay_h,
+                            D3D12_HEAP_TYPE_UPLOAD, &s.relay_up)))
+            return false;
+        {
+            D3D12_RANGE none{ 0, 0 };   // write-only, exactly like gup
+            if (FAILED(s.relay_up->Map(0, &none, (void **)&s.relay_up_cpu)) ||
+                s.relay_up_cpu == nullptr)
+                return false;
+            memset(s.relay_up_cpu, 0, (size_t)s.relay_up_pitch * s.relay_h);
+        }
+        s.relay_up_fp.Offset = 0;
+        s.relay_up_fp.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        s.relay_up_fp.Footprint.Width = s.relay_w;
+        s.relay_up_fp.Footprint.Height = s.relay_h;
+        s.relay_up_fp.Footprint.Depth = 1;
+        s.relay_up_fp.Footprint.RowPitch = s.relay_up_pitch;
+
+        // The OUTPUT mapping's address, borrowed. slot_info returns the slot's
+        // published name and pitches; the view is the relay's, so it is fetched
+        // once here rather than reconstructed per frame. Nothing writes through
+        // this pointer - it is read-only to us. The relay writes it.
+        {
+            mgpu::relay::SlotInfo oi;
+            if (!mgpu::relay::slot_info(3u, oi) || oi.slice_pitch < (unsigned long long)s.relay_up_pitch)
+            {
+                mgpu::diag::error("[MGPU][P4.1] RELAY: the OUTPUT slot is not published with a "
+                                  "usable pitch, so the returned frame could not be read. The "
+                                  "lane stays TRANSPORT-ONLY.");
+                return false;
+            }
+            // THE OUTPUT MAPPING, OPENED BY THE NAME THE MODULE PUBLISHED.
+            //
+            // The relay deliberately exposes no view pointer: it owns the mapping,
+            // it reports facts about it (output_changed) and nothing else may write
+            // through it. But the NAME is published - SlotInfo::mapping_name is
+            // exactly the string the worker opened - so this side opens the same
+            // section and reads it. That is a documented part of the contract, not
+            // a reach into the module, and it keeps the honesty rule intact: the
+            // pixels we present are the bytes the worker put there, and the
+            // "did they change" verdict still comes from the module's own
+            // comparison, not from ours.
+            //
+            // SYNCHRONISATION IS THE PIPE'S. A FRAME_COMPLETE has been read off the
+            // named pipe before anything here touches this view, so the worker is
+            // done writing for that frame. submit() is strictly request/response,
+            // one frame in flight, so there is no second writer.
+            {
+                std::wstring wname;
+                const int need = MultiByteToWideChar(CP_UTF8, 0, oi.mapping_name.c_str(), -1,
+                                                     nullptr, 0);
+                if (need > 1)
+                {
+                    wname.assign((size_t)need, L'\0');
+                    MultiByteToWideChar(CP_UTF8, 0, oi.mapping_name.c_str(), -1, &wname[0], need);
+                    if (!wname.empty() && wname[wname.size() - 1] == L'\0') wname.resize(wname.size() - 1);
+                }
+                s.relay_out_map = OpenFileMappingW(FILE_MAP_READ, FALSE, wname.c_str());
+                if (s.relay_out_map != nullptr)
+                    s.relay_out_cpu = (unsigned char *)MapViewOfFile(s.relay_out_map, FILE_MAP_READ,
+                                                                    0, 0, 0);
+                if (s.relay_out_cpu == nullptr)
+                {
+                    mgpu::diag::error("[MGPU][P4.1] RELAY: the OUTPUT mapping the module published "
+                                      "could not be opened for reading, so a returned frame could "
+                                      "never reach the screen. The lane stays TRANSPORT-ONLY.");
+                    if (s.relay_out_map != nullptr) { CloseHandle(s.relay_out_map); s.relay_out_map = nullptr; }
+                    return false;
+                }
+            }
+        }
+
+        for (unsigned i = 0; i < stream_state::RELAY_SLOTS; ++i)
+        {
+            UINT rows = 0; UINT64 rowb = 0;
+            HRESULT hr = ndev->GetCopyableFootprints(&cdesc, 0, 1, 0, &s.relay_fp[i][0],
+                                                     &rows, &rowb, nullptr);
+            if (SUCCEEDED(hr))
+                hr = ndev->GetCopyableFootprints(&ddesc, 0, 1, 0, &s.relay_fp[i][1],
+                                                 &rows, &rowb, nullptr);
+            if (SUCCEEDED(hr))
+                hr = ndev->GetCopyableFootprints(&mdesc, 0, 1, 0, &s.relay_fp[i][2],
+                                                 &rows, &rowb, nullptr);
+            if (FAILED(hr)) return false;
+            for (unsigned k = 0; k < 3u; ++k)
+            {
+                // THE FOOTPRINT IS 3D's, THE BUFFER IS GPU 0's: the readback
+                // buffer lives on the device whose command list copies into it,
+                // and the destination is a texture on GPU 1. GetCopyableFootprints
+                // is a property of the placing DEVICE's layout, so it is asked of
+                // ndev and the memory is allocated on gdev.
+                const UINT64 bytes = (UINT64)s.relay_fp[i][k].Footprint.RowPitch * h;
+                if (FAILED(make_buf(gdev, bytes, D3D12_HEAP_TYPE_READBACK, &s.relay_rb[i][k])))
+                    return false;
+                D3D12_RANGE all{ 0, (SIZE_T)bytes };
+                if (FAILED(s.relay_rb[i][k]->Map(0, &all, (void **)&s.relay_cpu[i][k])) ||
+                    s.relay_cpu[i][k] == nullptr)
+                    return false;
+                // Zeroed once: a frame with no depth or no vectors is described
+                // by the caller zeroing this buffer, and a stale row from the
+                // previous frame would be a plausible-looking plane instead.
+                memset(s.relay_cpu[i][k], 0, (size_t)bytes);
+            }
+        }
+
+        if (FAILED(gdev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s.relay_f))))
+            return false;
+        s.relay_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        return s.relay_ev != nullptr;
+    }
+
+    static void stream_relay_release(stream_state &s)
+    {
+        for (unsigned i = 0; i < stream_state::RELAY_SLOTS; ++i)
+            for (unsigned k = 0; k < 3u; ++k)
+            {
+                if (s.relay_rb[i][k] != nullptr && s.relay_cpu[i][k] != nullptr)
+                {
+                    D3D12_RANGE none{ 0, 0 };
+                    s.relay_rb[i][k]->Unmap(0, &none);
+                }
+                s.relay_cpu[i][k] = nullptr;
+                if (s.relay_rb[i][k] != nullptr) { s.relay_rb[i][k]->Release(); s.relay_rb[i][k] = nullptr; }
+            }
+        for (unsigned k = 0; k < 3u; ++k)
+            if (s.relay_in[k] != nullptr) { s.relay_in[k]->Release(); s.relay_in[k] = nullptr; }
+        if (s.relay_show != nullptr) { s.relay_show->Release(); s.relay_show = nullptr; }
+        if (s.relay_up != nullptr && s.relay_up_cpu != nullptr)
+        {
+            D3D12_RANGE none{ 0, 0 };
+            s.relay_up->Unmap(0, &none);
+        }
+        s.relay_up_cpu = nullptr;
+        if (s.relay_up != nullptr) { s.relay_up->Release(); s.relay_up = nullptr; }
+        if (s.relay_out_cpu != nullptr) { UnmapViewOfFile(s.relay_out_cpu); s.relay_out_cpu = nullptr; }
+        if (s.relay_out_map != nullptr) { CloseHandle(s.relay_out_map); s.relay_out_map = nullptr; }
+        for (unsigned p = 0; p < 2u; ++p)
+            if (s.relay_pso[p] != nullptr) { s.relay_pso[p]->Release(); s.relay_pso[p] = nullptr; }
+        if (s.relay_ev   != nullptr) { CloseHandle(s.relay_ev); s.relay_ev   = nullptr; }
+        if (s.relay_f    != nullptr) { s.relay_f->Release();    s.relay_f    = nullptr; }
+        s.relay_pipeline_ready = false;
+        s.relay_show_valid = false;
+        s.relay_stage_pending = false;
+        s.relay_submit_pending = false;
+        s.relay_on = false;
+    }
+
+    // A UAV -> UAV barrier between two dispatches in one list. D3D12 does not
+    // order two UAV writes across a dispatch boundary on its own, and the reduce
+    // writes relay_in[0..2] from three dispatches in one list. A global UAV
+    // barrier (pResource == nullptr) is the documented way to say "everything
+    // written before this is visible after it" and is what this lane needs; it
+    // costs one cache flush per dispatch and nothing else.
+    static void relay_uav_barrier(ID3D12GraphicsCommandList *l)
+    {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        b.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+        b.UAV.pResource = nullptr;
+        l->ResourceBarrier(1, &b);
+    }
+
+    // ---- the reduce, recorded into GPU 1's consume list ----
+    //
+    // WHY IT IS HERE AND NOT ON GPU 0. The three inputs already live on GPU 1:
+    // tex_in[ii] is the frame the game's own transport delivered, tex_depth[ii]
+    // and tex_mvec_r[ii] are the unpacked depth and the real velocity buffer.
+    // Reducing them HERE means the only thing that ever crosses to the host is
+    // 640x360 per input. Reducing them on the game's device would mean moving
+    // the full-size frame to GPU 1 first, which is the transport this phase
+    // exists to delete.
+    //
+    // WHAT IT DOES NOT DO: it does not run on the depth or the vectors when the
+    // frame does not carry them. A frame with no depth is described by zeroing
+    // that readback buffer, which is the same honest "none" the in-process path
+    // gives the model by unsetting the parameter rather than leaving it stale.
+    static void stream_relay_reduce(stream_state &s, unsigned ii, unsigned slot, bool with_depth)
+    {
+        if (!s.relay_pipeline_ready || s.nl == nullptr || s.ds_heap == nullptr) return;
+
+        ID3D12DescriptorHeap *heaps[1] = { s.ds_heap };
+        s.nl->SetDescriptorHeaps(1, heaps);
+        s.nl->SetComputeRootSignature(s.ds_rs);
+        s.nl->SetPipelineState(s.relay_pso[0]);
+
+        const unsigned base = stream_state::RELAY_DESC_BASE + ii * 4u;
+        D3D12_CPU_DESCRIPTOR_HANDLE h = s.ds_heap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += (SIZE_T)base * s.ds_inc;
+        D3D12_GPU_DESCRIPTOR_HANDLE gh = s.ds_heap->GetGPUDescriptorHandleForHeapStart();
+        gh.ptr += (UINT64)base * s.ds_inc;
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D.MipLevels = 1;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+        uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+
+        // ---- ORDER IS NOT COSMETIC: DEPTH AND MVEC FIRST, COLOUR LAST ----
+        //
+        // The reduce shader writes TWO outputs - gD0 and gD1 - because that is
+        // what the C2-SR reduce it is modelled on does, and the destination pair
+        // is chosen by which pass is running. The depth and MVec passes put
+        // their REAL result in gD0 and their filler in gD1, so they must run
+        // BEFORE the colour pass, which owns relay_in[0] and is the value the
+        // enlarge reads. Run the colour pass first and the depth pass's filler
+        // would land in relay_in[0] and overwrite it - a correct-looking lane
+        // presenting depth as colour.
+
+        // ---- pass A: depth -> relay_in[1] ----
+        // The shader LOADs the depth plane: a filtered average across a depth
+        // edge invents a surface that is not there, which is why the C2-SR reduce
+        // loads its depth too. The source is bound to t0 and read as .x by gD0,
+        // so the filler in gD1 (written into relay_in[1] at u1) is the value we
+        // actually want and gD0 goes to a destination nothing reads afterwards.
+        if (with_depth && s.tex_depth[ii] != nullptr && s.depth_bytes != 0 &&
+            s.depth_slot_valid[slot] != 0u)
+        {
+            sv.Format = s.tex_depth[ii]->GetDesc().Format;
+            s.ndev_b->CreateShaderResourceView(s.tex_depth[ii], &sv, h);
+            uv.Format = DXGI_FORMAT_R16G16_FLOAT;
+            s.ndev_b->CreateUnorderedAccessView(s.relay_in[2], nullptr, &uv, h.ptr + s.ds_inc);
+            s.ndev_b->CreateShaderResourceView(s.tex_depth[ii], &sv, h.ptr + 2 * s.ds_inc);
+            uv.Format = DXGI_FORMAT_R32_FLOAT;
+            s.ndev_b->CreateUnorderedAccessView(s.relay_in[1], nullptr, &uv, h.ptr + 3 * s.ds_inc);
+
+            relay_uav_barrier(s.nl);
+            const UINT c[4] = { s.depth_w, s.depth_h, s.relay_w, s.relay_h };
+            s.nl->SetComputeRootDescriptorTable(0, gh);
+            s.nl->SetComputeRoot32BitConstants(1, 4, c, 0);
+            s.nl->Dispatch((s.relay_w + 7u) / 8u, (s.relay_h + 7u) / 8u, 1u);
+        }
+        // NOTE: the two dispatches above and below each bind their own formats
+        // into the SAME two u0/u1 slots, and the gD0 write of the depth pass
+        // lands in relay_in[2] (bound at u0 for that dispatch). The colour pass
+        // is last, so nothing after it can overwrite relay_in[0].
+
+        // ---- pass B: the real motion vectors -> relay_in[2] ----
+        //
+        // THE SCALE IS THE CALLER'S AND THIS LANE DOES NOT CORRECT FOR IT. The
+        // vectors describe motion in the GAME's pixels at the game's extent; they
+        // are reduced to 640x360 with a linear sample and handed over unmodified,
+        // so the model is told 640x360-space motion. The in-process lane carries
+        // MVecScaleX/Y for exactly this reason (R105/R87); the worker's lane sets
+        // scale 1.0 and has no override. A reduction that rescaled the vector
+        // VALUES here would be asserting a units convention this code has not
+        // measured, so the honest thing is to move the pixels, keep .xy of the
+        // game's R16G16B16A16_FLOAT, and say so in the log.
+        if (s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr && s.mvec_bytes2 != 0 &&
+            s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u)
+        {
+            sv.Format = s.tex_mvec_r[ii]->GetDesc().Format;   // R16G16B16A16_FLOAT
+            s.ndev_b->CreateShaderResourceView(s.tex_mvec_r[ii], &sv, h);
+            uv.Format = DXGI_FORMAT_R32_FLOAT;
+            s.ndev_b->CreateUnorderedAccessView(s.relay_in[1], nullptr, &uv, h.ptr + s.ds_inc);
+            s.ndev_b->CreateShaderResourceView(s.tex_mvec_r[ii], &sv, h.ptr + 2 * s.ds_inc);
+            uv.Format = DXGI_FORMAT_R16G16_FLOAT;
+            s.ndev_b->CreateUnorderedAccessView(s.relay_in[2], nullptr, &uv, h.ptr + 3 * s.ds_inc);
+
+            relay_uav_barrier(s.nl);
+            const UINT c[4] = { s.mvec_w, s.mvec_h, s.relay_w, s.relay_h };
+            s.nl->SetComputeRootDescriptorTable(0, gh);
+            s.nl->SetComputeRoot32BitConstants(1, 4, c, 0);
+            s.nl->Dispatch((s.relay_w + 7u) / 8u, (s.relay_h + 7u) / 8u, 1u);
+        }
+
+        // ---- pass C: colour -> relay_in[0], LAST ----
+        sv.Format = s.tex_in[ii]->GetDesc().Format;
+        s.ndev_b->CreateShaderResourceView(s.tex_in[ii], &sv, h);
+        uv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        s.ndev_b->CreateUnorderedAccessView(s.relay_in[0], nullptr, &uv, h.ptr + s.ds_inc);
+        // The second pair must be valid descriptors on live resources even though
+        // this dispatch's u1/t1 are not read; the colour input and the colour
+        // destination are the only pair always present.
+        s.ndev_b->CreateShaderResourceView(s.tex_in[ii], &sv, h.ptr + 2 * s.ds_inc);
+        uv.Format = DXGI_FORMAT_R32_FLOAT;
+        s.ndev_b->CreateUnorderedAccessView(s.relay_in[1], nullptr, &uv, h.ptr + 3 * s.ds_inc);
+
+        relay_uav_barrier(s.nl);
+        {
+            const UINT c[4] = { s.width, s.height, s.relay_w, s.relay_h };
+            s.nl->SetComputeRootDescriptorTable(0, gh);
+            s.nl->SetComputeRoot32BitConstants(1, 4, c, 0);
+            s.nl->Dispatch((s.relay_w + 7u) / 8u, (s.relay_h + 7u) / 8u, 1u);
+        }
+    }
+
+    // ---- THE ONE BLOCKING CALL IN THIS LANE, AND WHERE IT IS ALLOWED TO RUN ----
+    //
+    // relay::submit() is synchronous: it writes the frame, sends FRAME_SUBMIT and
+    // reads until FRAME_COMPLETE or a SIXTY-SECOND pipe deadline. That is the
+    // module's contract and this file does not get to change it.
+    //
+    // SO THIS FUNCTION MUST NOT BE CALLED FROM stream_poll. stream_poll holds
+    // s.cs for its whole body, and s.cs is the mutex the GAME'S RENDER THREAD
+    // takes every frame in stream_on_finish_effects - a lock that thread waits on
+    // is a lock that reaches the application, which is DEFECT E and cost this
+    // project 60 -> 49.8 fps once already.
+    //
+    // THE ONLY PER-FRAME POINT THAT QUALIFIES is worker.cpp's bridge loop,
+    // BETWEEN mgpu::gpu1::stream_poll() and stream_present_gate(): the lock has
+    // been released, the list has been submitted and waited on, and nothing else
+    // in this add-on runs there. That is where the call site is; moving it inside
+    // stream_poll would be the bug, not a tidy-up.
+    // stream_poll submits, so the presented texture is ready before the present
+    // gate lets a frame through - and the frame on screen at that moment is
+    // s.relay_last_frame_id, one poll older than the reduce being recorded
+    // beside it. Renamed _locked-free: the public stream_relay_tick() below is
+    // the only caller and it holds no lock, which is the requirement.
+    static void stream_relay_tick_locked(stream_state &s)
+    {
+        if (!s.relay_on) return;
+        if (!s.relay_pipeline_ready || s.nl == nullptr || s.relay_f == nullptr) return;
+
+        // ---- THE REDUCE RECORDED BY THE PREVIOUS POLL ----
+        // Its command list was submitted and its fence was waited on inside the
+        // poll that recorded it (the loop's own WaitForSingleObject on s.nev), so
+        // by the time this runs the three readback buffers hold that frame. The
+        // guard below is that wait, expressed as the fence value it left behind -
+        // not an assumption about scheduling.
+        if (s.relay_stage_pending && s.relay_stage_f <= s.nf_value)
+        {
+            s.relay_stage_pending = false;
+
+            const unsigned i = s.relay_stage_slot;
+            // EACH INPUT'S OWN LOGICAL ROW, from ITS SLOT's published format:
+            //   COLOR          fmt 28  R8G8B8A8_UNORM  4 B/px
+            //   DEPTH          fmt 41  R32_FLOAT       4 B/px
+            //   MOTION_VECTORS fmt 34  R16G16_FLOAT    4 B/px
+            // The strides below are NOT these numbers: a readback buffer's row
+            // pitch is 256-aligned, and handing the logical row in as the stride is
+            // how a frame arrives sheared while every counter reads healthy.
+            const unsigned color_row = s.relay_w * 4u;
+            const unsigned depth_row = s.relay_w * 4u;
+            // ---- THE MOTION-VECTOR CONVERSION IS HERE, AND IT IS A CONVERSION ----
+            // The GAME's velocity buffer is fmt 10, R16G16B16A16_FLOAT: EIGHT bytes
+            // per pixel, four channels. The slot this lane publishes is fmt 34,
+            // R16G16_FLOAT: FOUR bytes per pixel, two channels. So the reduce in
+            // stream_relay_reduce samples .xy and DROPS .zw, and this number is the
+            // DESTINATION's row (640 * 4) and not the source's (1920 * 8 at the
+            // game's extent). Narrowing rather than carrying fmt 10 through is
+            // deliberate: it is exactly what the proven control lane binds to
+            // Reserved18 (nr_worker.cpp test_bytes_per_pixel, "the protocol's mvec
+            // class") and it halves this lane's traffic.
+            // THE VECTOR VALUES' SCALE IS NOT CONVERTED - see the note in
+            // stream_relay_reduce.
+            const unsigned mvec_row  = s.relay_w * 4u;
+
+            mgpu::relay::FrameView fv;
+            fv.color = s.relay_cpu[i][0];
+            fv.depth = s.relay_cpu[i][1];
+            fv.motion_vectors = s.relay_cpu[i][2];
+            fv.height = s.relay_h;
+            fv.color_row_bytes = color_row;
+            fv.depth_row_bytes = depth_row;
+            fv.motion_row_bytes = mvec_row;
+            fv.color_stride = s.relay_fp[i][0].Footprint.RowPitch;
+            fv.depth_stride = s.relay_fp[i][1].Footprint.RowPitch;
+            fv.motion_stride = s.relay_fp[i][2].Footprint.RowPitch;
+
+            mgpu::relay::SubmitResult sr;
+            std::string why;
+            const std::uint32_t frame_id = ++s.relay_frame_id;
+            const bool sent = mgpu::relay::submit(fv, frame_id, sr, why);
+            ++s.relay_submitted;
+
+            if (!sent)
+            {
+                ++s.relay_nocomplete;
+                if (s.relay_nocomplete <= 3ull)
+                {
+                    char l[900];
+                    snprintf(l, sizeof l,
+                             "[MGPU][P4.1] EvaluateFeature(RELAY) frame_id=%u: NO ANSWER from the "
+                             "worker - %s. No output is claimed and the lane's counters treat "
+                             "this frame as not submitted.", frame_id, why.c_str());
+                    mgpu::diag::error(l);
+                }
+            }
+            else
+            {
+                if (sr.worker_hr == 0 && sr.output_changed)
+                {
+                    ++s.relay_eval_ok;
+                    s.relay_submit_pending = true;
+                    s.relay_last_frame_id = frame_id;
+                }
+                else
+                {
+                    if (sr.worker_hr != 0) ++s.relay_eval_fail;
+                    else                   ++s.relay_unchanged;
+                    if (s.relay_eval_fail + s.relay_unchanged <= 3ull)
+                    {
+                        char l[1000];
+                        snprintf(l, sizeof l,
+                                 "[MGPU][P4.1] EvaluateFeature(RELAY) frame_id=%u src=worker "
+                                 "result=0x%08X output_changed=%s - %s",
+                                 frame_id, (unsigned)sr.worker_hr,
+                                 sr.output_changed ? "yes" : "no",
+                                 (sr.worker_hr != 0)
+                                     ? "the submit succeeded and the model refused. THE OUTPUT IS "
+                                       "NOT EVIDENCE OF ANYTHING and the previous good picture is "
+                                       "held."
+                                     : "the worker answered success and the OUTPUT mapping is "
+                                       "byte-identical to what this side put there, so nothing "
+                                       "was written and this frame is NOT reported as evaluated.");
+                        mgpu::diag::error(l);
+                    }
+                }
+            }
+        }
+
+        // ---- THE FRAME THIS SUBMIT RETURNED ----
+        // Its pixels are already in the OUTPUT mapping: egress_fence is 0 on this
+        // path because host staging gives nobody anything to wait on. The upload,
+        // the copy and the enlarge are recorded by stream_relay_stage, into the
+        // list stream_poll submits, so the presented texture is ready before the
+        // present gate lets a frame through - and the frame on screen at that
+        // moment is s.relay_last_frame_id, one poll older than the reduce being
+        // recorded beside it.
+        (void)0;
+    }
+
+    // Called from stream_poll AFTER seal_consume, so the slot flags, the textures
+    // and the command list are in exactly the state the in-process evaluate would
+    // have found them in. IT MAKES NO BLOCKING CALL: submit() lives in
+    // stream_relay_tick, which runs between polls with the lock released.
+    //
+    // ONE POLL OF LAG, STATED RATHER THAN HIDDEN. The OUTPUT mapping is filled by
+    // the submit in the PREVIOUS tick, so what this records into the current list
+    // is the frame that was submitted one poll ago, and s.relay_last_frame_id is
+    // the id of the frame on screen. That is not a stall and not a dropped frame:
+    // it is the price of keeping the 60-second pipe read out of the poll, and the
+    // periodic line names the frame so a reader never has to infer it.
+    static void stream_relay_stage(stream_state &s, unsigned long long f, unsigned slot, bool run_nr)
+    {
+        if (!s.relay_on || !run_nr || s.nl == nullptr) return;
+
+        if (s.relay_stage_pending)
+        {
+            // The previous frame was never submitted: no tick ran between its
+            // reduce and this one. Counted, because its pixels were read by
+            // nobody, and a silent gap here would make the periodic line's
+            // arithmetic wrong.
+            ++s.relay_superseded;
+            s.relay_stage_pending = false;
+        }
+
+        // ---- 1. THE OUTPUT THE WORKER RETURNED, INTO THE PRESENTED TEXTURE ----
+        //
+        // Its pixels are already in the OUTPUT mapping: on this path
+        // SubmitResult::egress_fence is 0 because host staging has nothing for
+        // anyone to wait on. So this is a row-by-row memcpy into an upload buffer
+        // and one CopyTextureRegion, both in the list stream_poll is about to
+        // submit, followed by one compute dispatch that enlarges 640x360 to the
+        // display extent so present_frame's existing full-frame copy can show it.
+        if (s.relay_submit_pending && s.relay_out_cpu != nullptr && s.relay_up_cpu != nullptr &&
+            s.relay_pipeline_ready)
+        {
+            s.relay_submit_pending = false;
+
+            mgpu::relay::SlotInfo oi;
+            // THE ROW IS THE SLOT'S, AND IT IS TAKEN, NOT CLAMPED. An earlier draft
+            // wrote `copy_row = min(oi.row_pitch, out_row)`, which can only fire on
+            // a bug and would then have copied a SHORT ROW IN SILENCE - the failure
+            // shape this file spends paragraphs refusing. The geometry contract
+            // makes oi.row_pitch >= row_bytes a property of the relay
+            // (slot_publish computes row_pitch = align_up(row_bytes, 256)), so a
+            // pitch that does not hold the row is a REFUSAL here, with both numbers
+            // in the log, and nothing is copied.
+            if (!mgpu::relay::slot_info(3u, oi))
+            {
+                mgpu::diag::error("[MGPU][P4.1] RELAY: the OUTPUT slot is no longer published, so "
+                                  "the returned frame cannot be read. Its pixels are NOT shown and "
+                                  "this is counted as a failed frame, not as a stale picture.");
+            }
+            else if (oi.row_pitch < s.relay_w * 4u)
+            {
+                char l[520];
+                snprintf(l, sizeof l,
+                         "[MGPU][P4.1] RELAY REFUSED: the OUTPUT slot's row pitch is %u and this "
+                         "frame's row is %u. The relay computes row_pitch as row_bytes rounded up "
+                         "to 256, so a pitch shorter than the row is a contract violation and NOT "
+                         "something to copy partially - nothing was copied and the previous good "
+                         "picture is held.", oi.row_pitch, s.relay_w * 4u);
+                mgpu::diag::error(l);
+            }
+            else
+            {
+                const unsigned out_row = s.relay_w * 4u;
+                for (unsigned y = 0; y < s.relay_h; ++y)
+                    memcpy(s.relay_up_cpu + (size_t)y * s.relay_up_pitch,
+                           s.relay_out_cpu + (size_t)y * oi.row_pitch, out_row);
+
+                D3D12_TEXTURE_COPY_LOCATION sd{}, dd{};
+                sd.pResource = s.relay_up;
+                sd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                sd.PlacedFootprint = s.relay_up_fp;
+                dd.pResource = s.relay_in[0];
+                dd.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                dd.SubresourceIndex = 0;
+                s.nl->CopyTextureRegion(&dd, 0, 0, 0, &sd, nullptr);
+                barrier(s.nl, s.relay_in[0], D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+                D3D12_CPU_DESCRIPTOR_HANDLE h2 = s.ds_heap->GetCPUDescriptorHandleForHeapStart();
+                h2.ptr += (SIZE_T)(stream_state::RELAY_ENLARGE_DESC) * s.ds_inc;
+                D3D12_GPU_DESCRIPTOR_HANDLE gh2 = s.ds_heap->GetGPUDescriptorHandleForHeapStart();
+                gh2.ptr += (UINT64)(stream_state::RELAY_ENLARGE_DESC) * s.ds_inc;
+
+                D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+                sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                sv.Texture2D.MipLevels = 1;
+                sv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                s.ndev_b->CreateShaderResourceView(s.relay_in[0], &sv, h2);
+                D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+                uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                uv.Format = nr_linear_format(s.format);
+                s.ndev_b->CreateUnorderedAccessView(s.relay_show, nullptr, &uv, h2.ptr + s.ds_inc);
+
+                barrier(s.nl, s.relay_show, D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                s.nl->SetPipelineState(s.relay_pso[1]);
+                s.nl->SetComputeRootDescriptorTable(0, gh2);
+                const UINT c[4] = { s.relay_w, s.relay_h, s.width, s.height };
+                s.nl->SetComputeRoot32BitConstant(1, c[0], 0);
+                s.nl->SetComputeRoot32BitConstant(1, c[1], 1);
+                s.nl->SetComputeRoot32BitConstant(1, c[2], 2);
+                s.nl->SetComputeRoot32BitConstant(1, c[3], 3);
+                s.nl->Dispatch((s.width + 7u) / 8u, (s.height + 7u) / 8u, 1u);
+                barrier(s.nl, s.relay_show, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COMMON);
+                s.relay_show_valid = true;
+            }
+        }
+
+        // ---- 2. THE CURRENT FRAME'S REDUCE, INTO THE SAME LIST ----
+        s.relay_stage_slot = (unsigned)(f % stream_state::RELAY_SLOTS);
+        s.relay_stage_f = f;
+        ++s.relay_frames;
+
+        // A FRAME WITH NO DEPTH, OR NO VECTORS, MUST NOT CARRY THE LAST FRAME'S.
+        //
+        // The relay's slots are fixed geometry - there is no per-frame "this input
+        // is absent" bit in the protocol, and submit() refuses a null pointer - so
+        // a frame whose depth or M-vectors did not arrive would otherwise hand the
+        // worker the PREVIOUS frame's rows at that address. That is precisely the
+        // failure the in-process lane refuses by UNSETTING the NGX parameter
+        // (R61/R63: "shipping the zeros it leaves behind would hand the model a
+        // false flat plane"). Zeroing the readback is the same statement made in
+        // the only language this carrier has: a zero depth plane and zero motion,
+        // which is what "none" means to a model that is given them.
+        //
+        // The value-invalidation counters are the same ones the seal checker uses,
+        // so a run's mvec/depth coverage is read from one place whichever lane ran.
+        {
+            const bool depth_here =
+                (s.depth_mode != 0 && s.tex_depth[ii] != nullptr && s.depth_bytes != 0 &&
+                 s.depth_slot_valid[slot] != 0u);
+            const bool mvec_here =
+                (s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr && s.mvec_bytes2 != 0 &&
+                 s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u);
+            const unsigned i = s.relay_stage_slot;
+            if (!depth_here)
+                memset(s.relay_cpu[i][1], 0,
+                       (size_t)s.relay_fp[i][1].Footprint.RowPitch * s.relay_h);
+            if (!mvec_here)
+                memset(s.relay_cpu[i][2], 0,
+                       (size_t)s.relay_fp[i][2].Footprint.RowPitch * s.relay_h);
+        }
+
+        stream_relay_reduce(s, (unsigned)(f & 1ull), slot, s.depth_mode != 0);
+        s.relay_stage_pending = true;
+
+        if (s.relay_frames >= s.relay_report_at + stream_state::RELAY_REPORT_EVERY)
+        {
+            s.relay_report_at = s.relay_frames;
+            char l[900];
+            snprintf(l, sizeof l,
+                     "[MGPU][P4.1] RELAY periodic: frames reduced=%llu submitted=%llu "
+                     "evaluated(hr==0 AND output changed)=%llu worker-hr-failures=%llu "
+                     "no-answer=%llu output-unchanged=%llu superseded=%llu | worker Reserved18="
+                     "0x%08X src=worker | the model ran at %ux%u, the worker's own pinned extent, "
+                     "and the result is ENLARGED to %ux%u for presentation - so the picture is "
+                     "SOFT by construction and nothing here claims otherwise. The frame on screen "
+                     "is frame_id=%u, one poll older than the reduce recorded beside it: the "
+                     "60-second pipe read is kept out of the poll on purpose.",
+                     s.relay_frames, s.relay_submitted, s.relay_eval_ok, s.relay_eval_fail,
+                     s.relay_nocomplete, s.relay_unchanged, s.relay_superseded,
+                     (unsigned)mgpu::relay::reserved18(), s.relay_w, s.relay_h,
+                     s.width, s.height, (unsigned)s.relay_last_frame_id);
+            mgpu::diag::info(l);
+        }
+    }
+
+#endif   // MGPU_NR_RELAY
+
     // P4.1. Bring up a PERSISTENT DLSS-NR stage on GPU 1, sized and formatted
     // to the stream. Called once, lazily, on the bridge thread, after the first
     // seal has told us the geometry is real.
@@ -10516,7 +11610,11 @@ namespace
 
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = 8;                       // 4 per parity
+        // 4 per parity for the C2-SR reduce (0..7), and 4 + 2 for the relay lane's
+        // reduce and enlarge (8..15). A COUNT, not a binding model: the two lanes
+        // index disjoint ranges so neither can rewrite a descriptor the other's
+        // dispatch still needs.
+        hd.NumDescriptors = 16;
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = ndev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.ds_heap));
         if (FAILED(hr)) return false;
@@ -12819,6 +13917,17 @@ namespace reflex { void status(int &was_out, int &now_out, bool &applied_out); v
 // Called from the bridge thread's ordered teardown, BEFORE gpu1::shutdown().
 // Order matters and it is the same order the rest of this file uses: the
 // features go before the device they were created against.
+// PHASE 2. The bridge thread's relay hook, declared in gpu1_context.hpp and
+// called from worker.cpp immediately after stream_poll(). Empty without
+// MGPU_NR_RELAY, so the call site needs no #ifdef of its own.
+void stream_relay_tick()
+{
+#ifdef MGPU_NR_RELAY
+    stream_state &s = str();
+    stream_relay_tick_locked(s);
+#endif
+}
+
 void stream_shutdown()
 {
     // Undo the driver mode we set on GPU 0, before anything else and outside
@@ -12827,6 +13936,31 @@ void stream_shutdown()
     reflex::restore();
 
     stream_state &s = str();
+
+#ifdef MGPU_NR_RELAY
+    // ==== THE RELAY LANE'S TEARDOWN, OUTSIDE s.cs ====
+    //
+    // relay::shutdown() sends SHUTDOWN and then WAITS for the worker process to
+    // leave - bounded, up to Config::shutdown_ms, and it terminates the process
+    // if it does not. The default is three seconds and this lane sets one, but
+    // even one second is a second holding the mutex the GAME'S RENDER THREAD
+    // takes every frame, and on the DllMain path it is a second inside the
+    // loader lock. So the ORDER is: the GPU objects go under the lock, with the
+    // rest of stream_release; the pipe and the process go HERE, before the lock
+    // is taken.
+    //
+    // THE ONE-TOUCH IS RELAY'S OWN. shutdown() is idempotent and stream_shutdown
+    // is called from three places, so a second call finds nothing to close.
+    if (s.relay_requested)
+    {
+        mgpu::diag::info("[MGPU][T5] relay: releasing the neural worker process (bounded, outside "
+                         "the stream lock). IF THIS IS THE LAST LINE, IT DIED IN THE WORKER'S "
+                         "TEARDOWN.");
+        mgpu::relay::shutdown();
+        mgpu::diag::info("[MGPU][T5] relay: worker released.");
+    }
+#endif
+
     std::lock_guard<std::mutex> lk(s.cs);
 
     // V38. FIRST CALLER WINS. s.armed is NOT cleared by stream_release(), so
@@ -13931,6 +15065,19 @@ void intensity_step(int dir)
     mgpu::diag::info(l);
 }
 
+// ---- PHASE 2: the relay lane's two entry points, forward-declared ----
+//
+// Defined in the anonymous namespace immediately above stream_nr_create, with
+// their reasons. Declared here because stream_request arms the lane and
+// stream_poll stages a frame, and both sit ABOVE that namespace in this file.
+#ifdef MGPU_NR_RELAY
+void stream_relay_begin(stream_state &s);
+void stream_relay_stage(stream_state &s, unsigned long long f, unsigned slot, bool run_nr);
+void stream_relay_release(stream_state &s);
+bool stream_relay_objects(stream_state &s, ID3D12Device *ndev);
+bool stream_relay_pipeline(stream_state &s, ID3D12Device *ndev);
+#endif
+
 void stream_request()
 {
     // V43. Refuse every arm during a recovery launch - AutoArm, the hotkey,
@@ -13959,6 +15106,23 @@ void stream_request()
     }
     if (s.requested) return;
     s.requested = true;
+
+#ifdef MGPU_NR_RELAY
+    // ==== PHASE 2: ASK FOR THE RELAY LANE. DO NOT START IT HERE. ====
+    //
+    // The lane's bring-up calls CreateProcessW and then waits up to twenty
+    // seconds for a worker to appear on a pipe. This function is entered with
+    // s.cs HELD and is called from the hotkey, the panel and AutoArm - the
+    // game's own hooks on the game's own thread. A twenty-second wait there is
+    // the same class of mistake as DEFECT E: a lock, or a thread, that the
+    // application can feel.
+    //
+    // So the request is RECORDED here, under the lock, and the bring-up itself
+    // happens at the top of stream_poll, on the bridge thread, BEFORE the lock
+    // is taken. That is the first moment this add-on has a thread of its own
+    // and nothing of the game's waiting on it.
+    s.relay_requested = true;
+#endif
     stream_read_fault(s.fault, sizeof s.fault);
     s.neural = stream_read_neural();
     s.max_frames = stream_read_frames();
@@ -16922,6 +18086,66 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
 void stream_poll()
 {
     stream_state &s = str();
+
+#ifdef MGPU_NR_RELAY
+    // ==== THE RELAY LANE'S ONE-SHOT BRING-UP, ON THE BRIDGE THREAD, UNLOCKED ====
+    //
+    // stream_request records the request; this is where it is honoured, and the
+    // placement is the whole point. This runs BEFORE std::unique_lock below, so
+    // CreateProcessW, the twenty-second pipe wait and the HELLO/WORKER_READY
+    // handshake never happen with s.cs held - and s.cs is the mutex the game's
+    // render thread takes every frame.
+    //
+    // IT IS ALSO WHY THE LANE BRINGS UP MORE THAN ONCE, IN A SENSE: the request
+    // survives a failed bring-up, so a run with no worker deployed retries once
+    // per poll. start() is bounded (20 s connect, 20 s handshake) and returns a
+    // Status rather than throwing, but a retry every poll is still wrong - so
+    // relay_bringup_done latches after the FIRST attempt, success or failure, and
+    // the lane is transport-only for the rest of the launch. No session is
+    // retried into existence; that is the module's rule and this is the call
+    // site obeying it.
+    if (s.relay_requested && !s.relay_bringup_done)
+    {
+        stream_relay_begin(s);
+    }
+
+    // ---- AND THE LANE'S OWN GPU OBJECTS, ONCE THE GEOMETRY IS REAL ----
+    //
+    // AFTER the bring-up above, because the reduce and enlarge are only worth
+    // building if there is a worker to submit to, and because a lane with no
+    // session must be seen to cost nothing. stream_relay_objects needs one
+    // thing the arm has already done: s.gdev, the borrowed game device the
+    // readback buffers are allocated on (the command list that copies into them
+    // is the GAME's, and a resource may only be referenced by the device that
+    // made it - the same rule the arm states for gxfer).
+    //
+    // BOTH ARE IDEMPOTENT AND BOTH REFUSE RATHER THAN HALF-BUILD. A failure
+    // turns the lane off for this launch with a line naming the step; it never
+    // leaves a reduce that cannot be submitted or a submit that cannot be shown.
+    if (s.relay_on && !s.relay_pipeline_ready)
+    {
+        ID3D12Device *ndev = nullptr;
+        {
+            std::lock_guard<std::mutex> g(st().cs);
+            ndev = st().device;
+        }
+        if (ndev == nullptr || s.gdev == nullptr)
+        {
+            mgpu::diag::warn("[MGPU][P4.1] RELAY: no GPU 1 device or no borrowed game device yet, "
+                             "so the lane's reduce and readback cannot be built. Transport-only "
+                             "until that changes.");
+        }
+        else if (!stream_relay_pipeline(s, ndev) || !stream_relay_objects(s, ndev))
+        {
+            mgpu::diag::error("[MGPU][P4.1] RELAY: the lane's GPU objects did not come up. THE "
+                              "NEURAL LANE IS TRANSPORT-ONLY for this launch - no frame is "
+                              "submitted and the worker is left running with nothing to do. The "
+                              "reason is the line above this one.");
+            stream_relay_release(s);
+        }
+    }
+#endif
+
     // DEFECT E, found on the rig 2026-09-05 by running Passes=2 and watching the
     // GAME slow down from ~60 to ~49.8 fps.
     //
@@ -18221,6 +19445,21 @@ void stream_poll()
         // D1: one checker, two callers. See seal_consume.
         seal_consume(s, f, slot, run_nr, use_cq, ii);
         s.consumed = f;
+
+#ifdef MGPU_NR_RELAY
+        // ==== PHASE 2: FEED THE RELAY LANE, IN THE SAME LIST, IN THE SAME POLL ====
+        //
+        // HERE and not earlier: seal_consume is what has just read this frame's
+        // seal, so depth_slot_valid[slot] and mvec_slot_valid[slot] are the values
+        // this frame really carried, and the source textures are in the state the
+        // in-process evaluate would have found them in. Anything earlier would
+        // feed the lane a frame whose validity had not been read yet.
+        //
+        // IT RECORDS ONLY. The submit - the one blocking call in this lane - is in
+        // stream_relay_tick, which the bridge thread's loop calls AFTER this
+        // function returns and after the lock is gone. See the note there.
+        stream_relay_stage(s, f, slot, run_nr);
+#endif
     }
 
     // ---- summary, once, after the producer has stopped and drained ----
