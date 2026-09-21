@@ -302,6 +302,24 @@ namespace mgpu::relay
         unsigned motion_stride = 0u;
     };
 
+    //: ONE INPUT SLOT, AS A FRAME IS CHECKED AGAINST IT. This is the subset of a
+    //: published slot that the geometry contract needs - no mapping, no view, no
+    //: state, nothing that requires a device or a session. That is the whole
+    //: point of it: the rules that make the worker's `hr == 0` mean something can
+    //: then be driven in a GPU-free test instead of only on the rig.
+    //:
+    //: ORDER IS FIXED: [0] COLOR, [1] DEPTH, [2] MOTION_VECTORS.
+    struct SlotGeometry
+    {
+        bool     published = false;
+        unsigned width = 0u;
+        unsigned height = 0u;
+        unsigned dxgi_format = 0u;
+        unsigned bytes_per_pixel = 0u;
+        //: bytes_per_pixel * width - the LOGICAL row, never the aligned pitch.
+        unsigned row_bytes = 0u;
+    };
+
     //: What the worker said about a submitted frame, quoted, never inferred.
     struct SubmitResult
     {
@@ -380,6 +398,23 @@ namespace mgpu::relay
     bool slot_info(unsigned slot_index, SlotInfo &out);
 
     // ------------------------------------------------------------ honesty API
+
+    //: THE PER-SLOT GEOMETRY CONTRACT, AS A PURE FUNCTION: no pipe, no mapping,
+    //: no session, no state. `submit()` calls it after its session guard, and
+    //: the GPU-free selftest calls it directly, so the three rules that make the
+    //: worker's `hr == 0` mean something are exercised where there is no device
+    //: to exercise them with:
+    //:
+    //:   * the frame's row count must equal THAT slot's published height, because
+    //:     the worker reads each slot's rows from the height its CONFIG carried;
+    //:   * each input's logical row length must be exactly bytes_per_pixel(format)
+    //:     times that slot's width - not merely something that fits under the
+    //:     pitch, which is how a truncated frame would pass;
+    //:   * each input's host stride must not be shorter than its row.
+    //:
+    //: Returns true when every input agrees with its slot; otherwise false with
+    //: `why` naming the slot and both geometries. A refusal, never a clamp.
+    bool check_frame(const FrameView &frame, const SlotGeometry inputs[3], std::string &why);
 
     //: The one place the word Success is allowed to be produced: a comparison
     //: against the worker's `1`. Everything else about Reserved18 is named

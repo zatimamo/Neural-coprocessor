@@ -825,6 +825,100 @@ namespace mgpu::relay
         return config_slot(cfg, slot_index);
     }
 
+    // ============================================================== geometry
+
+    bool check_frame(const FrameView &frame, const SlotGeometry inputs[3], std::string &why)
+    {
+        // ---- THE GEOMETRY CONTRACT, CHECKED PER SLOT ----------------------
+        //
+        // THIS IS THE CHECK THAT MAKES "hr == 0" MEAN SOMETHING. A frame whose
+        // motion vectors are 1920x1080 handed to a slot published at 3840x2160
+        // would otherwise be read by the worker as the top half of the wrong
+        // buffer, evaluated, and returned with hr == 0 and a changed OUTPUT -
+        // every rule this module has would pass on a frame that was never fully
+        // used. So: the row count must be the slot's, the row LENGTH must be
+        // exactly the slot's (bpp * width, not merely something that fits under
+        // the pitch), and the stride must not be shorter than the row. Three
+        // separate refusals, each naming the slot and both geometries, and each
+        // a returned failure rather than a clamp.
+        //
+        // A PURE FUNCTION, and that is the point: the same lines run in the live
+        // path and in a GPU-free test, so these three rules are not first
+        // exercised on the rig. Nothing here reads g, a mapping, a pipe or a
+        // session.
+        static const wire::InputSlot classes[3] = { wire::InputSlot::COLOR,
+                                                    wire::InputSlot::DEPTH,
+                                                    wire::InputSlot::MOTION_VECTORS };
+        // A zero stride means the buffer is tightly packed: rows follow each
+        // other, so the stride IS the row length. Derived rather than refused,
+        // because a zero stride is not something a caller can see in an int.
+        const unsigned rows[3] = { frame.color_row_bytes, frame.depth_row_bytes,
+                                   frame.motion_row_bytes };
+        const unsigned stride[3] = {
+            frame.color_stride ? frame.color_stride : frame.color_row_bytes,
+            frame.depth_stride ? frame.depth_stride : frame.depth_row_bytes,
+            frame.motion_stride ? frame.motion_stride : frame.motion_row_bytes,
+        };
+
+        for (unsigned i = 0u; i < 3u; ++i)
+        {
+            const SlotGeometry &s = inputs[i];
+            if (!s.published)
+            {
+                char b[160];
+                std::snprintf(b, sizeof b, "the %s slot was never published", slot_name(classes[i]));
+                why = b;
+                return false;
+            }
+            if (frame.height != s.height)
+            {
+                char b[416];
+                // THE WORKER'S OWN RULE IS SAID AT THE POINT OF REFUSAL, because
+                // it is the reason a rig run at a larger R sees a refusal and the
+                // reader must not have to go looking for it: the worker's frame
+                // path refuses an extent that is not the one its Reserved18
+                // feature was created at, and that extent is the worker's own
+                // pinned 640x360. Naming it here is the difference between "the
+                // relay is broken" and "the geometry has to be raised on the
+                // worker side first".
+                std::snprintf(b, sizeof b,
+                              "the frame has %u rows and the %s slot was published with %u; the "
+                              "worker takes its row count from the slot's own height, so this "
+                              "frame would be truncated or over-read. The relay does not "
+                              "resample or crop - reduce the frame to the published size first; "
+                              "and note that the worker separately refuses any extent other "
+                              "than the one its Reserved18 feature was created at (640x360 in "
+                              "this build).",
+                              frame.height, slot_name(classes[i]), s.height);
+                why = b;
+                return false;
+            }
+            if (rows[i] != s.row_bytes)
+            {
+                char b[288];
+                std::snprintf(b, sizeof b,
+                              "the %s rows are %u bytes and the slot was published at %u bytes "
+                              "(%ux%u fmt=%u, %u bytes per pixel); this is not the geometry the "
+                              "slot was configured for",
+                              slot_name(classes[i]), rows[i], s.row_bytes, s.width, s.height,
+                              s.dxgi_format, s.bytes_per_pixel);
+                why = b;
+                return false;
+            }
+            if (stride[i] < rows[i])
+            {
+                char b[256];
+                std::snprintf(b, sizeof b,
+                              "the %s stride is %u bytes and a row is %u; the relay would read "
+                              "past the end of each row",
+                              slot_name(classes[i]), stride[i], rows[i]);
+                why = b;
+                return false;
+            }
+        }
+        return true;
+    }
+
     // ================================================================ honesty
 
     bool reserved18_is_success(std::int32_t value)
@@ -1400,76 +1494,25 @@ namespace mgpu::relay
         const wire::InputSlot classes[3] = { wire::InputSlot::COLOR, wire::InputSlot::DEPTH,
                                              wire::InputSlot::MOTION_VECTORS };
 
-        // ---- THE GEOMETRY CONTRACT, CHECKED PER SLOT ----------------------
-        //
-        // THIS IS THE CHECK THAT MAKES "hr == 0" MEAN SOMETHING. A frame whose
-        // motion vectors are 1920x1080 handed to a slot published at 3840x2160
-        // would otherwise be read by the worker as the top half of the wrong
-        // buffer, evaluated, and returned with hr == 0 and a changed OUTPUT -
-        // every rule this module has would pass on a frame that was never fully
-        // used. So: the row count must be the slot's, the row LENGTH must be
-        // exactly the slot's (bpp * width, not merely something that fits under
-        // the pitch), and the stride must not be shorter than the row. Three
-        // separate refusals, each naming the slot and both geometries, and each
-        // a returned failure rather than a clamp.
-        for (unsigned i = 0u; i < 3u; ++i)
+        // THE GEOMETRY CONTRACT, CHECKED PER SLOT - through the one function the
+        // GPU-free selftest also drives, so the rules that make the worker's
+        // `hr == 0` mean something are exercised before the rig has a say.
+        // The reduction below copies only the slot's PUBLICATION state and its
+        // geometry; nothing about the frame enters it.
         {
-            const Slot &s = g.slots[(unsigned)classes[i]];
-            const Input &in = inputs[i];
-            if (!s.published || s.view == nullptr)
+            SlotGeometry geo[3];
+            for (unsigned i = 0u; i < 3u; ++i)
             {
-                char b[160];
-                std::snprintf(b, sizeof b, "the %s slot was never published",
-                              slot_name(classes[i]));
-                why = b;
-                g.last_error = why;
-                return false;
+                const Slot &s = g.slots[(unsigned)classes[i]];
+                geo[i].published = s.published && s.view != nullptr;
+                geo[i].width = s.width;
+                geo[i].height = s.height;
+                geo[i].dxgi_format = s.dxgi_format;
+                geo[i].bytes_per_pixel = s.bpp;
+                geo[i].row_bytes = s.row_bytes;
             }
-            if (frame.height != s.height)
+            if (!check_frame(frame, geo, why))
             {
-                char b[416];
-                // THE WORKER'S OWN RULE IS SAID AT THE POINT OF REFUSAL, because
-                // it is the reason a rig run at a larger R sees a refusal and the
-                // reader must not have to go looking for it: the worker's frame
-                // path refuses an extent that is not the one its Reserved18
-                // feature was created at, and that extent is the worker's own
-                // pinned 640x360. Naming it here is the difference between "the
-                // relay is broken" and "the geometry has to be raised on the
-                // worker side first".
-                std::snprintf(b, sizeof b,
-                              "the frame has %u rows and the %s slot was published with %u; the "
-                              "worker takes its row count from the slot's own height, so this "
-                              "frame would be truncated or over-read. The relay does not "
-                              "resample or crop - reduce the frame to the published size first; "
-                              "and note that the worker separately refuses any extent other "
-                              "than the one its Reserved18 feature was created at (640x360 in "
-                              "this build).",
-                              frame.height, slot_name(classes[i]), s.height);
-                why = b;
-                g.last_error = why;
-                return false;
-            }
-            if (in.row_bytes != s.row_bytes)
-            {
-                char b[288];
-                std::snprintf(b, sizeof b,
-                              "the %s rows are %u bytes and the slot was published at %u bytes "
-                              "(%ux%u fmt=%u, %u bytes per pixel); this is not the geometry the "
-                              "slot was configured for",
-                              slot_name(classes[i]), in.row_bytes, s.row_bytes, s.width, s.height,
-                              s.dxgi_format, s.bpp);
-                why = b;
-                g.last_error = why;
-                return false;
-            }
-            if (in.stride < in.row_bytes)
-            {
-                char b[256];
-                std::snprintf(b, sizeof b,
-                              "the %s stride is %u bytes and a row is %u; the relay would read "
-                              "past the end of each row",
-                              slot_name(classes[i]), in.stride, in.row_bytes);
-                why = b;
                 g.last_error = why;
                 return false;
             }

@@ -442,56 +442,104 @@ int main(int argc, char **argv)
         fv.depth_stride = fv.depth_row_bytes;
         fv.motion_stride = fv.motion_row_bytes;
 
+        // THE PUBLISHED SLOTS, as check_frame sees them. Built from the config
+        // the relay was started with - whose publication the slot_info() checks
+        // above already asserted slot by slot - so these are the module's own
+        // numbers and not the test's wishes. Bytes per pixel comes from the
+        // format, which is the same derivation the module uses.
+        auto bpp_of = [](unsigned fmt) -> unsigned {
+            switch (fmt)
+            {
+            case 28u:  return 4u;   // R8G8B8A8_UNORM
+            case 41u:  return 4u;   // R32_FLOAT
+            case 40u:  return 4u;   // D32_FLOAT
+            case 34u:  return 4u;   // R16G16_FLOAT
+            case 10u:  return 8u;   // R16G16B16A16_FLOAT
+            default:   return 0u;
+            }
+        };
+        mgpu::relay::SlotGeometry geo[3];
+        {
+            const mgpu::relay::SlotConfig *sc[3] = { &cfg.slots.color, &cfg.slots.depth,
+                                                     &cfg.slots.motion_vectors };
+            for (unsigned i = 0u; i < 3u; ++i)
+            {
+                geo[i].published = true;
+                geo[i].width = sc[i]->width;
+                geo[i].height = sc[i]->height;
+                geo[i].dxgi_format = sc[i]->dxgi_format;
+                geo[i].bytes_per_pixel = bpp_of(sc[i]->dxgi_format);
+                geo[i].row_bytes = sc[i]->width * geo[i].bytes_per_pixel;
+            }
+        }
+
+        // (b) and (c) below need a slot set that AGREES on the row count, because
+        // FrameView carries ONE height for all three inputs: against the
+        // as-published geometry above (motion vectors 180 rows, colour 360) a
+        // height that satisfied the motion slot would trip the colour slot's
+        // height check first and the row-length and stride rules would never be
+        // reached. A real submission is reduced to one extent first, so this is
+        // the shape a live frame has - and it is built from the same published
+        // numbers, with only the row count harmonised.
+        mgpu::relay::SlotGeometry geo_uniform[3];
+        for (unsigned i = 0u; i < 3u; ++i)
+        {
+            geo_uniform[i] = geo[i];
+            geo_uniform[i].height = cfg.slots.color.height;
+        }
+
         // (a) A MOTION-VECTOR GEOMETRY THAT DOES NOT MATCH ITS SLOT. Everything
         //     else about this frame is correct: the pointers, the strides, the
         //     colour and depth rows, the format-consistent row length. Only the
         //     row count is the colour slot's instead of the motion slot's - the
         //     exact shape of the truncation this guards against.
+        //
+        //     DRIVEN THROUGH check_frame(), NOT submit(). A --protocol-only worker
+        //     has no Reserved18 session, so submit() refuses at the session guard
+        //     before any geometry is examined - correctly - and these rules would
+        //     then be tested nowhere at all. check_frame() is the function the
+        //     live path calls, so what is exercised here is the live path's code.
         {
-            mgpu::relay::SubmitResult sr;
-            std::string ferr;
-            bool sent = mgpu::relay::submit(fv, 1u, sr, ferr);
-            std::printf("  geometry  = %s (%s)\n", sent ? "ACCEPTED" : "refused", ferr.c_str());
-            check(!sent, "submit() REFUSES a frame whose row count is not the slot's");
-            check(contains(ferr, "MOTION_VECTORS"),
+            std::string gerr;
+            const bool accepted = mgpu::relay::check_frame(fv, geo, gerr);
+            std::printf("  geometry  = %s (%s)\n", accepted ? "ACCEPTED" : "refused", gerr.c_str());
+            check(!accepted, "check_frame() REFUSES a frame whose row count is not the slot's");
+            check(contains(gerr, "MOTION_VECTORS"),
                   "the refusal names the slot that did not match");
-            check(contains(ferr, "MOTION_VECTORS") &&
-                      contains(ferr, std::to_string(cfg.slots.motion_vectors.height)),
+            check(contains(gerr, "MOTION_VECTORS") &&
+                      contains(gerr, std::to_string(cfg.slots.motion_vectors.height)),
                   "the refusal quotes the geometry the slot was published with");
-            check(contains(ferr, std::to_string(fv.height)),
+            check(contains(gerr, std::to_string(fv.height)),
                   "the refusal quotes the geometry the frame claimed");
         }
 
-        // (b) A ROW LENGTH THAT IS NOT width * bytes_per_pixel. Same height, so
-        //     the row-count check passes and this one has to catch it.
+        // (b) A ROW LENGTH THAT IS NOT width * bytes_per_pixel. The row counts
+        //     agree, so the height check passes and this one has to catch it.
         {
-            mgpu::relay::SubmitResult sr;
-            std::string ferr;
-            const unsigned rows_for_mvec = cfg.slots.motion_vectors.height;
             mgpu::relay::FrameView fv2 = fv;
-            fv2.height = rows_for_mvec;
+            fv2.height = cfg.slots.color.height;
             fv2.motion_row_bytes = cfg.slots.motion_vectors.width * 4u;   // 4, not 8, bpp
             fv2.motion_stride = fv2.motion_row_bytes;
-            const bool sent = mgpu::relay::submit(fv2, 1u, sr, ferr);
-            std::printf("  rowbytes  = %s (%s)\n", sent ? "ACCEPTED" : "refused", ferr.c_str());
-            check(!sent, "submit() REFUSES a row length that is not the format's bytes-per-pixel "
-                         "times the width");
-            check(contains(ferr, "bytes per pixel"),
+            std::string gerr;
+            const bool accepted = mgpu::relay::check_frame(fv2, geo_uniform, gerr);
+            std::printf("  rowbytes  = %s (%s)\n", accepted ? "ACCEPTED" : "refused", gerr.c_str());
+            check(!accepted, "check_frame() REFUSES a row length that is not the format's "
+                             "bytes-per-pixel times the width");
+            check(contains(gerr, "bytes per pixel"),
                   "the refusal explains the row length in terms of bytes per pixel");
         }
 
         // (c) A STRIDE SHORTER THAN THE ROW. The relay would read past the end of
         //     every row, so this must not be clamped to the row length.
         {
-            mgpu::relay::SubmitResult sr;
-            std::string ferr;
             mgpu::relay::FrameView fv3 = fv;
-            fv3.height = cfg.slots.motion_vectors.height;
+            fv3.height = cfg.slots.color.height;
             fv3.color_stride = fv3.color_row_bytes - 4u;
-            const bool sent = mgpu::relay::submit(fv3, 1u, sr, ferr);
-            std::printf("  stride    = %s (%s)\n", sent ? "ACCEPTED" : "refused", ferr.c_str());
-            check(!sent, "submit() REFUSES a stride shorter than a row");
-            check(contains(ferr, "stride"), "the refusal names the stride");
+            std::string gerr;
+            const bool accepted = mgpu::relay::check_frame(fv3, geo_uniform, gerr);
+            std::printf("  stride    = %s (%s)\n", accepted ? "ACCEPTED" : "refused", gerr.c_str());
+            check(!accepted, "check_frame() REFUSES a stride shorter than a row");
+            check(contains(gerr, "stride"), "the refusal names the stride");
         }
 
         // (d) THE SAME FRAME AT THE PUBLISHED NUMBERS. It must now get past the

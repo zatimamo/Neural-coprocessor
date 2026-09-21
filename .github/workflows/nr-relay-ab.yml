@@ -775,8 +775,15 @@ jobs:
 
           # Is there a caller? Anything in src/ that is not the module itself and
           # that names one of its entry points.
+          #
+          # `|| true` IS LOAD-BEARING, and the failure it fixes is invisible: the
+          # step runs under bash -e, and with no caller yet the pipeline returns
+          # 1. The assignment inherits that status and the step exits SILENTLY
+          # right after the object-file line, before the branch below can report
+          # which state it is in. The "no caller" state must not fail the gate
+          # that exists to handle the "no caller" state.
           CALLERS=$(grep -rlE 'relay::(start|submit|available)\(' src 2>/dev/null \
-                    | grep -v '^src/nr_relay\.' | sort | tr '\n' ' ')
+                    | grep -v '^src/nr_relay\.' | sort | tr '\n' ' ' || true)
           echo "callers of the relay in src/: [${CALLERS:-none}]"
 
           if [ -z "$CALLERS" ]; then
