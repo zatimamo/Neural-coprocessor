@@ -843,18 +843,26 @@ jobs:
           grep -q 'WORKER_READY' "$WLOG" || { echo "::error::no WORKER_READY"; exit 1; }
           grep -q 'reserved18=-1' "$WLOG" || {
             echo "::error::the protocol-only worker did not report reserved18=-1"; exit 1; }
-          for S in 'CONFIG COLOR' 'CONFIG DEPTH' 'CONFIG MOTION_VECTORS' 'CONFIG OUTPUT' \
+          # THE WORKER'S OWN WORDS, which are the METADATA names it is told and not
+          # the bare class names. Its line is
+          #   [ipc]    CONFIG MGPU_NR_INPUT_COLOR: 640x360 format=28 row_pitch=... shared="..."
+          # The first draft of this gate looked for 'CONFIG COLOR' and failed a run
+          # in which every CONFIG had arrived: it was reading a format nobody
+          # writes. What the worker calls each slot is in nr_slots.cpp, and that is
+          # what a gate over the worker's log has to use.
+          for S in 'CONFIG MGPU_NR_INPUT_COLOR' 'CONFIG MGPU_NR_INPUT_DEPTH' \
+                   'CONFIG MGPU_NR_INPUT_MOTION_VECTORS' 'CONFIG MGPU_NR_OUTPUT' \
                    'MGPU_NR_CI_RELAY'; do
             grep -q -- "$S" "$WLOG" || {
               echo "::error::the worker's log never shows '$S' - the relay's CONFIG did not arrive"
               exit 1; }
           done
-          # The motion-vector slot at 320x180 with the format that is 8 bytes per
-          # pixel, and the colour slot at 640x360: two different geometries in one
-          # session, which a single published geometry could not produce.
-          grep -q 'CONFIG MOTION_VECTORS: 320x180 format=10' "$WLOG" || {
+          # Two different geometries in one session, which a single published
+          # geometry could not produce: motion vectors at 320x180 in the format
+          # that is 8 bytes per pixel, colour at 640x360.
+          grep -q 'CONFIG MGPU_NR_INPUT_MOTION_VECTORS: 320x180 format=10' "$WLOG" || {
             echo "::error::the worker did not receive the motion-vector slot's own geometry"; exit 1; }
-          grep -q 'CONFIG COLOR: 640x360 format=28' "$WLOG" || {
+          grep -q 'CONFIG MGPU_NR_INPUT_COLOR: 640x360 format=28' "$WLOG" || {
             echo "::error::the worker did not receive the colour slot's own geometry"; exit 1; }
           # The worker's OWN Reserved18 line, anchored, and judged by its VALUE
           # rather than by the word: 0x00000001 is the only thing that means a
