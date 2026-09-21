@@ -710,9 +710,10 @@ namespace
     bool frame_pipeline_prepare(FramePipeline &p, unsigned w, unsigned h,
                                 const HostSlot *slots, std::string &err)
     {
-        const DXGI_FORMAT cf = (DXGI_FORMAT)slots[(unsigned)InputSlot::COLOR].dxgi_format;
-        const DXGI_FORMAT df = (DXGI_FORMAT)slots[(unsigned)InputSlot::DEPTH].dxgi_format;
-        const DXGI_FORMAT mf = (DXGI_FORMAT)slots[(unsigned)InputSlot::MOTION_VECTORS].dxgi_format;
+        const DXGI_FORMAT cf = (DXGI_FORMAT)slots[(unsigned)nr::InputSlot::COLOR].dxgi_format;
+        const DXGI_FORMAT df = (DXGI_FORMAT)slots[(unsigned)nr::InputSlot::DEPTH].dxgi_format;
+        const DXGI_FORMAT mf =
+            (DXGI_FORMAT)slots[(unsigned)nr::InputSlot::MOTION_VECTORS].dxgi_format;
         if (p.ready && p.w == w && p.h == h && p.color_fmt == cf && p.depth_fmt == df &&
             p.mvec_fmt == mf)
             return true;
@@ -815,10 +816,10 @@ namespace
     {
         eval_result = 0u; out_hash = 0ull; in_hash = 0ull;
 
-        HostSlot &c = slots[(unsigned)InputSlot::COLOR];
-        HostSlot &d = slots[(unsigned)InputSlot::DEPTH];
-        HostSlot &m = slots[(unsigned)InputSlot::MOTION_VECTORS];
-        HostSlot &o = slots[(unsigned)InputSlot::OUTPUT];
+        HostSlot &c = slots[(unsigned)nr::InputSlot::COLOR];
+        HostSlot &d = slots[(unsigned)nr::InputSlot::DEPTH];
+        HostSlot &m = slots[(unsigned)nr::InputSlot::MOTION_VECTORS];
+        HostSlot &o = slots[(unsigned)nr::InputSlot::OUTPUT];
 
         if (!host_slot_attach(c, err) || !host_slot_attach(d, err) ||
             !host_slot_attach(m, err) || !host_slot_attach(o, err))
@@ -918,7 +919,7 @@ namespace
         // pipeline they feed. Both live for the whole serving session: a slot is
         // attached once and reused, and the pipeline is built from the first
         // frame's geometry and format set.
-        HostSlot slots[(unsigned)InputSlot::COUNT];
+        HostSlot slots[(unsigned)nr::InputSlot::COUNT];
         FramePipeline pipe;
         unsigned frames_served = 0;
         pcab::logf("[ipc]    listening on %ls (protocol version %u, one client)",
