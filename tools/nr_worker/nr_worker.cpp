@@ -574,9 +574,11 @@ namespace
         pcab::logf("[frames] output hash = 0x%016llX  pixels_changed=%s", out_hash,
                    same ? "NO (identical to the input)" : "yes");
         pcab::logf("FRAMES-RESULT ok=%s called=%s evaluate=0x%08X frames=1 %ux%u "
+                   "color_fmt=%u depth_fmt=%u mvec_fmt=%u out_fmt=%u "
                    "in_hash=0x%016llX out_hash=0x%016llX pixels_changed=%s",
                    (called && ok) ? "YES" : "NO", called ? "YES" : "NO", eval_result, W, H,
-                   color_hash, out_hash, same ? "NO" : "YES");
+                   (unsigned)color.fmt, (unsigned)depth.fmt, (unsigned)mvec.fmt,
+                   (unsigned)out.fmt, color_hash, out_hash, same ? "NO" : "YES");
         if (!err.empty()) pcab::logf("[frames] detail: %s", err.c_str());
 
         return called && ok;
