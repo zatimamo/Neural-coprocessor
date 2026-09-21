@@ -34,6 +34,14 @@ namespace nr
             HANDLE                     event = nullptr;
             NVSDK_NGX_Parameter       *params = nullptr;
             bool                       list_submitted = false;
+
+            //: The evaluation half: the handle CreateFeature produced, the
+            //: snippet's own EvaluateFeature, and the fence value the next drain
+            //: will signal. The creation drain uses value 1, so the first
+            //: evaluated frame is 2 - the fence is never rewound.
+            NVSDK_NGX_Handle          *handle = nullptr;
+            void                      *p_eval = nullptr;
+            unsigned long long         fence_value = 1;
         };
 
         LaneState g_lane;
@@ -188,6 +196,168 @@ namespace nr
         pcab::logf("[exit]  nothing is torn down on purpose: this process owns the NGX session "
                    "and the Reserved18 feature, and exits with them - the same choice the proven "
                    "reference lane makes. mode=nr-worker");
+    }
+
+    unsigned long long lane_feature_handle()
+    {
+        return (unsigned long long)(std::uintptr_t)g_lane.handle;
+    }
+
+    // ------------------------------------------------------------------------
+    // lane_evaluate - one neural frame, on the feature lane_run() created.
+    //
+    // THE BINDING IS MGPU'S, NOT AN INVENTION. Every key below is one the
+    // add-on's own per-frame evaluate sets (gpu1_context.cpp, the P6.2 block),
+    // in the same DLSSNR namespace, with the same subrect convention: the
+    // subrect says which region of the resource is the frame. A resource larger
+    // than the bound region is normal - the stream binds subrects out of its
+    // shared ring.
+    //
+    // Unbinding is deliberate and different from leaving the last value: a frame
+    // with no depth UNSETS DLSSNR.Depth rather than handing the model the
+    // previous frame's geometry, which the add-on states in the same words.
+    //
+    // Returns false only when the call could not be MADE. A FAIL_* from the
+    // runtime comes back through `result`, because that is a measurement.
+    // ------------------------------------------------------------------------
+    bool lane_evaluate(const LaneFrame &f, unsigned &result, std::string &err)
+    {
+        result = 0;
+        err.clear();
+
+        if (g_lane.dev == nullptr || g_lane.queue == nullptr || g_lane.params == nullptr ||
+            g_lane.allocator == nullptr || g_lane.list == nullptr || g_lane.fence == nullptr ||
+            g_lane.event == nullptr)
+        {
+            err = "the lane has no live device, queue, parameter block or drain objects - "
+                  "lane_run() has not succeeded";
+            return false;
+        }
+        if (g_lane.handle == nullptr || g_lane.p_eval == nullptr)
+        {
+            err = "there is no Reserved18 handle or no EvaluateFeature entry point";
+            return false;
+        }
+        if (f.color == nullptr || f.out == nullptr)
+        {
+            err = "a frame needs at least DLSSNR.Color and DLSSNR.Output";
+            return false;
+        }
+
+        // ---- the binding ------------------------------------------------------
+        g_lane.params->Set("DLSSNR.Color", f.color);
+        g_lane.params->Set("DLSSNR.ColorSubrectBaseX", 0u);
+        g_lane.params->Set("DLSSNR.ColorSubrectBaseY", 0u);
+        g_lane.params->Set("DLSSNR.ColorSubrectWidth",  (unsigned)f.color_w);
+        g_lane.params->Set("DLSSNR.ColorSubrectHeight", (unsigned)f.color_h);
+
+        if (f.depth != nullptr)
+        {
+            g_lane.params->Set("DLSSNR.Depth", f.depth);
+            g_lane.params->Set("DLSSNR.DepthSubrectBaseX", 0u);
+            g_lane.params->Set("DLSSNR.DepthSubrectBaseY", 0u);
+            g_lane.params->Set("DLSSNR.DepthSubrectWidth",  (unsigned)f.depth_w);
+            g_lane.params->Set("DLSSNR.DepthSubrectHeight", (unsigned)f.depth_h);
+            g_lane.params->Set("DLSSNR.DepthInverted", (unsigned)(f.depth_inverted ? 1u : 0u));
+        }
+        else
+        {
+            g_lane.params->Set("DLSSNR.Depth", (ID3D12Resource *)nullptr);
+        }
+
+        if (f.mvec != nullptr)
+        {
+            g_lane.params->Set("DLSSNR.MVec", f.mvec);
+            g_lane.params->Set("DLSSNR.MVecSubrectBaseX", 0u);
+            g_lane.params->Set("DLSSNR.MVecSubrectBaseY", 0u);
+            g_lane.params->Set("DLSSNR.MVecSubrectWidth",  (unsigned)f.mvec_w);
+            g_lane.params->Set("DLSSNR.MVecSubrectHeight", (unsigned)f.mvec_h);
+            g_lane.params->Set("DLSSNR.MVecScaleX", f.mvec_scale_x);
+            g_lane.params->Set("DLSSNR.MVecScaleY", f.mvec_scale_y);
+        }
+        else
+        {
+            g_lane.params->Set("DLSSNR.MVec", (ID3D12Resource *)nullptr);
+        }
+
+        g_lane.params->Set("DLSSNR.Output", f.out);
+        g_lane.params->Set("DLSSNR.OutputSubrectBaseX", 0u);
+        g_lane.params->Set("DLSSNR.OutputSubrectBaseY", 0u);
+        g_lane.params->Set("DLSSNR.OutputSubrectWidth",  (unsigned)f.out_w);
+        g_lane.params->Set("DLSSNR.OutputSubrectHeight", (unsigned)f.out_h);
+
+        g_lane.params->Set("DLSSNR.Intensity", f.intensity);
+        g_lane.params->Set("DLSSNR.Reset", f.reset ? 1u : 0u);
+
+        // ---- record, then drain ----------------------------------------------
+        if (FAILED(g_lane.allocator->Reset())) { err = "command allocator Reset failed"; return false; }
+        if (FAILED(g_lane.list->Reset(g_lane.allocator, nullptr)))
+        {
+            err = "command list Reset failed";
+            return false;
+        }
+
+        // The resource states the model is documented against: reads are
+        // non-pixel-shader reads, the output is a UAV. A frame arrives in COMMON
+        // from a fresh upload, which is the only state this path has to leave.
+        {
+            ID3D12Resource *const inputs[3] = { f.color, f.depth, f.mvec };
+            D3D12_RESOURCE_BARRIER before[3] = {};
+            unsigned n = 0;
+            for (unsigned i = 0; i < 3; ++i)
+            {
+                if (inputs[i] == nullptr) continue;
+                before[n].Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                before[n].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                before[n].Transition.pResource   = inputs[i];
+                before[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                before[n].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                before[n].Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                ++n;
+            }
+            if (n > 0) g_lane.list->ResourceBarrier(n, before);
+
+            D3D12_RESOURCE_BARRIER out = {};
+            out.Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            out.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+            out.Transition.pResource   = f.out;
+            out.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            out.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            out.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            g_lane.list->ResourceBarrier(1, &out);
+        }
+
+        typedef NVSDK_NGX_Result (NVSDK_CONV *nr_pf_eval)(
+            ID3D12GraphicsCommandList *, NVSDK_NGX_Handle *, NVSDK_NGX_Parameter *, const void *);
+        const nr_pf_eval eval = (nr_pf_eval)g_lane.p_eval;
+        result = (unsigned)eval(g_lane.list, g_lane.handle, g_lane.params, nullptr);
+        pcab::logf("[eval]   EvaluateFeature(Reserved18) -> 0x%08X (%s) %ux%u reset=%u "
+                   "color=%p depth=%p mvec=%p out=%p",
+                   result, ngx_result_name(result), f.out_w, f.out_h, f.reset ? 1u : 0u,
+                   (void *)f.color, (void *)f.depth, (void *)f.mvec, (void *)f.out);
+
+        if (FAILED(g_lane.list->Close())) { err = "command list Close failed"; return false; }
+        ID3D12CommandList *const lists[1] = { g_lane.list };
+        g_lane.queue->ExecuteCommandLists(1, lists);
+
+        const unsigned long long value = ++g_lane.fence_value;
+        if (FAILED(g_lane.queue->Signal(g_lane.fence, value)))
+        {
+            err = "queue Signal failed";
+            return false;
+        }
+        if (g_lane.fence->SetEventOnCompletion(value, g_lane.event) != S_OK)
+        {
+            err = "SetEventOnCompletion failed";
+            return false;
+        }
+        if (WaitForSingleObject(g_lane.event, 20000) != WAIT_OBJECT_0)
+        {
+            err = "the evaluated frame did not drain inside 20 s";
+            return false;
+        }
+        pcab::logf("[eval]   frame drained at fence value %llu", value);
+        return true;
     }
 
     std::string LaneResult::failing_conditions() const
@@ -580,6 +750,16 @@ namespace nr
             return false;
         }
 
+        // The evaluation entry point. Resolved HERE, with the rest, so that a
+        // worker asked to run frames fails at load time rather than at its first
+        // frame - the same reason every other entry point is resolved up front.
+        g_lane.p_eval = (void *)pick(snip, "NVSDK_NGX_D3D12_EvaluateFeature", "snippet");
+        if (g_lane.p_eval == nullptr)
+        {
+            res.error = "the snippet does not export NVSDK_NGX_D3D12_EvaluateFeature";
+            return false;
+        }
+
         // 10. the snippet's own Reserved18 session, same app id, with our block.
         res.snip_init = (unsigned)p_sinit(pcab::NS_APPLICATION_ID, data_path, g_lane.dev,
                                           (NVSDK_NGX_Version)res.ngx_version_used,
@@ -628,6 +808,9 @@ namespace nr
                                              g_lane.params, &handle);
             QueryPerformanceCounter(&t1);
             res.feature_handle = (unsigned long long)(std::uintptr_t)handle;
+            // The handle has to outlive this scope: it is what every later
+            // EvaluateFeature call is made against.
+            if (handle != nullptr) g_lane.handle = handle;
             const double ms = (f.QuadPart > 0)
                 ? ((double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart) : 0.0;
             pcab::logf("[lane]   CreateFeature(NVSDK_NGX_Feature_Reserved18) via the snippet -> "

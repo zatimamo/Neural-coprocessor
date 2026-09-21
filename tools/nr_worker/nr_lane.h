@@ -48,6 +48,7 @@
 
 struct ID3D12Device;
 struct ID3D12CommandQueue;
+struct ID3D12Resource;
 
 namespace nr
 {
@@ -158,6 +159,41 @@ namespace nr
     //: them. Null before lane_run succeeded.
     ID3D12Device *lane_device();
     ID3D12CommandQueue *lane_queue();
+
+    // ------------------------------------------------------------------------
+    // THE EVALUATION HALF - what turns a created feature into a neural frame.
+    //
+    // This is the piece the objective needs: CreateFeature succeeding proves the
+    // feature EXISTS, and nothing on this machine has ever EVALUATED a DLSSNR
+    // frame. The keys below are the ones MGPU's own stream sets before its
+    // per-frame EvaluateFeature call (gpu1_context.cpp, the P6.2 evaluate
+    // block), so the worker feeds the model the same contract the add-on does,
+    // in the same namespace, rather than an invented one.
+    //
+    // Sizes are SUBRECT sizes: a resource may be larger than the region bound
+    // (the stream binds subrects out of its shared ring).
+    // ------------------------------------------------------------------------
+    struct LaneFrame
+    {
+        ID3D12Resource *color = nullptr;  unsigned color_w = 0, color_h = 0;
+        ID3D12Resource *depth = nullptr;  unsigned depth_w = 0, depth_h = 0;
+        bool            depth_inverted = true;
+        ID3D12Resource *mvec  = nullptr;  unsigned mvec_w = 0,  mvec_h = 0;
+        float           mvec_scale_x = 1.0f;
+        float           mvec_scale_y = 1.0f;
+        ID3D12Resource *out = nullptr;    unsigned out_w = 0,   out_h = 0;
+        float           intensity = 1.0f;
+        bool            reset = false;    // true on a feature's first frame
+    };
+
+    //: Evaluate one frame on the feature lane_run() created. Returns false only
+    //: when the call could not be MADE (no feature, no parameters, a list that
+    //: would not record); the snippet's own result is reported in `result`, so a
+    //: FAIL_* from the runtime is a RESULT rather than an inability to measure.
+    bool lane_evaluate(const LaneFrame &f, unsigned &result, std::string &err);
+
+    //: The Reserved18 handle lane_run() created, 0 before then.
+    unsigned long long lane_feature_handle();
 
     //: Deliberately not a teardown: the lane's session stays alive for as long as
     //: this process does, exactly as the proven diagnostic does. It exists so the
