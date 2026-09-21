@@ -306,15 +306,23 @@ jobs:
             echo "::error::channel only: no device, no NGX, no NVAPI, no Reserved18 session."
             exit 1
           }
-          # And the exclusion covers the relay's own files and the build switch -
-          # nothing else may be carrying these names.
+          # And the exclusion covers the relay's own files, the build switch, and
+          # - SINCE PHASE 2 - the ONE call site: the add-on's stream lane. That
+          # file includes the relay's header and calls mgpu::relay::start /
+          # submit, which is the module's whole purpose and not a leak: the call
+          # opens an IPC channel to the worker, and the Reserved18 session still
+          # lives in the worker's process, on the worker's device. So the allowed
+          # set is spelled out exactly, and ANY OTHER FILE carrying these names
+          # still fails here - the exclusion is enumerated, not widened to a
+          # pattern, and a sixth file cannot appear quietly.
           EX=$(grep -rlE 'nr_relay|MGPU_NR_RELAY' src CMakeLists.txt 2>/dev/null | sort | tr '\n' ' ')
-          case "$EX" in
-            "CMakeLists.txt src/nr_relay.cpp src/nr_relay.hpp "|\
-            "CMakeLists.txt src/nr_relay.hpp "|"CMakeLists.txt src/nr_relay.cpp ") ;;
-            *) echo "::error::the relay exclusion covers [$EX], which is not the relay's own files"
-               exit 1 ;;
-          esac
+          BAD=$(printf '%s\n' $EX | grep -vE '^(CMakeLists\.txt|src/nr_relay\.cpp|src/nr_relay\.hpp|src/gpu1_context\.cpp)$' || true)
+          [ -z "$BAD" ] || {
+            echo "$BAD"
+            echo "::error::the relay exclusion covers [$EX]; files outside the relay's own set plus"
+            echo "::error::its single call site are not allowed to carry these names"
+            exit 1
+          }
 
           # The worker's target must not be added to the add-on's build either.
           # Comments stripped, because this step's own comments name the tree.
